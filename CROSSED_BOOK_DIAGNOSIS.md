@@ -180,14 +180,18 @@ only defect is the missing column:
 
 ## Verification
 
-No behavioral change to any existing test — the full 31-file suite gives
-identical results before and after; the only delta is the new file. The 16
-non-passing tests fail identically in both trees on a missing `scipy`, and none
-of them import `lob_reconstruct` or `mstbook_loader`.
+No behavioral change to any existing test. With `scipy` and `statsmodels`
+installed, **all 31 existing tests pass in both the pristine and the patched
+tree** — identical results, the only delta being the new file. Verified by
+running each suite in a clean checkout of the original zip alongside the patched
+copy and diffing the exit codes.
 
-Passing on the patched tree: `test_reconstruct_ordering`,
+Directly exercising the changed code and passing: `test_reconstruct_ordering`,
 `test_crossed_regression`, `test_debug_crossing`, `test_verify_crossing`,
 `test_crossing_qc`, `test_crossed_root_cause`, and `lob_reconstruct._selftest()`.
+Every module that imports `lob_reconstruct` or `mstbook_loader`
+(`auction_imbalance`, `debug_crossing`, `validate_reconstruction`,
+`verify_crossing`, `run_analysis`, `run_contagion`) also imports cleanly.
 
 ## What I could not verify
 
