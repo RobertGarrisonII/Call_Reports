@@ -541,6 +541,12 @@ def build_all_tables(sessions, counts_fn, vol, mwcb_treated, mwcb_control, relea
         ("t5_repro", lambda: table_imbalance_contingency(sessions, counts_fn)),
         ("t9_repro", lambda: table_correlation_irf(sessions, spec="informational",
                                                    title="Table 9 (repro): IRF of return correlation [imbalance]")),
+        # Table 9 on BOTH dependent variables. The Pearson d-correlation the paper uses is
+        # attenuated by asynchronous quote updating, and the attenuation moves with trading
+        # intensity -- which is a regressor in the same system. The Delta block estimates how
+        # much of each published response is that measurement artifact.
+        ("t9_both_ways", lambda: table_correlation_irf_both_ways(sessions, spec="informational",
+                                                                 n_boot=n_boot)),
         ("t11_repro_cum", lambda: table_correlation_irf(sessions, spec="informational", cumulative=True,
                                                         title="Table 11 (repro): cumulative IRF of return correlation")),
         ("s6_repro_ols", lambda: table_mwcb_reopening_ols(mwcb_treated, release_by_date)),

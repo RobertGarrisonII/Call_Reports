@@ -1,0 +1,900 @@
+# Changelog
+
+## v0.9.15 -- correctness pass on the paper pipeline: reconstruction, nulls, and the Epps dependent variable
+
+Five defects, every one of them SILENT in the output tables. Grouped by what they broke.
+
+### 1. The book reconstruction was wrong on every production session (root cause)
+
+`mstbook_loader._read_messages_csv` builds `usecols` from `_MSG_NEEDED_COLS` and drops everything
+else -- and `sequencenumber` was not in that set. The column was deleted during the CSV read, before
+`lob_reconstruct` ever saw the frame. `_event_arrays(order_by='sequence')` then found no sequence
+anywhere and fell through, silently, to its degraded clock-only ordering: the legacy path that applies
+a Cancel before the Modify it precedes. `modify()` is remove-old + add-new, so the Modify re-creates
+the just-cancelled order, the cancel is spent, the phantom is immortal, and it pins the venue's own top
+crossed for the rest of the session. Observed on SPY 2024-01-03: 99.92% of snapshots crossed.
+
+`test_reconstruct_ordering.py` already measured this at 100% crossed vs 0% -- production was running
+the 100% configuration without knowing it. Every crossing test built frames directly and handed them to
+`reconstruct_book`, so all of them carried a sequencenumber; the one layer that could drop the column
+was the one layer no test crossed.
+
+- **mstbook_loader**: `sequencenumber` added to `_MSG_NEEDED_COLS`.
+- **lob_reconstruct**: WARN when ordering degrades, and when sequence coverage is only partial (an
+  unsequenced message type sorts LAST within its feed -- if `mt_trade` were the frame missing it, every
+  trade would be applied at end of day). Guard a NULL clock, which casts to `INT64_MIN` and sorts ahead
+  of the entire session rather than merely being misplaced. Match `"<NA>"` in the null-token tests: the
+  ref/side columns are read as pandas `string` dtype, whose missing values stringify to `"<NA>"`, not
+  `"nan"`, so the existing guard stopped matching when that dtype was adopted.
+- **debug_crossing**: CHECK 4 now raises CODE/FATAL naming the column instead of printing
+  `(no sequencenumber column)` as an aside; per-feed clock-inversion rates; CHECK 4b timestamp health
+  (null and dead clocks both collapse a feed's day onto the first grid point); **CHECK 8**, the missing
+  mirror of CHECK 5 -- orphan provenance can only explain a removal that did nothing, never a crossed
+  book, so CHECK 8 reports which orders are PINNING the top (resurrections, wrong-side resting orders
+  with entry times, longest-held pinned prices, and the book stats that were collected but never
+  printed); CHECK 9 settles the ordering question by experiment behind `--ab-ordering`. CHECK 5 now
+  weighs the orphan RATE and ranks a low-rate uniform tail MINOR, which does not vote in the verdict.
+
+### 2. The Table 5 null was rejected by the marginals, not by cross-market trading
+
+Binomial(n, 1/2) with n = 505/112 bundles "each market's own flow is a fair coin" with "the two markets
+are independent". Only the second is tandem trading, and it is the first that fails: from the paper's
+own Table 5.II the ETF is directional in 68.7% of baseline seconds against a 2.4% prediction, the future
+in 83.2% against 29.0%. Within-market clustering inflates all four corner cells with no cross-market
+linkage at all. Re-benchmarked against independence GIVEN the observed marginals, PCMOF is 1.51x
+(not ~100x) and NCMOF is 0.55x -- a DEFICIT, reversing "NCMOF levels are much greater than the
+predicted values under either form of the null hypothesis".
+
+- **tandem_order_flow**: `independence_given_marginals()`, `dependence_summary()` (ratios plus the
+  corner log odds ratio with SE and z -- marginal-free, so comparable across the three panels),
+  `permutation_null()` (shuffles the pairing between markets, preserving each market's exact marginals),
+  and `independence_null_from_counts()` (the binomial null at the ACTUAL per-bar counts). The binomial
+  null is a function of orders-per-bar, so the per-second calibration cannot be reused: it is 0.4% at
+  one second, ~23% at ten milliseconds and ~50% in action time, where Table 7's observed 30.1% and
+  48.4% sit at or below chance. `theoretical_null()` is unchanged, so published Table 5.I reproduces.
+
+### 3. Delta-rho is an Epps-attenuated estimator, biased by a regressor in its own system
+
+Grid-sampled Pearson is attenuated by asynchronous quote updating, and the severity depends on trading
+intensity -- while volume, message traffic and liquidity demand are regressors in Eq. (5). On a DGP with
+true correlation pinned at 0.60, a 25% refresh rate gives Pearson 0.072 vs HY 0.580; with activity
+cycling and true rho constant, corr(measured rho, activity) is +0.774 under Pearson and +0.026 under HY.
+
+- **correlation_svar**: `corr_method='hy'` in `build_svar_frame`; `_hy_rolling_corr()` using each
+  asset's own mid-change times, attributing each interval-pair product to the later interval end so the
+  window ending at t uses nothing dated after t, O(n+m+T) via cumsum; `epps_comparison()` reporting both
+  with the difference as the artifact estimate. `'rolling'` and `'dcc'` untouched.
+- **paper_tables**: `table_correlation_irf_both_ways()` (both estimator blocks carry day-cluster
+  bootstrap SEs and Romano-Wolf stars), added to `build_all_tables` as `t9_both_ways`.
+
+### 4. A silent NaN in the cluster-robust standard error
+
+`ecm_sde._cluster_se` set the Liang-Zeger correction `G/(G-1)*(N-1)/(N-K)` to NaN whenever `G < 2`, so a
+single session produced NaN SEs throughout -- and a NaN t-stat prints as a blank table cell rather than
+raising. This hit `t_a1_SPY`, the coefficient on `z*S` that the module's own docstring calls "the
+single-number test of liquidity-conditioning". Now falls back to Newey-West (valid for one contiguous
+session) and logs the substitution. The warning also notes that with few clusters -- the MWCB sample has
+G=4 -- a wild cluster bootstrap is preferable.
+
+### 5. A self-test that failed and exited 0
+
+`robust_prices` printed `checks: False` and exited 0, so the README's smoke loop
+(`for m in ...; do python "$m.py"; done`), which reads only the exit code, showed it green. `_selftest()`
+now returns a bool and `__main__` exits non-zero.
+
+### New
+
+- **run_paper_replication.sh** -- the whole corrected pipeline in one command, seven stages, two of
+  them GATES: STAGE 1 refuses to proceed unless every correction's regression test passes, and STAGE 3
+  refuses to estimate on any session whose book fails the crossed-book invariant. The paper's sample
+  (Appendix Table A.1) is baked in.
+- **run_table9_both_ways.py** -- CLI for the paired Table 9, writing .csv/.md/.tex and ranking the
+  largest |HY - Pearson| gaps.
+- **test_crossed_root_cause.py**, **test_tandem_null.py**, **test_hy_correlation.py** -- known-answer
+  guards for 1, 2 and 3 above.
+
+### Also fixed
+
+- `paper_tables` markdown/LaTeX renderers stringified MultiIndex columns as Python tuples; and
+  `to_latex(label=...)` unconditionally prefixed `tab:`, producing `\label{tab:tab:...}`.
+
+### Known open
+
+- `state_space_efficient_price` self-check (1) fails: the Kalman smoother does not beat a naive average
+  of the two quotes (RMSE 0.366 vs 0.096, correlation 0.9991). The test's DGP uses lambda = [+1,-1],
+  where the cross-sectional average cancels the transitory term exactly and is the efficient estimator,
+  so that assertion is unachievable as written -- but a lambda sweep shows the smoother also loses at
+  [1,-0.4] and [1,0.3], so it is not only a test artifact. A level offset was ruled out.
+- `paper_tables._selftest()` writes to a hard-coded `/mnt/user-data/outputs/`.
+- `mean_variance.py` does not finish in 400 s.
+
+## v0.9.14 -- `debug_crossing.py`: localize a crossed-book violation to DATA or CODE
+
+A crossed top is always our fault, but "our fault" splits into two different repairs, and the running
+stack gives no way to tell them apart: DATA (the messages needed never reached the replay -- nothing in
+`lob_reconstruct` can fix it) versus CODE (the messages were present and the replay failed to apply
+them). This adds a single-session diagnostic that decides which.
+
+- **Orphan provenance is the discriminator.** When a cancel or trade references an order the book does
+  not have, the tool asks whether an ADD for that same `(feed, ref)` exists anywhere in the fetched
+  messages: present => CODE (we had the data and failed to match it), absent => DATA (the creation
+  never arrived). "Absent" is further split by time of day, because orphans in the first minutes are
+  usually orders that were legitimately resting before the 09:30 window opened -- benign and expected --
+  while orphans spread evenly across the session are genuinely missing messages.
+- **Seven checks, cheapest first:** message inventory (an EMPTY removal stream is fatal on its own);
+  per-feed x per-type matrix (one venue missing its removals crosses the CONSOLIDATED top even when
+  every other venue is perfect); field health (side-token histogram, NaN price/qty rates, cross-feed
+  price-scale ratio); per-feed sequence continuity; orphan provenance; replay dynamics (resting-order
+  growth and crossing onset); per-venue versus consolidated crossing.
+- **Names two silent-failure paths** that make the diagnosis necessary: `reconstruct_session()`
+  substitutes an EMPTY frame on a fetch exception and continues, so a failed fetch yields a
+  full-length frame of garbage rather than an error; and `_Book.add()` silently DROPS any order whose
+  side is not exactly `"Bid"`/`"Ask"` or whose price/size is not finite and positive, so a venue with a
+  different side encoding or a renamed quantity column contributes no liquidity at all.
+- Runs on the production fetch path (`--date`), or offline from a pickled message dict
+  (`--save-messages` once, then iterate). Exit codes: 0 clean, 2 DATA, 3 CODE.
+
+Three defects were found by testing against fixtures with known faults rather than by inspection:
+  1. Orphan provenance was keyed by reference alone, but `_Book` keys orders by `(feed, ref)`. An add
+     on a DIFFERENT venue therefore counted as provenance and misattributed a data fault to code.
+     Now keyed by `(feed, ref)`, with cross-feed reference collisions reported as their own finding.
+  2. "Crossed in the first sixth => structural" mislabeled a fast leak as a parse fault. The verdict is
+     now gated on resting-order growth: structural means crossed from the first snapshots WITH a stable
+     book.
+  3. Book growth measured as last-sixth over first-sixth read ~1x for a book that fills early and then
+     plateaus -- exactly how an accumulation fault disguises itself as structural. Now peak over opening.
+
+- **Tests.** New `test_debug_crossing.py` builds five sessions whose fault is known by construction
+  (clean, empty cancel stream, unrecognized side tokens on one feed, cancels ordered before their own
+  adds, and cancels for orders resting before the window) and asserts the verdict is right FOR THE RIGHT
+  REASON. The decisive pair is the last two: both produce orphaned removals, only one is a code fault,
+  and the test asserts they are separated. Full suite 31/31.
+
+## v0.9.13 -- `run_ofr_improved.sh`: the improved-leg driver for the OFR WP 19-04 / JFM reproduction
+
+A three-stage driver (`select` | `pilot` | `main` | `all`) for the revision's improved leg, following
+the `run_liberation_day.sh` idiom (env-overridable config, `autoscale.py` worker sizing, `banner`,
+timestamped `tee` logs, STAGE dispatch).
+
+- **Selection is split from extraction.** The ex-ante vol signal is DAILY data, so `select` picks the
+  day universe with no book access; passing the full 2014-01-01:2017-08-31 range to `--date-range`
+  would extract ~920 sessions of consolidated SPY+ES MBO instead of the ~20 the design needs.
+- **`select`** reads a required `VOL_CSV` (prior-close VIX or a HAR forecast -- information available
+  BEFORE the session it labels), runs `stress_index.select_days`, thins to distinct episodes, era-matches
+  controls 1:1, and writes `ofr_universe.txt` plus a selection report.
+- **`pilot`** extracts two OFR-era sessions and GATES on the crossed-book invariant using
+  `onset_response._crossed_frac`, exiting non-zero above `CROSS_MAX`. Every reconstruction fix in this
+  stack was validated on 2025 tape; 2014-2017 is a different venue-protocol generation, so the crossing
+  rate there is unknown until measured. `all` will not proceed to `main` if the gate fails.
+- **`main`** extracts the selected universe and builds the 16-table suite, defaulting `CLOCK=exchange`
+  (NOT `run_liberation_day.sh`'s `receipt`) and passing `--auto-regime` together with `--vol-csv` so the
+  regime labels come from the SAME ex-ante series that chose the days; without `--vol-csv` the driver
+  would fall back to per-session realized vol, silently reinstating ex-post selection.
+
+Three design bugs were found by testing the selection stage on a synthetic OFR-era series rather than
+by inspection, each of which would have quietly degraded inference:
+  1. `stress_index.match_controls` matches nearest-tau WITH replacement -- correct for a DiD where one
+     control may serve several treated days, but every high-tau stress day picked the SAME calm day, so
+     the extraction universe held ONE control cluster. Now matched without replacement.
+  2. Matching stress to calm on the vol LEVEL is tautological here: the labels are DEFINED by tau
+     percentile, so a level caliper rejected every pair (0 controls). Controls are now ERA-matched on
+     calendar proximity -- same venue protocol generation, tick regime, and contract cycle -- with the
+     tau imbalance reported rather than hidden, and ex-ante level balance left to `event_study_driver`,
+     which is where it belongs.
+  3. tau is the PERSISTENT component, so one vol spike leaves a plateau of consecutive high-tau
+     sessions and an unthinned top-N returned ten consecutive days of a single episode -- one
+     day-cluster, not ten. `EPISODE_GAP` (default 10 days) now thins to distinct episodes.
+
+Suite unchanged at 30/30 (the driver adds no Python module).
+
+## v0.9.12 -- Release-date template + pre-ingest validator
+
+The 10:00 releases with no publisher rule (JOLTS, NEW_HOME, UMICH) have to be ingested, and a wrong
+date does not raise anywhere: it produces an onset that splits the session in the wrong place, or --
+on a holiday or outside 09:30-16:00 -- an empty pre-window, so `event_onset_estimate` returns NaN and
+the event silently vanishes. A mistyped year is worse still: a valid session, a valid-looking number,
+and an observation centred on nothing. This release adds the fill-in template and, more importantly,
+the validator that turns each of those silent failures into a loud one before ingest.
+
+- **`release_template.py` (new).** `make_template()` emits one row per expected release with the
+  loader-visible columns (`date`, `category`, `time_et`) plus entry aids the loader ignores
+  (`ref_month`, `status`, `notes`). Two row kinds: NEEDS_DATE (blank date -- JOLTS, NEW_HOME, UMICH,
+  the last with two rows per month for preliminary and final) and VERIFY (the rule-generated
+  ISM_MFG / ISM_SVC / CONF_BOARD dates pre-filled for checking against the publisher calendar; an
+  unchanged row is a no-op, a corrected one overrides generation for that category-month). The 08:30
+  block and OPEX are deliberately absent -- under an RTH window they are always dropped, so including
+  them would let a large useless ingest look successful.
+- **`validate()`** checks, per row: parseable `YYYY-MM-DD`; NYSE trading day (else no session exists);
+  known category; parseable time; onset leaves at least the 20-bar floor on BOTH sides (else NaN);
+  full requested pre/post window (else a truncation warning); duplicate `(date, category)`; and
+  surfaces dates carrying more than one release TIME, since one session per date resolves to a single
+  arbitrary onset. Half-day awareness included via `early_close()` (Friday after Thanksgiving,
+  Christmas Eve, July 3 when the 4th is a weekday) -- a 14:30 onset on a 13:00 close is an error, not
+  a truncation.
+- **CLI:** `python release_template.py make --start 2020-01-01 --end 2026-07-23 --out t.csv` and
+  `python release_template.py validate filled.csv` (exit 1 on errors, so it can gate a pipeline).
+- **Bug found by the guard:** pandas reads a blank CSV cell as float `NaN`, which is TRUTHY, so
+  `str(v or "")` yielded the string `"nan"` and a blank date reached the parser -- crashing inside the
+  holiday lookup on `NaT.year`. Fixed with a NaN/NaT-aware `_s()` coercion plus an explicit `pd.isna`
+  guard after parsing.
+- **Tests.** New `test_release_template.py` feeds a CSV containing ONE INSTANCE OF EACH failure mode
+  (Good Friday, a Saturday, an ad-hoc closure, an 08:30 onset, an after-close onset, an unparseable
+  date, an unknown category, a duplicate, a missing time, a half-day onset past the 13:00 close, and a
+  genuine truncation) and asserts every one is caught ON THE RIGHT LINE, that unfilled rows are skipped
+  silently, that the collision is surfaced, and that a clean file both validates and actually ingests
+  through `load_release_schedule`. Full suite 30/30.
+
+## v0.9.11 -- NYSE trading calendar + the rule-generated 10:00 release backbone (23 -> 263 RTH-valid onsets)
+
+Extraction runs 09:30-16:00, so an onset needs RTH bars on BOTH sides. This was verified to fail
+silently for most of the macro calendar: an 08:30 release (CPI, NFP, PPI, RETAIL, GDP, PCE, CLAIMS,
+DURABLE, HOUSING, TRADE) and OPEX at 09:30 land on or before the frame's first bar, so `n_pre = 0`,
+`transmission = NaN`, and the event disappears from the surface with no error. Loading those schedules
+would have burned full extraction cost on hundreds of sessions and harvested nothing. This release
+instead builds out the release cluster that IS valid under an RTH window -- 10:00 -- which raises the
+impact-blind event supply over 2020-01-01..2026-07-23 from 23 (FOMC-only, 2023-2025) to **263**.
+
+- **NYSE trading calendar (new, in `market_shocks.py`).** `nyse_holidays(year)`, `is_trading_day(d)`,
+  `nth_trading_day(year, month, n)`, plus `_easter` (anonymous Gregorian), `_nth_weekday`,
+  `_last_weekday_of_month`, `_observed`, and `_NYSE_ADHOC_CLOSURES` (Sandy, Bush, Carter). A TRADING
+  calendar, not a federal one, is required: a federal calendar would place releases on Good Friday
+  (market closed -> no session to extract) and skip Columbus/Veterans Day (market open -> a good
+  session dropped). Anchoring the business-day rule to the tape guarantees every generated date has a
+  session. Includes the NYSE quirk that a Saturday New Year's does NOT pull the holiday back to Dec 31.
+- **Rule-generated 10:00 releases.** `ISM_MFG` (1st business day), `ISM_SVC` (3rd business day),
+  `CONF_BOARD` (last Tuesday) -- 12/yr each, generated across any requested range and wired into
+  `scheduled_events` and the `categories=None` expansion. Provenance is stamped honestly in the
+  `source` field as rule-generated, in contrast to `FOMC_DECISION_DAYS`, which is a transcribed table.
+  `JOLTS` / `NEW_HOME` / `UMICH` are also 10:00 but have no clean publisher rule and are deliberately
+  NOT generated -- ingest them via `load_release_schedule`.
+- **Ingest now beats generation.** `scheduled_events` dedups on `(date, category)` first-wins, so a
+  rescheduled release ingested on its true date would previously have survived ALONGSIDE the generated
+  date and double-counted that month. Generation is now suppressed for any category-MONTH that has a
+  loaded release, so a partial ingest (e.g. authoritative 2024 only) corrects 2024 while generation
+  still fills the untouched years.
+- **`release_collisions(frame)` (new).** `cross_event_onset` builds one session per DATE and takes the
+  first matching event row, so a date carrying two different release times resolves to one arbitrary
+  onset. The detector surfaces them; on 2020-2026 with FOMC + the generated cluster there are 4
+  (2023-02-01, 2023-05-03, 2023-11-01, 2024-05-01 -- each an ISM 10:00 sharing a session with an FOMC
+  14:00). Which onset should win is a research decision, so it is reported, not silently resolved.
+- **`run_onset_surface.py`** `--categories` help now names the RTH-valid set and states explicitly
+  which categories are unusable without widening the extraction window, and why.
+- **Tests.** New `test_release_calendar.py`: known-answer Easter/Good Friday, seven holiday-observation
+  cases (Saturday/Sunday shifts, the Dec-31 exception, Juneteenth's 2022 NYSE start, an ad-hoc
+  closure), the core invariant that every generated date is a trading day, business-day spot checks
+  including a Good-Friday-shifted 3rd business day, and an END-TO-END check that a 10:00 onset yields
+  usable windows on an RTH frame while 08:30 and 09:30 onsets return NaN -- the counter-case proving
+  the guard has teeth. `test_release_loader.py` updated for the new precedence, with a new (B2)
+  asserting an ingested date suppresses the generated one for that month. Full suite 28/28.
+
+## v0.9.10 -- Per-event reconstruction QC on the onset panel (crossed-book contamination weight)
+
+The FOMC backbone run surfaced crossed-book rates that vary enormously ACROSS sessions (observed: a
+few percent up to ~75%), which the surface then pooled without any record of which events were built on
+a broken book. A crossed top is impossible in a real matching engine, so a nonzero rate is
+reconstruction error, and it contaminates every book-derived input to that event's onset observation --
+the spread, the hollowness/capacity axes, the cost-to-fill, and the mid the returns come from. This
+release makes that contamination a first-class, per-event column so a contaminated event can be
+identified and excluded rather than silently weighted into b3.
+
+- **`onset_response._crossed_frac` (new).** Share of grid points with `bid1 > ask1`, optionally over a
+  window. Measured on the SAME frame the estimator consumes rather than inherited from reconstruction:
+  the session join drops `df.attrs`, so `lob_stats` / `consolidated_crossed` is unavailable downstream,
+  and a measured number cannot silently disagree with the frame that produced the estimate. Degrades to
+  NaN (never raises) when the book columns are absent.
+- **New panel columns.** `crossed_max` (the single sort/filter column), `crossed_resp`, `crossed_imp`
+  -- all three over each event's ESTIMATION WINDOW (pre+post) -- plus `crossed_resp_sess` /
+  `crossed_imp_sess` session-wide. The window-local rate is the one that bears on the estimate:
+  crossing concentrates where message rates spike, i.e. AT THE ONSET, so an event can look acceptable
+  session-wide while its own windows are badly crossed. Session-level rates are recorded before the
+  short-window guard, so an event dropped for insufficient data still reports why its book was unusable.
+- **Surface summary gains a reconstruction-QC block** (`_crossing_qc_lines`): clean / suspect /
+  contaminated counts against the `_XED_CLEAN=1%` and `_XED_SUSPECT=10%` tiers, the five worst events
+  with window-vs-session rates side by side, an explicit marker where the window rate exceeds twice the
+  session rate (onset-local contamination), and an ACTION line to re-fit excluding contaminated events
+  and compare b3.
+- **Tests.** New `test_crossing_qc.py`, a known-answer guard built to DETECT the failure mode rather
+  than merely run: three synthetic sessions with analytically known crossed-bar counts -- clean,
+  onset-concentrated, and uniform-with-the-identical-count -- assert that (A) both rates recover the
+  injected counts exactly, (B) the onset case shows window/session > 3x while the uniform control stays
+  ~1x (so the gap is real localization, not an artifact of any crossing), (C) the onset event's session
+  rate sits UNDER the contamination bar while its window rate sits over it, i.e. a session-level-only QC
+  would have passed it through, (D) the summary flags contamination and stays quiet on a clean panel,
+  and (E) missing book columns degrade to NaN. Full suite 27/27.
+
+## v0.9.9 -- Dynamic parallelization: shared `autoscale` single-source, `run_onset_surface` worker knobs, thread-parallel onset loop
+
+The onset launcher (`run_onset_surface.py`) previously inherited a STATIC 4-worker extraction default and ran the
+per-event onset loop serially, and the runtime worker-sizing logic lived only in `run_liberation_day.sh` (bash) — so a
+direct `python run_onset_surface.py` got none of it. This release makes the launcher size itself to the machine and
+parallelizes the one region that warrants it, on a single sizing source shared by shell and Python.
+
+- **`autoscale.py` (new — single source of truth).** Runtime worker sizing on TWO budgets, because the parallel regions
+  differ: EXTRACTION is memory-bound (`extraction_workers = min(memory-derived, #sessions, cores)`), CPU work — the
+  day-block bootstrap and the onset loop — is core-bound (`cpu_jobs = all cores`). Core detection takes the MAX across
+  `os.cpu_count` / `/proc/cpuinfo` / affinity to defeat a cgroup/affinity cap that would silently serialize on a
+  containerized node; RAM is `min(node MemTotal, cgroup limit)`. Every value is overridable via env
+  (`CORES/RAM_GB/RESERVE_GB/WORKERS/BOOT_WORKERS/PEAK_GB_GUESS`), and a CLI (`python autoscale.py {cores,ram,reserve,
+  workers,jobs}`) lets the shell driver source the same numbers.
+- **`run_onset_surface.py`.** New `--max-workers` (extraction; default → autoscale, threaded into `load_sessions`) and
+  `--onset-jobs` (onset loop; default → autoscale cores); both print the chosen sizing.
+- **`onset_response.py`.** `cross_event_onset` / `run_onset_surface` gain `n_jobs`. Each event's estimate is
+  independent, so n_jobs>1 runs the loop on a joblib THREAD pool (the per-event cost is GIL-releasing numpy: the
+  pre/post covariances, the Rigobon solve, TSRV / Hayashi-Yoshida) — bit-identical to serial (order preserved, no
+  shared state), gated above `_MIN_PARALLEL_EVENTS=8`. The trivial surface-fit / jackknife stage is deliberately NOT
+  parallelized. Reconstruction (the event-ordering-sensitive book replay) is never parallelized within a feed; this
+  fans out across already-built sessions.
+- **`run_liberation_day.sh`.** The worker-sizing FORMULA is de-duplicated onto `autoscale.py` (the bash keeps its
+  cgroup-aware detection and feeds RAM_GB/CORES through the environment; the "export to override" behavior is preserved
+  exactly — verified identical numbers, 1/16/1 on the sandbox, 8/20/5 under override). The onset stage now passes
+  `--max-workers`/`--onset-jobs`.
+- **Tests.** New `test_autoscale.py` (two-budget sanity, session/core caps, reserve clamp boundaries, env overrides
+  win, CLI==API). `test_onset_surface_stage.py` gains check (D): the parallel onset panel (n_jobs=4) is bit-identical
+  to serial. Full suite 26/26.
+
+Not changed: `run_contagion.py` — its static `--max-workers 4` default is a pre-existing standalone default, not the
+duplicated formula (the orchestrator passes it explicit autoscaled values). Worker DETECTION now exists in both the
+bash and `autoscale.py` by design — equivalent sources that agree — while only the sizing FORMULA is single-sourced.
+
+## v0.9.8 -- Docs refresh: README + methods vignette + WP-19-04 memo brought current through the reconstruction-ordering arc
+
+No code change (the suite and self-tests are byte-identical to v0.9.7). This release brings the three narrative
+documents current through v0.9.7 and corrects passages that the v0.9.5–v0.9.7 work had made stale -- the analog of
+the v0.9.4 docs refresh that brought them current to the onset spine.
+
+- **README.** §5.31 gains *The event-ordering fix (v0.9.5–v0.9.7)* — the 100%-crossed root cause, the sequence-ordering
+  fix, `verify_crossing`, and the eliminations-last within-tie tiebreak — and the crossing note now distinguishes a
+  legitimate cross-venue lock (retained) from a persistent `consolidated_crossed` top (a reconstruction artifact, now
+  invariant-guarded). Two stale lines fixed: caveat (iv) said ES stayed on the snapshot (both legs are reconstructed);
+  the §9 "not yet run on tape" caveat now notes the first co-temporal 2025-04-03 window is in hand while the onset
+  panel still awaits the multi-event run.
+- **Methods vignette.** New §12.5 frames the reconstruction / event-ordering fix as a data-cleaning contribution
+  upstream of every estimate on the surface; header range and the guard cross-reference updated (the latter was still
+  citing v0.5.0).
+- **WP-19-04 memo.** §6 data plan now states message-level reconstruction as the extraction path, the crossed-book
+  fix as a data-cleaning appendix, and the in-hand first co-temporal window; the appendix notes the stack has grown
+  beyond its original fourteen modules. The §5 identification section and the appendix module list are left as the
+  author's editorial call (they predate the onset spine), flagged rather than rewritten.
+
+Honest status preserved throughout: the reconstruction logic is fully synthetic-guard-verified, but the real-tape
+crossed audit (`smoke_test_crossed`) on the 2025-04-03 window has not yet been run.
+
+## v0.9.7 -- Within-tie ordering = eliminations-last: the CME packet-level residual crossing + the degraded-path artifact
+
+v0.9.5 made intra-feed order follow `sequencenumber` (the 100%-crossed root cause). But the order key is
+not always a total order, and the within-TIE fallback was the arbitrary message concatenation order
+(adds, then cancels, then modifies, then trades). Two distinct failures rode on that fallback; both are
+closed here by ranking liquidity removals (cancel / trade / level-delete) LAST within a tie, so the
+removal is the final word in its packet/instant.
+
+- **CME packet-level sequence (the ES residual).** A single CME `sequencenumber` covers a whole packet,
+  so one value can carry an add/modify AND the cancel/trade that removes the order it references. Under
+  the concatenation fallback the cancel landed before the modify that followed it; since `modify()` ==
+  `remove()+add()`, the modify RE-ADDED the just-cancelled order, resurrecting a level that pinned the
+  consolidated top below the bid on every later snapshot. This is the residual ES crossing that survived
+  the v0.9.5 fix (≈88% on the real tape; `trade_no_ref=0` distinguishes it from the refless-trade bug).
+  Eliminations-last makes the cancel win, and the resurrected level cannot form.
+- **Degraded (no-`sequencenumber`) path.** When no event carries a sequence, every event in a feed ties,
+  and the per-feed sequence cummax — meaningless without a sequence — was dragging a later same-instant
+  event ahead of an earlier one, so a snapshot could be taken before a same-instant sweep applied. The
+  degraded path now orders by the clock directly with removals last within an instant (the per-feed
+  cummax is skipped, as it has no sequence to ride).
+
+Strictly a no-op wherever `sequencenumber` is strictly increasing per feed — equities (SPY) reconstruct
+identically (0% -> 0%); the change only bites on genuine ties, which is exactly the CME packet case.
+
+- `lob_reconstruct._event_arrays`: `elim_rank` (0 = add/modify/level-set, 1 = removal) added as the
+  innermost lexsort key in the sequence path; degraded sub-case routed to a direct clock sort with the
+  same tiebreak.
+- `test_crossed_regression.py`: new `packet_resurrection` guard — a cancel and a modify of one order
+  sharing a packet `sequencenumber`; red on v0.9.6 (98.4% of snapshots crossed), green on v0.9.7. The
+  existing `multilevel_sweep` (the degraded-path guard) flips red -> green on the same change.
+- Full suite green (25/25) and the `lob_reconstruct` self-test passes, including the never-crossed
+  invariant across the multi-venue SPY book, the ES MBP replay, and the consume / clock-switch invariances.
+
+Recommended next real-data step: run the SPY (multi-venue) and ES (CME) reconstruction on the
+2025-04-03 09:29–09:32 ET co-temporal window; expect SPY ≈0% crossed under both v0.9.6 and v0.9.7 and ES
+crossed under v0.9.6 -> ≈0% under v0.9.7.
+
+## v0.9.6 -- verify_crossing: one-command before/after for the ordering fix (data-cleaning appendix)
+
+A single-session diagnostic that fetches the raw messages ONCE and reconstructs the consolidated book
+TWICE -- legacy clock ordering vs fixed exchange-sequence ordering -- on identical events, printing the
+crossed-book fraction and trade/cancel reference-miss rates side by side. This is the number for the
+paper's data-cleaning appendix: the all-day-crossed artifact under the old ordering and its
+disappearance under the fix.
+
+- `verify_crossing.py`: `--date YYYYMMDD --product SPY` (or `--demo` for the synthetic resurrection, no
+  feed needed). Holds the cross-feed clock fixed across the two runs so the ONLY variable is intra-feed
+  ordering; reports consolidated-crossed %, crossed-frac (bid1>ask1), locked-or-crossed, trades,
+  trade_no_ref %, cancel_no_order, and resting-orders-EOD for each ordering, plus a one-line summary.
+  Reconstructs with consume=False so one fetch serves both orderings.
+- Guard `test_verify_crossing.py`: the `--demo` path reproduces the contract -- legacy ordering crosses
+  (99.6%), fixed ordering is clean (0%), identical snapshot count.
+
+Recommended first real-data use (the v0.9.5 fix validation): run on SPY 2025-04-03, confirm crossing
+collapses ~100% -> ~0% and watch whether trade_no_ref also falls; then repeat for the ES contract.
+
+
+## v0.9.5 -- Reconstruction event-ordering fix: the 100%-crossed-book root cause
+
+Roots out the all-day consolidated-crossed-book bug (best_bid > best_ask on ~100% of snapshots, SPY and
+ES). The reconstructor ordered the merged multi-venue event stream by a single capture timestamp; UDP
+multicast arrives out of packet order, so ~11% of adjacent same-feed events invert -- a Cancel lands
+before the Modify it follows, the Modify resurrects the deleted order, and that phantom level crosses
+the consolidated top forever. Confirmed on a sample (SPY 2025-04-03): identical events, sequence
+ordering -> 0/46 snapshots crossed; receipt ordering -> 46/46.
+
+- `lob_reconstruct._event_arrays` now ingests `sequencenumber` and orders events by a **k-way merge of
+  per-feed streams in exchange-sequence order**, interleaved across feeds by the clock (vectorized: a
+  stable sort on a per-feed sequence-monotone clock == heapq.merge, O(n log n)). `sequencenumber` is the
+  venue's authoritative within-feed order; the clock now only places events on the grid.
+- Default `clock` switched **receipt -> exchange**: with sequence governing intra-feed order, the clock's
+  sole role is cross-feed interleaving, and the per-venue exchange clock removes the differential
+  capture-latency bias receipt bakes in (measured ~0.2 ms venue-to-venue on SPY, vs sub-us GPS sync). The
+  obsolete "exchange is a robustness lens, not a correction" warning is removed.
+- `order_by` ("sequence" default | "clock" legacy) added to `_event_arrays` / `reconstruct_book` so the
+  pre-fix behavior stays reproducible for comparison.
+- NOT changed: order references are already namespaced -- the book keys orders by the `(feed, ref)`
+  tuple, so cross-feed reference collisions cannot occur; no namespacing change was needed.
+- Guard `test_reconstruct_ordering.py`: a one-venue stream with a receipt-vs-sequence inversion crosses
+  100% under legacy clock ordering (with zero trades -- disproving the trade-matching attribution) and is
+  clean under sequence ordering; same events, only `order_by` differs.
+
+
+## v0.9.4 -- Docs refresh: README + methods vignette brought current to the onset spine
+
+Documentation only (no code change). README gains the three onset modules in the Files table and a full
+section 8, "Onset stress-surface -- the identified estimate of f(state)", covering the cross-event onset
+identification, the 2-D liquidity-spiral surface and its identification gate, the noise-robust
+transmission (the bid-ask-bounce confound and its fix), the sum/bottleneck/product cost aggregations,
+the surface-excess test of the curated tail, and the run_onset_surface CLI / `onset` launcher stage,
+plus two onset-specific caveats. The methods vignette gains a master-map row, section 12 "The onset
+identification spine -- f(state) as a surface" (the conceptual identification narrative), three
+onset-specific honest limits, and a corrected version footer.
+
+
+## v0.9.3 -- excess_over_surface: the salience-curated tail tested against the fitted PLANE
+
+The surface analog of excess_over_benchmark. The benchmark is now the 2-D bilinear surface
+f(basis, holl) fit on the impact-blind scheduled backbone; the curated marquee shocks are tested as
+EXCESS over that surface -- transmission beyond what an impact-blind shock at the SAME basis dislocation
+AND book capacity predicts, jointly conditioned rather than along the basis line alone.
+
+- onset_response.excess_over_surface(panel, fit): residual = transmission - f_surface(basis, holl) on
+  the salience-curated events; mean-excess Ibragimov-Muller t across them. The benchmark carries the
+  exogeneity, so the excess is identified even when the tail is curated on salience.
+- Reports within_support_frac -- the fraction of curated points inside the benchmark's (basis, holl)
+  bounding box. A bilinear surface EXTRAPOLATES outside its support, and the marquee shocks are exactly
+  the points most likely to sit beyond the scheduled backbone's range, so out-of-box excess is
+  extrapolation, not interpolation, and is flagged as such.
+- fit_stress_surface now records basis_col / holl_col / y_col so excess_over_surface is self-contained
+  (it tests the curated tail on the same axes and transmission the benchmark was fit on).
+- run_onset_surface attaches the surface-excess to the co-headline cost axes (joint_cost, cost_max);
+  empty (n=0) when the events frame is the pure scheduled backbone, populated once marquee shocks are
+  included.
+- Guard test_surface_excess.py: recovers a known injected excess against the fitted plane (IM-
+  significant, within support); a clean null when the curated tail follows the surface; and the
+  extrapolation flag fires (within_support_frac < 1) when curated points sit outside the benchmark box.
+
+
+## v0.9.2 -- Cost-aggregation comparison: sum vs bottleneck vs product, adjudicated by the diagnostics
+
+Resolves the "why not the multiplicative cost" question by EMITTING all three leg-aggregations and
+letting interaction_identified + the jackknife band adjudicate, rather than asserting a winner.
+
+- event_onset_estimate / cross_event_onset now emit three round-trip cost axes off the per-leg costs:
+  state_cost_joint (SUM: legs stack linearly), state_cost_max (BOTTLENECK: the binding leg gates the
+  arb), and state_cost_prod (PRODUCT, bps^2: the multiplicative comparator).
+- run_onset_surface fits the surface on all three (plus the two single-leg hollowness axes) and the
+  summary gains a loo_band (leave-one-out jackknife) column -- where the product's leverage fragility
+  shows. cost_max stronger than joint_cost is flagged as a bottleneck / joint-withdrawal signature.
+- Guard test_cost_aggregation.py: (A) the aggregations obey their invariants (max<=sum; sum>=2*sqrt(prod)
+  by AM-GM; max^2>=prod); (B) under realistic CO-MOVEMENT of basis and leg costs, the multiplicative
+  PRODUCT carries strictly more leverage/fragility (wider jackknife band) than the additive SUM --
+  confirming the product is a dominated choice. Empirically the product is identified-but-fragile (not
+  unidentified), and the bottleneck MAX is the strongest-but-most-fragile axis (binding-leg leverage):
+  a richer, more honest picture than "the product fails outright".
+
+
+## v0.9.1 -- run_onset_surface launcher stage: the leg triple on the robust transmission, one command
+
+Wires the whole onset/surface apparatus into a runnable stage and resolves the book-leg decision into a
+run-all-three-and-compare exhibit.
+
+- Panel enriched for the LEG TRIPLE: event_onset_estimate / cross_event_onset now emit state_holl_imp
+  (the impulse-leg / ES book hollowness) and state_cost_joint (the leg-neutral SPY+ES round-trip
+  arbitrage cost) alongside the response-leg state_holl / state_cost.
+- onset_response.run_onset_surface(sessions, events_frame, ...): runs the 2-D surface across the triple
+  -- joint round-trip cost (primary), ES book (cross / contagion co-headline), SPY book (own-leg
+  robustness) -- on the NOISE-ROBUST transmission, reporting b3 on robust AND naive side by side (does
+  the spiral survive the bounce correction?), the interaction-identification verdict, and the LOO
+  jackknife band, with a decision-legible text summary.
+- fit_stress_surface now REFUSES ill-conditioned designs: when the centered design is near-singular
+  (an unspanned plane / near-constant capacity axis, cond>1e9) it returns interaction=NaN with
+  ill_conditioned=True rather than an exploded least-norm coefficient. The verdict belongs to
+  interaction_identified, which flags exactly that case.
+- run_onset_surface.py: a CLI launcher (demo + extract paths). The scheduled calendar (FOMC by default)
+  drives the date universe; sessions are loaded via run_analysis's loader; prints the summary and writes
+  the onset panel CSV.
+- run_liberation_day.sh: new `onset` stage (STAGE=onset ./run_liberation_day.sh), tunable via
+  ONSET_RANGE / ONSET_CATS / ONSET_PRE / ONSET_POST / ONSET_NOTIONAL.
+- Guard test_onset_surface_stage.py: end-to-end plumbing over deep-book sessions on a spanned plane --
+  the panel carries the enriched columns, all three axes are fit with the full field set, the primary
+  (joint_cost) axis is well-conditioned, and degenerate single-leg axes report NaN honestly.
+
+
+## v0.9.0 -- Noise-robust identification: defending the transmission against bid-ask-bounce attenuation
+
+The single most important defense of the headline. Rigobon cancels TIME-CONSTANT microstructure noise,
+but NOT noise that SHIFTS at the onset: post-release the touch thins and the BBO flips faster, so
+mid-return noise variance rises, inflates the post-regime diagonal, and ATTENUATES the identified
+transmission (errors-in-variables). A hollow pre-window predicts a larger such shift -- so the bounce
+confound manufactures a spurious negative capacity/interaction effect that MIMICS the liquidity spiral.
+This release neutralizes it and proves, on synthetic data, that it does.
+
+- _robust_window_cov + transmission_robust in event_onset_estimate: each regime's 2x2 covariance
+  re-estimated with noise-corrected TSRV variances on the diagonal (where the bounce confound lives)
+  and the Hayashi-Yoshida cross-covariance (unbiased by per-leg idiosyncratic noise). id_strength_robust
+  is the robust path's identification strength.
+- Microstructure controls in the panel: pre_noise_bps (the BNHLS bounce LEVEL omega, which varies with
+  touch fragility even when the quoted spread is tick-pinned, as in SPY/ES) and pre_spread_bps.
+- state_cost: the joint round-trip arbitrage cost over the pre-window (cost_to_fill_bps) -- the
+  symmetric, leg-neutral capacity axis, an alternative interacting conditioner (holl_col="state_cost").
+- fit_stress_surface gains y_col and covar_cols: fit on transmission_robust and/or add centered controls.
+- Guard test_noise_robust_surface.py -- the referee's objection, run and defused: a DGP with NO spiral
+  but post-onset bounce scaled by basis*holl; the naive surface manufactures a significant negative b3,
+  transmission_robust shrinks it to insignificance, and a PRE-window noise covariate provably cannot
+  rescue it (the confound is the POST-onset shift) -- so the noise-robust covariance is the necessary fix.
+
+
+## v0.8.9 — The 2-D liquidity-spiral interaction: f(basis, hollowness) + its identification gate
+
+f(state) becomes a SURFACE. The mechanism the paper claims -- a basis dislocation transmits worse when
+the book cannot absorb the arbitrage -- is multiplicative (Brunnermeier-Pedersen / limits-of-arbitrage):
+the additive model basis + hollowness cannot represent it, so the interaction is the MINIMUM
+specification in which the spiral can exist, not an extra. The onset estimator now carries the second
+predetermined axis and the surface fit comes with a diagnostic that says whether the events identify it.
+
+- **Second predetermined state wired into the onset.** `event_onset_estimate` / `cross_event_onset` now
+  also return `state_holl` -- the pre-window book HOLLOWNESS (near-touch resiliency = arbitrage-capacity
+  margin) from `liquidity_stress.stress_state`, on the response leg by default. Pass `book_asset=impulse`
+  to condition on the OTHER leg's book instead (the cross-asset propagation channel, robust to
+  own-instrument microstructure contamination). Level-capped and exception-safe: a shallow book yields
+  NaN, never a crash.
+- **`fit_stress_surface(panel, ...)`** fits the CENTERED bilinear surface
+  transmission = b0 + b1(basis-b̄) + b2(holl-h̄) + b3(basis-b̄)(holl-h̄); b3 is the spiral interaction.
+  Centering removes the mechanical collinearity, leaving only genuine corner-emptiness. b3 is a
+  regression coefficient, so Ibragimov-Muller does NOT apply to it (IM stays for the per-event
+  transmission/excess); the honest few-events companion is the leave-one-event-out jackknife band on b3,
+  returned here.
+- **`interaction_identified(panel, ...)`** -- the b3-analog of id_strength. If events cluster on the
+  diagonal (basis and book stress together, the natural correlation), b3 is unidentified and its SE
+  explodes -- you would miss a real spiral because the events don't span the plane. Reports cross-event
+  corr(basis, holl), the VIF of the centered interaction, and the median-split quadrant counts, calling
+  out the sparsest OFF-DIAGONAL corner (the cells that pin b3). NOTE: post-centering the VIF stays ~1
+  even at corr~0.99, so the verdict keys on corr and corner coverage too, not VIF alone.
+- The onset interaction identifies the STATIC complementarity the spiral predicts -- its cross-sectional
+  shadow, not the dynamic feedback loop (that stays descriptive in the cascade tier). This is also the
+  reason the design needs events scattered across a PLANE (30-50), not a line.
+- **Guard `test_stress_surface.py`**: the diagnostic fires on diagonal-only events and passes on
+  plane-spanning ones; the fit recovers a known b3 + main effects; the jackknife band brackets the
+  estimate; cross_event_onset emits a finite state_holl on a deep book.
+
+
+## v0.8.8 — Onset sensitivity diagnostics: validating the estimator's assumptions on real data
+
+The onset estimator (v0.8.7) is correct where its assumptions hold; these tools profile, on real
+sessions, whether they hold -- before any coefficient is trusted. None of them MAKE the design valid;
+they reveal whether it is.
+
+- **`onset_sensitivity.post_window_profile(df, onset_ts, post_grid, ...)`** -- per-event transmission as
+  the post-window grows. A flat plateau near the onset is the pre-feedback estimate; a large DEPARTURE
+  (either direction) signals the window has reached the basis-feedback cascade, where Rigobon's
+  constant-A assumption breaks and the estimate destabilises. Read the coefficient off the plateau.
+- **`window_sweep(sessions, events_frame, pre_grid, post_grid, ...)`** -- the pooled benchmark f(state)
+  slope across a (pre,post) grid: stable across a sensible band = window-robust; swinging = window-driven.
+- **`id_strength_profile(panel)` / `id_threshold_sweep(panel)`** -- the distribution of Rigobon
+  identification strength across events (share weakly identified, quantiles, share with no onset
+  variance rise), and whether the benchmark slope survives progressively dropping weak-ID events. A
+  common-scale variance jump is unidentified however clean the eigendecomposition looks; this is the
+  check that catches it.
+- **`cholesky_bracket(df, onset_ts, ...)`** -- the order-free Rigobon coefficient next to the two
+  Cholesky orderings; outside the bracket flags label-switching or weak ID.
+- **Guard `test_onset_sensitivity.py`**: the diagnostics DETECT the failure modes -- post_window_profile
+  fires on a within-post structural break and stays quiet on a clean session (window discrimination);
+  a common-scale onset is flagged weakly identified despite a large variance ratio while a differential
+  onset is strong; id_strength_profile / id_threshold_sweep act correctly; the bracket brackets.
+
+
+## v0.8.7 — Cross-event onset driver: the identified estimate of f(state)
+
+The analytical core. Produces the identified headline estimate of the stress-response function by
+pooling per-event ONSET observations across the multi-event frame.
+
+- **`onset_response.event_onset_estimate(df, onset_ts, ...)`** -- one event's onset observation: the
+  contemporaneous ES->SPY transmission identified WITHIN-event off the onset variance shift (Rigobon
+  2-regime heteroskedasticity ID, calm pre vs shocked post), paired with the PREDETERMINED basis
+  dislocation (|basis| over the pre-window). Reports the post/pre variance ratio and the Rigobon
+  eigenvalue separation (weak-ID flag).
+- **`cross_event_onset(sessions, events_frame, ...)`** builds the cross-event panel
+  [date, category, selection, impact_blind, state, transmission, var_ratio, id_strength, ...],
+  resolving each onset from the release time (or open-gap for overnight events).
+- **`fit_stress_response(panel, degree)`** fits f(state) on the IMPACT-BLIND benchmark (degree>=2 gives
+  the convex spiral term); **`excess_over_benchmark`** tests the SALIENCE-CURATED tail as excess over
+  the benchmark-extrapolated f with an Ibragimov-Muller t (the benchmark carries the exogeneity, so the
+  excess is identified even when the tail is curated); **`onset_inference`** is IM across events.
+  **`run_onset_study`** ties it together.
+- Identification is at the onset (pre-feedback): the within-crisis cascade endogenizes the slope and is
+  DESCRIBED (markov_switching_vecm), not fit as f(state) here.
+- **Guard `test_onset_response.py`**: Rigobon onset recovers a known transmission off a differential
+  variance shift; the benchmark slope is recovered on impact-blind events only; the excess test flags
+  injected excess (IM-significant); end-to-end wiring recovers per-event betas (corr 1.00).
+
+
+## v0.8.6 — Impact-blind unscheduled feed: selection provenance + scheduled-uncertainty stratum
+
+Operationalizes the unscheduled stratum of the sampling design. "Impact-blind unscheduled" decomposes
+into three provenances, and identification treats them differently, so every event now carries a tag.
+
+- **Selection provenance.** Every event has a `selection`: `scheduled` (release schedule),
+  `scheduled_uncertainty` (known date / unknown outcome -- elections, referendums, deadlines, OPEC,
+  rulings), `news_classified` (categorized feed selected on EX-ANTE prominence), or `salience_curated`
+  (the hand-picked crisis registry). `shocks_frame` exposes `selection` and a derived `impact_blind`
+  boolean (true for the first three): impact-blind events carry exogeneity for the benchmark;
+  salience-curated ones are read only as excess over it. The crisis registry defaults to salience_curated.
+- **Scheduled-uncertainty stratum** -- the impact-blind way to sample "unscheduled" shocks (take every
+  one, like FOMC). US general elections are GENERATED (Tue after 1st Mon in Nov, even years); other
+  known-date events (Brexit, debt-ceiling X-date) are seeded -> extend or load a feed. Tagged overnight.
+- **Loader provenance.** `load_release_schedule` / `load_ics` gain `selection=`; pass "news_classified"
+  for a categorized news/event feed or "scheduled_uncertainty" for a known-date calendar. Unscheduled
+  event types (election/referendum/opec/deadline/ruling/geopolitical/sanction) added to the name map;
+  they default to overnight (open-to-open) unless the feed supplies an intraday time.
+- **Guard `test_unscheduled_feed.py`**: election-generator dates; provenance + impact_blind partition;
+  loader news_classified tagging flowing through the frame impact-blind, defaulting to overnight.
+
+Note: when an event is in BOTH the salience-curated registry and an impact-blind feed, the registry row
+currently wins the (date, category) dedup (conservative -- it stays salience_curated).
+
+
+## v0.8.5 — Release-schedule loader (agency-general): ingest the real calendar
+
+Completes the backbone-population path: the scheduled dates are DATA, so this adds a loader that
+ingests an authoritative schedule rather than hand-keying ~70 dates.
+
+- **`market_shocks.load_release_schedule(source, ...)`** ingests a CSV path, a DataFrame, or an
+  iterable of rows with columns {date, category|release|name, [time_et|time]}. Release NAMES map to
+  category codes via `RELEASE_NAME_TO_CATEGORY` (agency-general: FOMC; BLS NFP/CPI/PPI/JOLTS; BEA
+  GDP/PCE; Census RETAIL/DURABLE/TRADE/HOUSING; ISM; sentiment; ADP; claims); a `category` column is
+  used as-is. Times come from a time column or `DEFAULT_RELEASE_TIME_ET[category]` (08:30 macro,
+  10:00 ISM/sentiment/JOLTS, 14:00 FOMC, 08:15 ADP). NaN cells handled; unmapped names skipped.
+- **`load_ics(source, ...)`** parses an iCal export (BLS calendar / economic-calendar feed): VEVENT
+  SUMMARY -> category, DTSTART -> date/time. No external deps.
+- Loaded releases flow through `scheduled_events` / `shocks_frame` / `event_dates` / `release_times`
+  once registered (`register_releases` / `clear_loaded`); `scheduled_events(categories=None)` now
+  means all available categories including loaded ones.
+- **Guard `test_release_loader.py`**: name+category mapping (incl. GDP/BEA, Retail/Census, ISM) with
+  correct release times and classes; flow-through + clear-revert; iCal parsing; (date,category) dedup.
+
+
+## v0.8.4 — Scheduled-event calendar: the impact-blind backbone for the multi-event design
+
+Adds the scheduled-release frame that anchors f(state) impact-blind -- the spine of the sampling
+strategy: take EVERY scheduled release over a wide, regime-dispersed span (not a contiguous window,
+not a volatility filter); the ones that land during turbulent stretches supply impact-blind
+HIGH-pre-state onset points.
+
+- **`market_shocks.scheduled_events(start, end, categories=("FOMC","CPI","NFP","OPEX"))`** returns
+  scheduled releases in the crisis-registry dict schema. FOMC rate-decision days (2023-2026, 14:00 ET)
+  are a VERIFIED table from Fed press releases; OPEX/quad-witching (09:30 ET) is generated by the
+  third-Friday rule; CPI/NFP (08:30 ET) are stored as verified tables but only SEEDED with the 2025
+  shutdown-revised dates -- complete the full schedule from bls.gov.
+- **Release dates are DATA, not a rule.** The 2025 federal shutdown cancelled the Oct-2025 Employment
+  Situation and pushed Sep-2025 CPI to 10-24, so FOMC/CPI/NFP are tabular (verified), not generated.
+- **`shocks_frame(include_scheduled=True, start, end)`** merges the backbone into the crisis registry,
+  de-duplicated on (date, category) so hand-annotated crisis rows win; `event_dates` / `release_times`
+  gain the same `include_scheduled` switch (default off -> existing behavior unchanged).
+- **Guard `test_scheduled_calendar.py`**: third-Friday math vs known quad-witching dates; FOMC 8/yr at
+  14:00; impact-blind enumeration with correct release times; merge/dedup (2024-09-18 once) with the
+  default frame unchanged.
+
+
+## v0.8.3 — Basis conditioning state for the stress-response function
+
+Realizes the design decision to condition cross-asset price discovery on the SPY-ES BASIS and the
+book-stress state (not realized volatility): the basis is the size of the law-of-one-price violation
+-- the direct health of the arbitrage link -- whereas volatility is its symptom.
+
+- **`liquidity_stress.basis_state(df, predetermined=True)`** assembles `ecm_sde.basis` (the demeaned
+  (1,-1) cointegrating residual) into a predetermined conditioning state: signed `basis_bps` and the
+  dislocation magnitude `abs_basis_bps`, lagged one step so the state at t is known at t-1 and does
+  not condition on the contemporaneous outcome. Pass `abs_basis_bps` as `state=` to
+  `irf.local_projection_irf` for the basis-conditioned ONSET IRF -- `theta_low`/`theta_high` then
+  trace transmission as a function of how dislocated the link already is. The book-stress state
+  (`stress_state`) is the second axis; `local_projection_irf` takes a 1-D state, so basis and book
+  stress condition as separate axes (or a composite scalar -- a design choice).
+- **Guard `test_basis_state.py`**: (A) `basis_state` recovers the lagged demeaned basis exactly and is
+  genuinely predetermined; (B) fed as the state to `local_projection`, it recovers a known
+  state-dependent response (level b0 and state-slope b1 within tolerance; transmission ~4x stronger at
+  +1 SD dislocation), confirming the conditioner plugs into the state-dependent onset-IRF machinery.
+
+
+## v0.8.2 — In-process upgraded analysis (no pickle IO); run_robust + multi-event launcher modes
+
+Eliminates the v0.8.1 frame pickle and extends the upgraded analysis to the 100ms lens and a pooled
+multi-event design.
+
+- **No pickle round-trip.** `run_analysis.main()` is split into `load_sessions` + a new
+  `run_stages(sessions, args)`. `run_contagion` gains `--upgraded`, which calls
+  `run_analysis.run_stages` IN-PROCESS on the same in-memory sessions after the contagion pipeline —
+  no serialization, no second extraction/load. (`--save-pickle` is kept as an opt-in for process
+  isolation or inspecting frames.) Tradeoff: peak memory is higher than the sequential two-process
+  approach, but the memory-heavy phase is extraction (once, inside `load_sessions`); the downstream
+  analyses run on the small 1s frames.
+- **`run_liberation_day.sh` MAIN now uses `--upgraded`** instead of the pickle; **ROBUST (100ms) gains
+  `--upgraded --upgraded-skip dcc`** (cDCC is the expensive stage at 100ms). Upgraded output lands
+  under `<out>/upgraded/`.
+- **New `STAGE=multievent`** pools several 2025 shocks (tariffs 04-03/04-09 + Iran 06-13/06-23) plus a
+  calm control pool via a curated `--dates` list (only the days needed, not a contiguous range), for
+  enough TREATED day-clusters to make the wild-cluster bootstrap valid. Honest caveat printed at run
+  time: pooling across event types assumes a common treatment effect and mixes timing regimes; set
+  `ME_CLASSES=TRADE_POLICY` for homogeneous identification. Pooling buys cluster count, not cleanliness.
+
+
+## v0.8.1 — Restore the contagion driver; route run_liberation_day.sh through the upgraded analysis
+
+Fixes a regression: `run_contagion.py` (and `run_mean_variance.py` / `mean_variance.py`) were dropped
+from the packages at v0.3.0, which silently orphaned `run_liberation_day.sh` — the Liberation-Day
+launcher is built entirely around `run_contagion.py`, so in v0.3.0–v0.8.0 its pilot/main stages failed
+with "No such file." All three modules are restored (verified: `run_contagion --selftest` passes —
+DiD/RD estimators, 16 tables, 0 errors). And the launcher now routes the run through the re-floored
+v0.6–0.8 analysis, not just the original contagion pipeline.
+
+- **`run_liberation_day.sh` MAIN stage now does both, on one extraction.** `run_contagion.py` extracts
+  the window once and `--save-pickle`s the (date,regime,df) frames; the launcher then runs
+  `run_analysis.py --source load --pickle <frames> --legacy --event-class TRADE_POLICY` on the *same*
+  frames — the day-clustered/wild-cluster inference, Hayashi-Yoshida + Rigobon leadership, the two-axis
+  liquidity-stress conditioner, the TARIFF event-clock study, and the LEGACY before/after tables. No
+  second tape pull.
+- **`run_contagion.py` gains `--save-pickle PATH`** — after load + `--auto-regime`, it dumps the
+  sessions so a downstream `run_analysis --source load` reuses them. (Both drivers already share
+  `run_analysis.load_sessions`, so the frame format round-trips exactly.)
+- The window still ends 2025-04-08 (excludes the 04-09 pause), so the TARIFF event study is a clean
+  single overnight regime rather than the mixed overnight+intraday case.
+
+
+## v0.8.0 — Event-clock study wired into the pipeline (`--events` / `--event-class`)
+
+The 2025 exogenous events were already in the registry (Liberation Day 04-03 and the 04-09 pause,
+Israel/US strikes on Iran 06-13 / 06-23, the 2024 yen-carry unwind, …) and the event-study driver was
+already category-general; what was missing was a path to it from `run_analysis` and a guard proving a
+NON-MWCB category flows through end-to-end. Both added.
+
+- **`run_analysis --events TARIFF,GEOPOLITICAL` / `--event-class TRADE_POLICY,GEOPOLITICAL`** — a new,
+  opt-in `events` stage resolves each event's release time (the event clock), matches controls on an
+  ex-ante stress proxy, and runs the event-study profile / DiD / RD-in-time / cross-market (ES→SPY)
+  spillover. Off by default; gated like `--legacy`. Requires the extracted sessions to include BOTH
+  event days AND candidate control days (use `--date-range` over a window).
+- **Ex-ante state, not an outcome.** Control matching uses `_daily_vol_state` — the PRIOR session's
+  realized vol of the SPY mid (t-1, never t's own outcome) — so it does not condition on the dependent
+  variable. Replace with a prior-close VIX series on real data.
+- **Guard `test_event_study_2025.py`** drives the TARIFF category (2025-04-03 overnight + 2025-04-09
+  intraday) through the whole path: the intraday boundary resolves to 13:18; 2 treated + 4 clean
+  controls assemble; the panel builds; DiD/RD/spillover come back finite and correctly signed (treated
+  cost-to-fill jumps post-release). The driver self-test had only covered MWCB.
+- Honest caveat the guard surfaces: TARIFF mixes overnight (04-03) and intraday (04-09) timing
+  (`mixed_regime=True`); a clean single-regime study analyses the two timings separately.
+
+
+## v0.7.0 — Legacy before/after comparison (`--legacy`) + bash launcher
+
+The single most persuasive referee exhibit: the paper's ORIGINAL estimators computed next to the
+upgraded ones on the **same data**, so it is explicit which conclusions survive the re-flooring. New
+module `legacy_tables.py`, a `--legacy` flag on `run_analysis.py`, and a `run_analysis.sh` launcher
+with the comparison ON by default.
+
+- **`legacy_tables.py` — four paired contrasts**, each best-effort (a failure in one leaves the rest):
+  - *comovement* — Pearson realized correlation vs Hayashi-Yoshida (Epps-robust);
+  - *inference* — pooled OLS iid t vs day-clustered t + wild-cluster-bootstrap p (the *** collapse);
+  - *liquidity* — quoted-spread R² vs two-axis book-stress-state R² (+ partial R²);
+  - *identification* — recursive Cholesky (futures ordered first) vs Rigobon heteroskedasticity ID:
+    the Cholesky **assumes** ES←SPY = 0; Rigobon **estimates** it, exposing the ordering artifact.
+- **`--legacy` / `--no-legacy`** on `run_analysis.py` (BooleanOptionalAction, default OFF for a bare
+  python call). When on, a `legacy` stage emits the before/after tables into `report.md`, the per-output
+  CSVs, and `summary.json`. Gated cleanly — off by default, unaffected by `--only`/`--skip`.
+- **`run_analysis.sh`** launcher: legacy ON by default (`LEGACY=false ./run_analysis.sh ...` to disable);
+  a bare `./run_analysis.sh` runs a self-contained demo; all other args forwarded verbatim;
+  `PYTHON=python3` selects the interpreter.
+- **Honest read of the demo.** The Epps gap, the iid→clustered t collapse, and the spread→state R² jump
+  are data-dependent and muted on the *synchronous synthetic* demo; they show real magnitude on the
+  *asynchronous* April-2025 tape. The identification contrast (assumed-zero vs estimated) is stark even
+  on demo. The wild bootstrap is unreliable at the MWCB G=4 — read Ibragimov-Müller there.
+
+
+## v0.6.0 — Liquidity-stress conditioner + validation battery; methods vignette
+
+Realizes the paper's reframing — liquidity stress as the CONDITIONING variable, MWCB demoted to a
+special case — with a two-axis, book-derived stress state plus the validation a referee demands that it
+carries signal the quoted spread cannot. New module `liquidity_stress.py`, guarded end-to-end; the
+methods vignette now travels with the code.
+
+- **`liquidity_stress.py` — the conditioner.** `stress_state` returns two near-orthogonal, cross-asset-
+  comparable, book-derived axes: `depth_illiq` (aggregate thinning) and `hollowness` (near-touch
+  resiliency). `cross_stress_state` aligns both assets so one asset's price discovery can be conditioned
+  on the OTHER's book stress. `cost_to_fill_bps` is the single cost-to-trade-Q summary;
+  `quoted_spread_bps` / `amihud_illiquidity` are the benchmarks the state must beat.
+- **Validation battery.** `incremental_content` (nested partial-R² + cluster-robust joint Wald: does the
+  state beat spread + Amihud?); `fpca_alignment` (the hand-chosen axes ARE distinct data-driven FPCA
+  components); `lambda_validation` (the state predicts realized impact). Trade-derived measures validate,
+  never condition — preserving the book-derived exogeneity of the state.
+- **Guard `test_liquidity_stress.py`** (tick-pinned synthetic book, two independent latent factors): the
+  spread is dead (R²≈0); the axes recover their factors (corr 1.00 / 0.92) and are orthogonal (|corr|≈0);
+  incremental content over spread+Amihud is partial-R² 0.90; the resiliency axis adds 0.69 beyond
+  level+spread; FPCA recovers both axes as distinct labeled components; the state predicts realized
+  impact (t=81 / 195).
+- **`METHODS_VIGNETTE.md`** added to the repo: per-indicator what / why / how-it-enhances-the-paper /
+  how-to-interpret, the leadership-triangulation argument, the reporting checklist, and honest limits.
+
+
+## v0.5.0 — Hardening: jump-robust variation, Rigobon identifying-variation diagnostic, FPCA interpretation, cross-impact symmetry
+
+Four hardening upgrades to already-working modules, each verified by a synthetic known-answer guard.
+
+- **noise_robust_cov.py — jump-robust variation** (H3 / MWCB days). Adds `bipower_variation` (BNS 2004),
+  `threshold_variance` (Mancini 2009 truncated RV), `tripower_quarticity`, and `jump_test` (BNS /
+  Huang-Tauchen ratio test); `realized_variance` gains `'bipower'`/`'threshold'` methods. Guard
+  `test_jumps.py`: on a diffusion + known jumps, naive RV inflates to ~2x IV while BV (1.05x) and TRV
+  (0.96x) recover the continuous integrated variance; the test fires (z≈26) on jumps and is quiet on the
+  no-jump control.
+
+- **rigobon_id.py — identifying-variation diagnostic**. Adds `identification_diagnostic`: a variance-ratio
+  + relative-eigenvalue-gap test that flags the failure mode where regimes differ only in SCALE (common
+  variance factor → coincident eigenvalues → A not identified). Guard `test_rigobon_id.py`: relative
+  heteroskedasticity → identified, C recovered (0.398/0.194); common-scale regimes → flagged not-identified.
+
+- **functional_liquidity.py — component interpretation**. Adds `interpret_components`: labels each FPC as
+  level / slope / curvature by loading-curve sign changes (the economic reading of the liquidity factors).
+  Guard `test_fpca_interp.py`: an injected level+slope structure is recovered and labeled, variance shares
+  matching the injection (0.79 / 0.20).
+
+- **cross_impact.py — Schneider-Lillo symmetry test**. Adds `cross_impact_symmetry`: a Wald test of the
+  no-dynamic-arbitrage restriction Lambda_12 = Lambda_21 using the joint cross-equation HAC covariance
+  (the per-equation SEs cannot). Guard `test_xi_symmetry.py`: a symmetric DGP is not rejected (p≈0.67), an
+  asymmetric one is (p<1e-4).
+
+
+## v0.4.0 — Tier-1 methodology upgrades (gating inference + measured lead-lag + corrected cDCC)
+
+Three estimator upgrades from the methodology upgrade plan, each verified by a synthetic
+known-answer guard (a data-generating process with ground truth). All additive; existing
+functions and module self-tests unchanged.
+
+- **inference.py — wild cluster bootstrap + Ibragimov-Müller** (Stage-1 gating).
+  Adds `cluster_robust_ols` (Liang-Zeger 1986), `wild_cluster_bootstrap` (Cameron-Gelbach-Miller
+  2008, restricted WCR; Webb 2014 six-point weights when clusters ≤ 12), and `ibragimov_muller`
+  (2010/2016 group t-statistic). Targets the paper's pooled inference over ~23.4M observations
+  whose effective N is ~20 days / 4 MWCB events. Guard `test_wild_cluster.py`: under the null with
+  G=10 clusters the iid t over-rejects at ~69%, the wild cluster bootstrap at ~5% and
+  Ibragimov-Müller at ~7-8%, both retaining full power.
+
+- **noise_robust_cov.py — HRY lead-lag** (Stage-2 gating). Adds `lead_lag` (Hoffmann-Rosenbaum-
+  Yoshida 2013 shifted-HY contrast), turning the paper's ASSUMED Cholesky "futures leads" ordering
+  into a measured, signed quantity (positive ⇒ first series leads). Guard `test_leadlag.py`
+  recovers an injected ±50 ms lead and the no-lead null with correct sign.
+
+- **dcc_garch.py — Aielli cDCC** (serves the named Copula-DCC-GARCH method). Adds `cdcc_fit`
+  (Aielli 2013 corrected cDCC with consistent correlation targeting) alongside Engle DCC, and makes
+  it the default in `dcc_garch_x` (`dcc_method="cdcc"|"engle"`). Guard `test_cdcc.py` recovers
+  (a, b, S) from data generated by a true cDCC.
+
+Deferred by design (unchanged): the Putniņš ILS in `price_discovery_shares.py` remains a documented
+stub — the vanilla formula is academically contested (Shrestha-Lee 2023; Shen-Zivot 2024; corrected
+Shen-Zhang-Zivot 2025 JEF) and is intentionally not implemented from memory.
+
+## v0.3.0
+Scope/spine triage; severed stray `paper_tables`→`mstbook_loader` self-test import; removed
+superseded drivers (`run_contagion`, `run_mean_variance`, `mean_variance`).
+
+## v0.2.0
+Three verified fixes: `lob_reconstruct` crossed-book (price-keyed reduce); `ecm_sde` day-clustered
+SE on the headline gradient; `price_discovery_shares` `panel_vecm` day-clustered SE.
