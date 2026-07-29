@@ -227,15 +227,8 @@ Being explicit about coverage, since "the entire stack" is ~55 modules:
 - **The price-discovery half (§5, Tables 9–14)** — the SVAR/IRF machinery in
   `correlation_svar.py`, `price_discovery_shares.py`, `ecm_sde.py`, `irf.py` has been read
   but not audited to the depth applied to Table 5. Its self-tests pass.
-- **The Epps/asynchronicity question.** The paper computes SPY–ES return correlations at
-  10 ms and never mentions non-synchronous trading; the word "Epps" does not appear. At
-  that frequency measured correlation is attenuated by asynchronous updating, and the
-  attenuation depends on trading intensity — which is itself on the right-hand side of
-  Eq. (5). The stack already has the fix (`noise_robust_cov.hayashi_yoshida`, and
-  `legacy_tables.py` even contrasts Pearson vs HY), but `correlation_svar.build_svar_frame`
-  builds Δρ from a plain Pearson rolling correlation with no HY option. Adding
-  `corr_method="hy"` and reporting Table 9 both ways looks like the highest-value next
-  step, and it is a natural referee question.
+- **The price-discovery half beyond the dependent variable** — the identification and lag
+  structure of Eq. (5)/(6) has not been audited to the depth applied to Table 5.
 - One hypothesis I tested and **rejected**: that the default moving-block bootstrap length
   (~*n*^⅓) is too short for the overlapping 100-bar rolling correlation. Differencing kills
   the overlap persistence — the bootstrap SE (0.00008) matches the Monte Carlo truth

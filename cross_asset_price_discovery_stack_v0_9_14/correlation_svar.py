@@ -1,0 +1,688 @@
+"""
+correlation_svar.py
+==================
+Reproduce **Table 9** ("Impulse Response of Price Return Correlation") of Garrison,
+Jain & Paddrik -- but in the spread-based, depth-frame-native framework of this stack,
+and offer the structurally cleaner replacement.
+
+Table 9 is the SVAR of Eq. (5): the response of the change in price-return correlation
+to order-flow / liquidity shocks. The paper proxies liquidity with message-type
+proportions (LS/LD/cancel). Here we instead use SPREADS computed from the book:
+
+  * standard quoted spread   :  a1 - b1                          (bps of mid)
+  * weighted spread          :  depth-weighted round-trip cost-to-fill
+                                slippage_ask(Q) + slippage_bid(Q) (bps), or a
+                                size-weighted half-spread average
+  * informational proxies    :  multi-level OFI (book pressure, replacing the crude
+                                NCMOF/PCMOF message states), realized variance, and the
+                                microprice-minus-mid deviation
+
+Two things matter methodologically (see the module functions):
+
+  1. Dependent variable. The paper differences a 100-bar ROLLING return correlation.
+     We support that (corr_method='rolling'), the Epps-robust Hayashi-Yoshida correlation
+     over the same window (corr_method='hy'), and the DCC conditional correlation
+     (corr_method='dcc', via dcc_garch) which has no look-ahead-window artifact.
+     The paper samples at one second AND ten milliseconds; grid-sampled Pearson is
+     attenuated by asynchronous quote updating at both, severely at the latter, and the
+     attenuation moves with trading intensity -- which is on the right-hand side.
+
+  2. Identification. The paper uses an identity shock covariance (no real
+     orthogonalization) with correlation ordered first -- which would zero the
+     contemporaneous effects it reports. We provide ident='cholesky' (correlation
+     ordered LAST, recursive, futures-lead) and ident='identity' (the paper's shortcut,
+     Theta_h = Psi_h scaled by own SD), so the gap is visible.
+
+The *better* object is `spread_conditioned_is`: rather than regress d-correlation on
+spread, it makes the (weighted) spread the conditioning state S in the information-share
+curve IS(S) via ecm_sde -- the state-dependent price-discovery object this stack is built
+around. Pure numpy/pandas (+ optional dcc_garch).
+"""
+import numpy as np
+import pandas as pd
+
+import liquidity_curve_metrics as lcm
+import cross_asset_pd_liquidity as ca
+import price_discovery_shares as pds
+import robust_prices as rp
+import ecm_sde as es
+
+EPS = 1e-12
+
+
+# ── spread observables (from the depth frame) ─────────────────────────────────
+def quoted_spread(df, asset):
+    """Standard quoted BBO spread (a1 - b1), in basis points of the mid."""
+    a1 = df[f"{asset}_askprice_1"].to_numpy(); b1 = df[f"{asset}_bidprice_1"].to_numpy()
+    mid = (a1 + b1) / 2.0
+    return (a1 - b1) / np.where(mid > EPS, mid, np.nan) * 1e4
+
+
+def _default_target(qa, qb):
+    """A fill size that walks past level 1: median cumulative depth over the first
+    min(3, N) levels (so the weighted spread is a genuine multi-level cost)."""
+    k = min(3, qa.shape[1])
+    cum = np.nanmedian(np.nansum(qa[:, :k], axis=1) + np.nansum(qb[:, :k], axis=1)) / 2.0
+    return float(max(cum, 1.0))
+
+
+def weighted_spread(df, asset, target_qty=None, n_levels=10, kind="cost_to_fill"):
+    """Depth-weighted spread (bps of mid). kind='cost_to_fill' (default) is the
+    round-trip effective spread to trade `target_qty` per side (walks the book via
+    slippage_to_fill); kind='depth_weighted' is the size-weighted half-spread average
+    a*q summed over levels. Both >= the quoted spread (deeper levels are worse)."""
+    da, qa, mid = lcm.extract_book(df, asset, "ask", n_levels, unit="pct")    # pct of mid
+    db, qb, _ = lcm.extract_book(df, asset, "bid", n_levels, unit="pct")
+    if kind == "depth_weighted":
+        wa = np.nansum(lcm._clean(qa) * da, axis=1) / np.maximum(np.nansum(lcm._clean(qa), axis=1), EPS)
+        wb = np.nansum(lcm._clean(qb) * db, axis=1) / np.maximum(np.nansum(lcm._clean(qb), axis=1), EPS)
+        return (wa + wb) * 1e4
+    Q = _default_target(qa, qb) if target_qty is None else float(target_qty)
+    sa = lcm.slippage_to_fill(da, qa, Q)                                       # avg dist to fill Q (pct)
+    sb = lcm.slippage_to_fill(db, qb, Q)
+    return (sa + sb) * 1e4
+
+
+def microprice_dev(df, asset, n_levels=5):
+    """Microprice minus mid, in bps -- a sub-tick directional-pressure / information proxy."""
+    mp = rp.microprice(df, asset, n_levels)
+    a1 = df[f"{asset}_askprice_1"].to_numpy(); b1 = df[f"{asset}_bidprice_1"].to_numpy()
+    mid = (a1 + b1) / 2.0
+    return (mp - mid) / np.where(mid > EPS, mid, np.nan) * 1e4
+
+
+def _returns_bps(df, asset):
+    mid = np.asarray(ca._mid(df, asset), float)
+    r = np.diff(np.log(np.where(mid > EPS, mid, np.nan))) * 1e4
+    return np.concatenate([[np.nan], r])                                       # align to df.index
+
+
+# ── Epps-robust dependent variable (Hayashi-Yoshida) ──────────────────────────
+# The paper's Delta-rho is the first difference of a Pearson correlation of returns sampled on
+# a fixed grid, at one second AND at ten milliseconds. Pearson on a fixed grid is exactly the
+# estimator the Epps effect attacks: SPY and ES do not update at the same instants, so within a
+# short bar one leg's mid is often stale, the grid records a zero return for it, and the measured
+# correlation is pulled toward zero. The bias grows as the bar shrinks -- which is why measured
+# correlation rises with the sampling interval at all (that IS the Epps curve).
+#
+# This matters for Eq. (5) beyond precision. The severity of the attenuation depends on how
+# often each leg updates, i.e. on trading intensity -- and volume, message traffic and liquidity
+# demand are all REGRESSORS in the same system. So part of any estimated "activity raises
+# correlation" relationship is the measurement error moving with the regressor, not a market
+# mechanism. Hayashi-Yoshida is consistent for the covariance of asynchronously observed
+# processes and uses no grid at all, so it removes that channel.
+#
+# On a bar grid the asynchronicity is recoverable: a bar in which an asset's mid did not move is
+# precisely a bar in which that asset did not update, and its zero return is the artifact. Taking
+# each asset's own mid-CHANGE times as its observation times restores the irregular, asynchronous
+# sampling HY is designed for.
+def _hy_rolling_corr(mid_spy, mid_es, window):
+    """Rolling Hayashi-Yoshida correlation of two mid series observed on a shared bar grid.
+
+    Each asset contributes only the bars where its own mid actually moved, so no synchronizing
+    grid is imposed and stale-quote zero returns cannot attenuate the estimate. Returns a
+    length-T array (leading NaN until `window` bars of history) of
+
+        rho_HY(t) = HY_cov(t-window, t] / sqrt( RV_SPY * RV_ES )
+
+    where RV is each leg's own tick-by-tick realized variance over the same span. Each
+    HY interval-pair product is attributed to the LAST bar of the two intervals it spans, so
+    the window ending at t uses no information dated after t (no look-ahead), and the rolling
+    sums are exact cumulative sums -- O(n + m + T) overall, not O(T * window).
+
+    Note this is a realized correlation (no demeaning), whereas `rolling().corr()` demeans.
+    Over a 100-bar window of near-zero-mean returns the difference is negligible; the Epps
+    correction is orders of magnitude larger."""
+    T = len(mid_spy)
+    W = int(window)
+    out = np.full(T, np.nan)
+    if T < W + 2 or W < 2:
+        return out
+    lp = {}
+    for nm, m in (("SPY", mid_spy), ("ES", mid_es)):
+        v = np.asarray(m, float)
+        v = np.log(np.where(v > EPS, v, np.nan))
+        i = np.flatnonzero(np.isfinite(v))
+        if i.size < 3:
+            return out
+        # keep only bars where THIS asset's mid moved: its genuine observation times
+        keep = np.concatenate([[i[0]], i[1:][np.abs(np.diff(v[i])) > 0]])
+        lp[nm] = (keep.astype(np.int64), v[keep])
+    (i1, p1), (i2, p2) = lp["SPY"], lp["ES"]
+    if i1.size < 3 or i2.size < 3:
+        return out
+    r1 = np.diff(p1); a1, b1 = i1[:-1], i1[1:]
+    r2 = np.diff(p2); a2, b2 = i2[:-1], i2[1:]
+
+    cov_at = np.zeros(T)                       # HY cross products, attributed to a bar
+    v1_at = np.zeros(T); v2_at = np.zeros(T)   # each leg's realized variance, per bar
+    np.add.at(v1_at, b1, r1 * r1)
+    np.add.at(v2_at, b2, r2 * r2)
+    m, lo = len(r2), 0
+    for k in range(len(r1)):                   # two-pointer HY sweep (O(n+m), as in noise_robust_cov)
+        while lo < m and b2[lo] <= a1[k]:
+            lo += 1
+        j = lo
+        ak, bk, rk = a1[k], b1[k], r1[k]
+        while j < m and a2[j] < bk:
+            cov_at[bk if bk >= b2[j] else b2[j]] += rk * r2[j]     # attribute to the later end
+            j += 1
+
+    def _roll(x):
+        c = np.concatenate([[0.0], np.cumsum(x)])
+        s = np.full(T, np.nan)
+        s[W:] = c[W + 1:] - c[1:T - W + 1]
+        return s
+    C, V1, V2 = _roll(cov_at), _roll(v1_at), _roll(v2_at)
+    den = np.sqrt(np.where((V1 > EPS) & (V2 > EPS), V1 * V2, np.nan))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        rho = C / den
+    return np.clip(rho, -1.0, 1.0)
+
+
+# ── variable assembly (spec progression: standard -> weighted -> informational) ─
+PRESETS = {
+    "standard":      ["qspr"],
+    "weighted":      ["qspr", "wspr"],
+    "informational": ["qspr", "wspr", "ofi", "rv", "mdev"],
+}
+_DIFF = {"qspr", "wspr"}                         # liquidity levels enter as changes (as in the paper)
+_LABEL = {"qspr": "Spread", "wspr": "WtdSpread", "ofi": "OFI", "rv": "RV", "mdev": "MicroDev"}
+
+
+def build_svar_frame(df, spec="informational", n_levels=10, target_qty=None,
+                     corr_method="rolling", corr_window=100, wspread_kind="cost_to_fill",
+                     dcc_returns=None, extra_fn=None):
+    """Assemble the per-bar SVAR variables in CAUSAL order (futures ES block, then
+    equities SPY block, any `extra_fn(df)` columns, then the d-correlation LHS last).
+    Liquidity levels are differenced; OFI/RV/MicroDev and extra columns enter as
+    (stationary) levels. Returns (X[T', k], names, corr_idx) after dropping incomplete
+    rows. `extra_fn(df) -> DataFrame` injects continuous cross-flow regressors (e.g.
+    cross_flow.cross_flow_features(df)[["PCMOF","NCMOF"]]) right before the LHS.
+
+    corr_method='rolling' -> d of the `corr_window`-bar return correlation (the paper).
+    corr_method='hy'      -> d of the `corr_window`-bar HAYASHI-YOSHIDA correlation. Same
+                             window, but asynchronicity-robust: immune to the Epps attenuation
+                             that biases grid-sampled Pearson toward zero, and whose severity
+                             moves with trading intensity -- itself a regressor in this system.
+                             Report Table 9 both ways; the gap IS the measurement artifact.
+    corr_method='dcc'     -> d of the DCC conditional correlation (pass dcc_returns or it
+                             is fit here from the two return series)."""
+    feats = PRESETS[spec] if isinstance(spec, str) else list(spec)
+    idx = df.index
+    cols = {}
+    r = {a: _returns_bps(df, a) for a in ("SPY", "ES")}
+    for a in ("ES", "SPY"):                                                    # futures first
+        for f in feats:
+            if f == "qspr":
+                cols[(a, f)] = quoted_spread(df, a)
+            elif f == "wspr":
+                cols[(a, f)] = weighted_spread(df, a, target_qty, n_levels, wspread_kind)
+            elif f == "ofi":
+                cols[(a, f)] = ca.order_flow_imbalance(df, a, n_levels)
+            elif f == "rv":
+                rr = pd.Series(r[a], index=idx)
+                cols[(a, f)] = (rr ** 2).rolling(corr_window, min_periods=corr_window // 2).mean().to_numpy()
+            elif f == "mdev":
+                cols[(a, f)] = microprice_dev(df, a, min(n_levels, 5))
+    V = pd.DataFrame({f"{_LABEL[f]}_{a}": v for (a, f), v in cols.items()}, index=idx)
+    for (a, f) in cols:                                                         # difference liquidity levels
+        if f in _DIFF:
+            name = f"{_LABEL[f]}_{a}"
+            V[name] = V[name].diff()
+    if extra_fn is not None:                                                    # inject cross-flow regressors
+        E = extra_fn(df).reindex(idx)
+        for c in E.columns:
+            V[c] = np.asarray(E[c], float)
+    # dependent: change in return correlation
+    if corr_method == "dcc":
+        rho = _dcc_corr(df, r, dcc_returns)
+    elif corr_method == "hy":                                                   # Epps-robust
+        rho = _hy_rolling_corr(ca._mid(df, "SPY"), ca._mid(df, "ES"), corr_window)
+    else:
+        rho = pd.Series(r["SPY"], index=idx).rolling(corr_window).corr(pd.Series(r["ES"], index=idx))
+    V["dCorr"] = pd.Series(np.asarray(rho), index=idx).diff()
+    names = list(V.columns)                                                    # dCorr is last
+    X = V.to_numpy()
+    mask = np.all(np.isfinite(X), axis=1)
+    return X[mask], names, len(names) - 1
+
+
+def _dcc_corr(df, r, dcc_returns):
+    """DCC conditional correlation series (length len(df), leading NaN). Falls back to
+    NaN if dcc_garch is unavailable or the fit fails."""
+    try:
+        import dcc_garch as dg
+        ret = dcc_returns if dcc_returns is not None else np.column_stack(
+            [np.diff(np.log(np.asarray(ca._mid(df, "SPY"), float))), np.diff(np.log(np.asarray(ca._mid(df, "ES"), float)))])
+        fit = dg.dcc_garch_x(ret)
+        return np.concatenate([[np.nan], np.asarray(fit["rho"], float)])
+    except Exception:
+        return np.full(len(df), np.nan)
+
+
+# ── reduced-form VAR(p) + orthogonalized IRF ──────────────────────────────────
+def var_ols(X, p):
+    """Reduced-form VAR(p): X_t = c + sum_{i=1}^p A_i X_{t-i} + u_t. Returns
+    (A list of (k,k), Sigma (k,k) residual covariance, residuals)."""
+    T, k = X.shape
+    Y = X[p:]
+    Z = np.column_stack([np.ones(T - p)] + [X[p - i:T - i] for i in range(1, p + 1)])
+    B, resid = pds._ols(Y, Z)
+    A = [B[1 + (i - 1) * k: 1 + i * k, :].T for i in range(1, p + 1)]
+    dof = max(resid.shape[0] - Z.shape[1], 1)
+    Sigma = (resid.T @ resid) / dof
+    return A, Sigma, resid
+
+
+def _ma_from_var(A, H):
+    """Wold MA matrices Psi_0..Psi_H: Psi_0 = I, Psi_h = sum_{i=1}^{min(h,p)} A_i Psi_{h-i}."""
+    k = A[0].shape[0]; p = len(A)
+    Psi = [np.eye(k)]
+    for h in range(1, H + 1):
+        S = np.zeros((k, k))
+        for i in range(1, min(h, p) + 1):
+            S += A[i - 1] @ Psi[h - i]
+        Psi.append(S)
+    return Psi
+
+
+def orthogonalized_irf(A, Sigma, H, ident="cholesky"):
+    """Orthogonalized IRF Theta_0..Theta_H (each (k,k)); Theta_h[j,m] = response of
+    variable j to a 1-SD structural shock to variable m at horizon h, in the variable
+    order of X. ident='cholesky' uses the recursive lower-triangular factor (so with the
+    target ordered last, every shock hits it contemporaneously); ident='identity' is the
+    paper's diagonal-covariance shortcut (own-SD scaling, no cross-orthogonalization)."""
+    if ident == "identity":
+        L = np.diag(np.sqrt(np.clip(np.diag(Sigma), 0.0, None)))
+    else:
+        S = Sigma + np.eye(Sigma.shape[0]) * EPS
+        L = np.linalg.cholesky(S)
+    Psi = _ma_from_var(A, H)
+    return [Psi[h] @ L for h in range(H + 1)]
+
+
+# ── Table 9: IRF of correlation to each shock, by regime ──────────────────────
+def correlation_irf(data, spec="informational", n_lags=6, horizon=10, ident="cholesky",
+                    cumulative=False, n_levels=10, corr_method="rolling", corr_window=100,
+                    target_qty=None, wspread_kind="cost_to_fill", min_obs=400, extra_fn=None,
+                    criterion=None, pmax=12):
+    """Reproduce Table 9 in the spread framework. `data` is a (date, regime, df) session
+    list (one VAR per regime, frames stacked) or a single df (regime 'all'). Returns a
+    DataFrame: rows = shock variables, columns = regimes, values = the impact (h=0)
+    orthogonalized response of d-correlation to a 1-SD shock, x100 (the paper's scaling).
+    With cumulative=True the column is the summed response over `horizon`. `extra_fn`
+    injects continuous cross-flow regressors (e.g. cross_flow.cross_flow_features) so
+    Table 9 can be run on chi / PCMOF-NCMOF / common-divergent instead of just spreads."""
+    if isinstance(data, pd.DataFrame):
+        groups = {"all": [data]}
+    else:
+        groups = {}
+        for item in data:
+            df = item[-1]; regime = item[1] if len(item) == 3 else "all"
+            groups.setdefault(regime, []).append(df)
+
+    out = {}
+    names_ref = None
+    for regime, frames in groups.items():
+        Xs, names = [], None
+        for df in frames:
+            X, nm, ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
+                                         corr_window, wspread_kind, extra_fn=extra_fn)
+            if len(X) > n_lags + 5:
+                Xs.append(X); names = nm; corr_idx = ci
+        if not Xs or sum(len(x) for x in Xs) < min_obs:
+            continue
+        X = np.vstack(Xs); names_ref = names
+        p_use = pds.select_lag_var(X, pmax=pmax, criterion=criterion)[0] if criterion is not None else n_lags
+        A, Sigma, _ = var_ols(X, p_use)
+        Theta = orthogonalized_irf(A, Sigma, horizon, ident)
+        if cumulative:
+            resp = np.sum([Theta[h][corr_idx, :] for h in range(horizon + 1)], axis=0)
+        else:
+            resp = Theta[0][corr_idx, :]
+        out[regime] = resp * 100.0                                             # paper scales by 100
+
+    if not out:
+        return pd.DataFrame()
+    tab = pd.DataFrame(out, index=names_ref)
+    return tab.drop(index=names_ref[-1])                                       # drop the dCorr-own row
+
+
+# ── Table 9 with inference: bootstrap SE + Romano-Wolf joint significance ──────
+def _stars(p):
+    if p is None or not np.isfinite(p):
+        return ""
+    return "***" if p < 0.01 else "**" if p < 0.05 else "*" if p < 0.10 else ""
+
+
+def _fmt_cell(coef, se=None, p=None, prec=3):
+    if coef is None or (isinstance(coef, float) and not np.isfinite(coef)):
+        return "--"
+    s = f"{coef:.{prec}f}{_stars(p)}"
+    if se is not None and np.isfinite(se):
+        s += f" ({se:.{prec}f})"
+    return s
+
+
+def _irf_corr_response(X, corr_idx, n_lags, horizon, ident, cumulative):
+    """Impact (or cumulative) orthogonalized response of d-correlation to each shock, x100."""
+    A, Sigma, _ = var_ols(X, n_lags)
+    Theta = orthogonalized_irf(A, Sigma, horizon, ident)
+    if cumulative:
+        return np.sum([Theta[h][corr_idx, :] for h in range(horizon + 1)], axis=0) * 100.0
+    return Theta[0][corr_idx, :] * 100.0
+
+
+def epps_comparison(data, methods=("rolling", "hy"), **kw):
+    """Table 9 computed with each dependent variable in `methods`, side by side.
+
+    The point of the pairing is not robustness box-ticking. Grid-sampled Pearson is attenuated
+    by asynchronous quote updating, the attenuation is a function of trading intensity, and
+    trading intensity is on the right-hand side of the same system -- so the naive estimator
+    cannot separate "activity raises correlation" from "activity makes correlation easier to
+    measure". Hayashi-Yoshida imposes no grid and breaks that link, so the DIFFERENCE between
+    the two columns is an estimate of how much of each response is measurement artifact.
+
+    Coefficients that keep their sign, size and significance across both are safe to interpret
+    as market mechanism. Ones that shrink toward zero under 'hy' were partly the Epps channel;
+    the volume and message-traffic responses are the ones to watch, since they drive the
+    attenuation most directly.
+
+    Returns a DataFrame indexed by shock with a column block per method, plus `delta_<regime>`
+    columns giving (hy - rolling) for each regime."""
+    out = {}
+    for m in methods:
+        tb = correlation_irf(data, corr_method=m, **kw)
+        for c in tb.columns:
+            out[(m, c)] = tb[c]
+    res = pd.DataFrame(out)
+    res.columns = pd.MultiIndex.from_tuples(res.columns, names=["corr_method", "regime"])
+    if len(methods) == 2 and all(m in res.columns.get_level_values(0) for m in methods):
+        a, b = methods
+        for c in res[b].columns:
+            if c in res[a].columns:
+                res[("delta", c)] = res[b][c] - res[a][c]
+    return res
+
+
+def correlation_irf_inference(data, spec="informational", n_lags=6, horizon=10, ident="cholesky",
+                              cumulative=False, n_levels=10, corr_method="rolling", corr_window=100,
+                              target_qty=None, wspread_kind="cost_to_fill", min_obs=400, extra_fn=None,
+                              n_boot=499, alpha=0.05, rw_by_regime=False, block_len=None, seed=0,
+                              n_jobs=None):
+    """`correlation_irf` with bootstrap standard errors and **Romano-Wolf joint significance**
+    built in, so the IRF table comes out publication-ready: each cell is the impact (or
+    cumulative) response x100 with a bootstrap SE and stars from the FWER-controlled
+    (joint, cross-correlation-robust) p-value.
+
+    Resampling unit:
+      * a (date, regime, df) session list with >=2 sessions -> a DAY-CLUSTER bootstrap
+        (resample whole sessions); because each replication rebuilds the SVAR frame, this
+        also propagates the generated-regressor uncertainty in d-correlation.
+      * a single df (or one session) -> a moving-block bootstrap of the built SVAR frame
+        rows (d-correlation treated as fixed -- no first-stage propagation).
+
+    Romano-Wolf scope: `rw_by_regime=False` controls FWER jointly over ALL shock x regime
+    cells (the strongest joint claim); `True` controls within each regime column.
+
+    Returns a dict: point, se, tstat, padj, reject, ci_lower, ci_upper (all DataFrames with
+    the shock x regime shape of `correlation_irf`), a rendered `table` (coef*** (se)), a
+    per-regime `joint` summary (n_shocks, n_reject, min_padj), plus alpha, n_boot, rw_scope.
+    """
+    from inference import romano_wolf_from_boot, moving_block_bootstrap, parallel_bootstrap
+
+    kw = dict(spec=spec, n_lags=n_lags, horizon=horizon, ident=ident, cumulative=cumulative,
+              n_levels=n_levels, corr_method=corr_method, corr_window=corr_window,
+              target_qty=target_qty, wspread_kind=wspread_kind, min_obs=min_obs, extra_fn=extra_fn)
+    point = correlation_irf(data, **kw)
+    empty = {"point": point, "se": pd.DataFrame(), "tstat": pd.DataFrame(), "padj": pd.DataFrame(),
+             "reject": pd.DataFrame(), "ci_lower": pd.DataFrame(), "ci_upper": pd.DataFrame(),
+             "table": pd.DataFrame(), "joint": pd.DataFrame(), "alpha": alpha, "n_boot": 0,
+             "rw_scope": "by_regime" if rw_by_regime else "joint"}
+    if point.empty:
+        return empty
+    rows, cols = list(point.index), list(point.columns)
+
+    # ---- bootstrap draws (B, R, C) aligned to the point table ----
+    draws = []
+    if not isinstance(data, pd.DataFrame) and len(data) >= 2:
+        sess = list(data); nse = len(sess)
+
+        def _draw(child_seed):                                       # day-cluster: resample whole sessions
+            r = np.random.default_rng(child_seed)
+            idx = r.integers(0, nse, nse)
+            tb = correlation_irf([sess[i] for i in idx], **kw)
+            return tb.reindex(index=rows, columns=cols).to_numpy() if not tb.empty else None
+
+        # threading: session frames shared read-only (no pickling), refit releases the GIL,
+        # and the bootstrap is post-extraction so it is not memory-bound -> use all cores.
+        draws = parallel_bootstrap(_draw, n_boot, n_jobs=n_jobs, backend="threading", seed=seed)
+        B = np.array(draws) if draws else None
+    else:                                                            # single frame: block-bootstrap its rows
+        df = data if isinstance(data, pd.DataFrame) else data[0][-1]
+        X, names, ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method, corr_window,
+                                        wspread_kind, extra_fn=extra_fn)
+        nshock = len(names) - 1
+        stat = lambda Xb: _irf_corr_response(Xb, ci, n_lags, horizon, ident, cumulative)[:nshock]
+        bd = moving_block_bootstrap(X, stat, n_boot=n_boot, block_len=block_len, seed=seed,
+                                    n_jobs=n_jobs)                   # (B, R)
+        B = bd[:, :len(rows), None]                                  # single 'all' regime column
+
+    if B is None or B.shape[0] < 2:
+        return empty
+
+    pt = point.to_numpy()
+    se = np.nanstd(B, axis=0, ddof=1)
+    tstat = pt / np.where(se > EPS, se, np.nan)
+    lo = np.nanpercentile(B, 100 * alpha / 2, axis=0); hi = np.nanpercentile(B, 100 * (1 - alpha / 2), axis=0)
+
+    padj = np.ones_like(pt, dtype=float)
+    if rw_by_regime:
+        for j in range(pt.shape[1]):
+            ptj, Bj = pt[:, j], B[:, :, j]
+            fin = np.isfinite(ptj) & np.all(np.isfinite(Bj), axis=0)
+            if fin.sum() >= 1:
+                padj[fin, j] = romano_wolf_from_boot(ptj[fin], Bj[:, fin])["adj_p"]
+    else:
+        ptf = pt.ravel(); Bf = B.reshape(B.shape[0], -1)
+        fin = np.isfinite(ptf) & np.all(np.isfinite(Bf), axis=0)
+        adj = np.ones_like(ptf)
+        if fin.sum() >= 1:
+            adj[fin] = romano_wolf_from_boot(ptf[fin], Bf[:, fin])["adj_p"]
+        padj = adj.reshape(pt.shape)
+    reject = padj <= alpha
+
+    mk = lambda M: pd.DataFrame(M, index=rows, columns=cols)
+    table = pd.DataFrame(index=rows, columns=cols, dtype=object)
+    for i in range(len(rows)):
+        for j in range(len(cols)):
+            table.iloc[i, j] = _fmt_cell(pt[i, j], se[i, j], padj[i, j])
+    table.index.name = "shock"
+
+    jr = []
+    for j, c in enumerate(cols):
+        fin = np.isfinite(pt[:, j])
+        jr.append({"regime": c, "n_shocks": int(fin.sum()),
+                   "n_reject": int(np.sum(reject[:, j] & fin)),
+                   "min_padj": float(np.nanmin(padj[fin, j])) if fin.any() else np.nan})
+    joint = pd.DataFrame(jr).set_index("regime")
+
+    return {"point": point, "se": mk(se), "tstat": mk(tstat), "padj": mk(padj),
+            "reject": pd.DataFrame(reject, index=rows, columns=cols),
+            "ci_lower": mk(lo), "ci_upper": mk(hi), "table": table, "joint": joint,
+            "alpha": alpha, "n_boot": int(B.shape[0]), "rw_scope": "by_regime" if rw_by_regime else "joint"}
+
+
+def fevd_correlation(data, spec="informational", n_lags=6, horizon=20, **kw):
+    """Forecast-error variance of d-correlation attributed to each shock at `horizon`
+    (recursive identification), per regime. Complements the IRF: shares sum to 1."""
+    tabs = {}
+    groups = ({"all": [data]} if isinstance(data, pd.DataFrame)
+              else _group_by_regime(data))
+    for regime, frames in groups.items():
+        Xs = []; names = None; corr_idx = None
+        for df in frames:
+            X, nm, ci = build_svar_frame(df, spec, n_lags=n_lags if False else 0, **_fkw(kw)) \
+                if False else build_svar_frame(df, spec, **_bkw(kw))
+            if len(X) > n_lags + 5:
+                Xs.append(X); names = nm; corr_idx = ci
+        if not Xs:
+            continue
+        X = np.vstack(Xs)
+        A, Sigma, _ = var_ols(X, n_lags)
+        Theta = orthogonalized_irf(A, Sigma, horizon, "cholesky")
+        num = np.zeros(Sigma.shape[0]); tot = 0.0
+        for h in range(horizon + 1):
+            row = Theta[h][corr_idx, :]
+            num += row ** 2; tot += float(np.sum(row ** 2))
+        tabs[regime] = pd.Series(num / tot if tot > 0 else num, index=names).drop(names[-1])
+    return pd.DataFrame(tabs)
+
+
+def _group_by_regime(data):
+    g = {}
+    for item in data:
+        g.setdefault(item[1] if len(item) == 3 else "all", []).append(item[-1])
+    return g
+
+
+def _bkw(kw):
+    return {k: kw[k] for k in ("n_levels", "target_qty", "corr_method", "corr_window",
+                               "wspread_kind") if k in kw}
+
+
+# ── the better object: spread-conditioned information share IS(S) ─────────────
+def spread_conditioned_is(sessions, spread_kind="weighted", n_levels=10, target_qty=None,
+                          wspread_kind="cost_to_fill", degree=1, n_lags=0, hac_lags=20):
+    """The structural replacement for Table 9: instead of regressing d-correlation on
+    spread, make the relative (weighted) spread the conditioning STATE in the
+    information-share curve, S = log(spread_ES) - log(spread_SPY), and report IS(S) via
+    the state-dependent ECM-SDE. A negative IS_ES gradient in S means ES leads price
+    discovery precisely when its book is relatively tighter -- the thesis, read off a
+    spread state. Returns the ecm_sde fit (with fit['curve'] the IS(S) table)."""
+    def _spr(df, a):
+        return (weighted_spread(df, a, target_qty, n_levels, wspread_kind)
+                if spread_kind == "weighted" else quoted_spread(df, a))
+
+    def state_fn(df):
+        se = _spr(df, "ES"); ss = _spr(df, "SPY")
+        return np.log(np.maximum(se, EPS)) - np.log(np.maximum(ss, EPS))
+
+    return es.estimate_sample(sessions, state_fn=state_fn, degree=degree,
+                              n_lags=n_lags, hac_lags=hac_lags)
+
+
+# ── self-test ─────────────────────────────────────────────────────────────────
+def _demo_frame(n=8000, seed=0, depth_factor=1.0):
+    """Synthetic two-asset book where a common factor drives returns, and ES depth
+    (hence its spread) responds to volatility -- enough structure to exercise the IRF."""
+    rng = np.random.default_rng(seed)
+    s = np.abs(rng.normal(0, 1, n)).cumsum() * 0 + np.abs(rng.standard_normal(n))   # vol proxy
+    f = rng.normal(0, 1, n).cumsum()                                            # common log-price factor
+    lp1 = f + rng.normal(0, 0.3, n); lp2 = f + rng.normal(0, 0.3, n)
+    ms, me = 500 * np.exp(lp1 / 50), 5000 * np.exp(lp2 / 50)
+    lev = np.arange(1, 11); dw = np.exp(-0.3 * (lev - 1)); cols = {}
+    for a, mid, tick, sgn in (("SPY", ms, 0.01, -0.5), ("ES", me, 0.25, 0.5)):
+        depth = 300.0 * np.exp(sgn * s) * depth_factor
+        for i, l in enumerate(lev):
+            q = np.maximum(depth * dw[i] * (1 + rng.normal(0, 0.05, n)), 1.0)
+            cols[f"{a}_bidprice_{l}"] = mid - l * tick; cols[f"{a}_askprice_{l}"] = mid + l * tick
+            cols[f"{a}_bidquantity_{l}"] = q; cols[f"{a}_askquantity_{l}"] = q * (1 + rng.normal(0, 0.02, n))
+    idx = pd.date_range("2024-08-05 09:30", periods=n, freq="s", tz="America/New_York")
+    return pd.DataFrame(cols, index=idx)
+
+
+def _selftest():
+    print("correlation_svar self-test")
+    df = _demo_frame()
+
+    # (1) spread observables: positive, weighted >= quoted, finite
+    qs = quoted_spread(df, "ES"); ws = weighted_spread(df, "ES"); wd = weighted_spread(df, "ES", kind="depth_weighted")
+    md = microprice_dev(df, "ES")
+    print("\n(1) spread observables (ES, bps)")
+    print("    quoted mean=%.3f  cost-to-fill mean=%.3f  depth-wtd mean=%.3f  microdev std=%.3f"
+          % (np.nanmean(qs), np.nanmean(ws), np.nanmean(wd), np.nanstd(md)))
+    print("    checks:", np.nanmean(qs) > 0 and np.nanmean(ws) >= np.nanmean(qs) - 1e-9
+          and np.nanmean(wd) >= np.nanmean(qs) - 1e-9 and np.isfinite(np.nanstd(md)))
+
+    # (2) VAR / IRF algebra on a known 2-var system: Psi_1 == A_1, impact == chol(Sigma)
+    rng = np.random.default_rng(1); T = 6000
+    A1 = np.array([[0.4, 0.1], [0.2, 0.3]]); L0 = np.array([[1.0, 0.0], [0.5, 0.8]])
+    e = rng.normal(0, 1, (T, 2)) @ L0.T; Y = np.zeros((T, 2))
+    for t in range(1, T):
+        Y[t] = A1 @ Y[t - 1] + e[t]
+    A, Sig, _ = var_ols(Y, 1); Th = orthogonalized_irf(A, Sig, 5, "cholesky")
+    print("\n(2) VAR/IRF algebra (recover A_1 and the impact factor)")
+    print("    ||A_hat - A_1|| = %.3f   ||Theta_0 - chol(Sigma)|| = %.3f"
+          % (np.linalg.norm(A[0] - A1), np.linalg.norm(Th[0] - np.linalg.cholesky(Sig))))
+    print("    Psi_1 == A_hat:", np.allclose(_ma_from_var(A, 2)[1], A[0]))
+    print("    checks:", np.linalg.norm(A[0] - A1) < 0.05
+          and np.allclose(Th[0], np.linalg.cholesky(Sig))
+          and np.allclose(_ma_from_var(A, 2)[1], A[0]))
+
+    # (3) Table-9-style IRF across the spec progression + both identifications
+    sessions = [("d1", "benchmark", _demo_frame(seed=2, depth_factor=1.5)),
+                ("d2", "volatile",  _demo_frame(seed=3, depth_factor=0.7))]
+    t_std = correlation_irf(sessions, spec="standard", n_lags=4, horizon=6)
+    t_inf = correlation_irf(sessions, spec="informational", n_lags=4, horizon=6)
+    t_id = correlation_irf(sessions, spec="informational", n_lags=4, horizon=6, ident="identity")
+    print("\n(3) Table-9-style correlation IRF (impact x100)")
+    print("    standard spec rows:", list(t_std.index))
+    print("    informational spec rows:", list(t_inf.index))
+    print(t_inf.round(3).to_string())
+    print("    checks:",
+          not t_std.empty and not t_inf.empty and not t_id.empty
+          and t_std.shape[0] == 2                          # ES & SPY quoted-spread shocks
+          and t_inf.shape[0] == 10                         # 5 features x 2 assets
+          and set(t_inf.columns) == {"benchmark", "volatile"}
+          and np.all(np.isfinite(t_inf.to_numpy())))
+
+    # (4) the better object: spread-conditioned IS(S) curve via ecm_sde
+    fit = spread_conditioned_is(sessions, spread_kind="weighted", n_levels=10, degree=1, n_lags=0)
+    curve = fit["curve"]
+    print("\n(4) spread-conditioned information share IS_ES(S), S = log relative weighted spread")
+    print(curve[["S", "IS_ES", "CS_ES"]].round(3).to_string(index=False))
+    print("    checks:", isinstance(curve, pd.DataFrame) and "IS_ES" in curve.columns
+          and np.all(np.isfinite(curve["IS_ES"].to_numpy())))
+
+    # (5) IRF with bootstrap SE + Romano-Wolf joint significance built in
+    sess5 = [(f"d{i}", "benchmark" if i % 2 == 0 else "volatile",
+              _demo_frame(n=4000, seed=10 + i, depth_factor=1.4 if i % 2 == 0 else 0.7)) for i in range(6)]
+    res = correlation_irf_inference(sess5, spec="informational", n_lags=4, horizon=6,
+                                    n_boot=80, alpha=0.10, seed=0)
+    pt, se, padj = res["point"].to_numpy(), res["se"].to_numpy(), res["padj"].to_numpy()
+    t = np.abs(pt / np.where(se > EPS, se, np.nan))
+    fin = np.isfinite(t.ravel())
+    imax = int(np.nanargmax(np.where(fin, t.ravel(), -np.inf)))          # largest |t| among finite cells
+    print("\n(5) IRF with bootstrap SE + Romano-Wolf joint significance (n_boot=%d, scope=%s)"
+          % (res["n_boot"], res["rw_scope"]))
+    print(res["table"].to_string())
+    print("    per-regime joint:", {k: dict(v) for k, v in res["joint"].T.to_dict().items()})
+    shapes_ok = res["se"].shape == res["point"].shape == res["padj"].shape == res["table"].shape
+    range_ok = np.all((padj >= -1e-9) & (padj <= 1 + 1e-9)) and np.nanmax(se) > 0
+    monotone_ok = np.isclose(padj.ravel()[imax], np.nanmin(padj.ravel()[fin]))   # max |t| -> min adj_p (RW)
+    print("    checks:", shapes_ok and range_ok and monotone_ok
+          and isinstance(res["table"].iloc[0, 0], str) and res["n_boot"] >= 2)
+
+    # (5b) parallel bootstrap equivalence: n_jobs is a pure speedup. Per-replicate spawned seeds
+    #      make the day-cluster draws identical regardless of worker count, so SE/point/padj match.
+    rs = correlation_irf_inference(sess5, spec="informational", n_lags=4, horizon=6,
+                                   n_boot=80, alpha=0.10, seed=0, n_jobs=1)
+    rp = correlation_irf_inference(sess5, spec="informational", n_lags=4, horizon=6,
+                                   n_boot=80, alpha=0.10, seed=0, n_jobs=4)
+
+    def _eqnan(a, b):
+        a, b = a.to_numpy(), b.to_numpy()
+        return bool(np.allclose(np.nan_to_num(a), np.nan_to_num(b))
+                    and np.array_equal(np.isnan(a), np.isnan(b)))
+    par_ok = _eqnan(rs["se"], rp["se"]) and _eqnan(rs["point"], rp["point"]) and _eqnan(rs["padj"], rp["padj"])
+    print("\n(5b) day-cluster bootstrap: serial (n_jobs=1) == threaded (n_jobs=4)")
+    print("     SE max|diff|=%.2e  padj max|diff|=%.2e  ->  identical: %s"
+          % (float(np.nanmax(np.abs(rs["se"].to_numpy() - rp["se"].to_numpy()))),
+             float(np.nanmax(np.abs(rs["padj"].to_numpy() - rp["padj"].to_numpy()))), par_ok))
+    print("     checks:", par_ok)
+
+
+if __name__ == "__main__":
+    _selftest()
