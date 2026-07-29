@@ -156,23 +156,67 @@ while leaving every odds ratio algebraically untouched.
 
 ---
 
-## Module health sweep
+## Module health sweep (complete: 46 modules)
 
-Ran each module's built-in self-test. Of the 24 completed at time of writing, 21 exit
-clean. The three that do not are environmental, not defects:
+36 of 46 exit clean. Of the 10 that do not, 6 are environmental and 4 are real. **All were
+already failing on the unmodified stack** — none was introduced here.
 
-| Module | Reason |
+| Module | Status |
 |---|---|
-| `autoscale.py`, `debug_crossing.py` | argparse CLIs — require arguments, no self-test entry point |
-| `market_analysis_fixed.py` | needs the `maystreet_data` SDK, absent here |
+| `autoscale`, `debug_crossing`, `release_template`, `validate_release_csv`, `validate_reconstruction`, `verify_crossing` | argparse CLIs — need arguments, no self-test entry point. Not defects. |
+| `market_analysis_fixed` | needs the `maystreet_data` SDK, absent here |
+| `paper_tables` | writes to a hard-coded `/mnt/user-data/outputs/`, `FileNotFoundError` anywhere else — the reporting layer cannot be smoke-tested on a normal checkout |
+| `mean_variance` | does not finish in 400 s |
+| `robust_prices`, `state_space_efficient_price` | **self-check reported False** — see below |
 
-The sweep was still running over the remaining ~26 modules when this was written; nothing
-in the completed set showed a numerical failure.
+### The meta-defect: a failing self-test that exits 0
 
-One portability defect worth fixing: `paper_tables.py` `_selftest()` writes to a
-hard-coded `/mnt/user-data/outputs/` and raises `FileNotFoundError` anywhere else. It
-fails identically on the unmodified stack, so it is pre-existing, but it means the
-reporting layer cannot be smoke-tested on a normal checkout.
+`robust_prices.py` printed `checks: False` and **exited 0**. The README's recommended smoke
+loop is `for m in ...; do python "$m.py"; done`, which inspects nothing but the exit code —
+so a module failing its own checks reads as green. Fixed: `_selftest()` now returns a bool
+and `__main__` exits non-zero on failure. (`state_space_efficient_price` already exited 1.)
+
+### `robust_prices` — silent NaN t-statistic (fixed)
+
+The failure was `t(a1_SPY) = nan`. `a1_SPY` is the coefficient on `z·S` — per `ecm_sde`'s
+own docstring, *"the single-number test of liquidity-conditioning."*
+
+Cause: `ecm_sde._cluster_se` computes the Liang–Zeger small-cluster correction
+`c = G/(G-1)·(N-1)/(N-K)`, and set `c = nan` when `G < 2`. With a single session there is
+one cluster, so every SE came back NaN — and a NaN t-stat prints as a blank cell rather
+than raising. Same silent-failure shape as the swallowed fetch error in the reconstruction
+work.
+
+Fixed: with one cluster, fall back to Newey–West HAC (which is exactly valid for a single
+contiguous session) and log a warning naming the fallback. `t(a1_SPY)` now returns 1.35
+instead of NaN. The warning also points out that with few clusters — the MWCB sample has
+**G = 4** — a wild cluster bootstrap is preferable to cluster-robust SEs; `test_wild_cluster.py`
+exists in the stack but is not wired into this path.
+
+### `state_space_efficient_price` — open, not fixed
+
+Self-check (1) asserts the Kalman smoother beats a naive average of the two quotes. It does
+not: RMSE 0.366 vs 0.096, though correlation with the truth is 0.9991 and the error is 4%
+of `sd(m_true) = 8.57`.
+
+Two things I ruled out: it is not a level offset (removing the +0.003 mean changes RMSE by
+nothing), and it is not purely an unfair benchmark. The test's DGP uses λ = [+1, −1], where
+the cross-sectional average cancels the transitory component *exactly* and is therefore the
+efficient estimator — no filter can beat it, so that assertion is unachievable as written.
+But sweeping λ shows the smoother also loses at [1, −0.4] and [1, 0.3], only winning at
+[1, 0.9]:
+
+| λ | RMSE smoother | RMSE naive average | smoother wins |
+|---|---|---|---|
+| [1.0, −1.0] | 0.3662 | 0.0960 | no |
+| [1.0, −0.4] | 0.3475 | 0.2922 | no |
+| [1.0, 0.3] | 0.6715 | 0.6057 | no |
+| [1.0, 0.9] | 0.7367 | 0.8794 | yes |
+
+So the benchmark is mis-specified *and* the estimator underperforms a trivial alternative
+over much of the parameter space. I did not chase this further. It needs the authors' eye
+before this module is relied on — though note it is an extension module, not one the
+published tables appear to depend on.
 
 ---
 
