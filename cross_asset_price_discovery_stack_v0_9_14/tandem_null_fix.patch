@@ -1,0 +1,164 @@
+--- pristine/cross_asset_price_discovery_stack_v0_9_14/tandem_order_flow.py	2026-06-23 20:21:19.000000000 +0000
++++ stack/cross_asset_price_discovery_stack_v0_9_14/tandem_order_flow.py	2026-07-29 21:30:26.276379255 +0000
+@@ -167,6 +167,143 @@
+     return M
+ 
+ 
++# ── the null that actually isolates CROSS-market dependence ───────────────────
++# The Binomial(n, 1/2) null above (Table 5.I Panel A) is a joint hypothesis. It says
++#   (i)  each market's own order flow is a fair coin across n orders, AND
++#   (ii) the two markets are independent of each other.
++# Rejecting it tells you nothing about which half failed, and on this data it is (i) that
++# fails, overwhelmingly. From the paper's own Table 5.II Panel A the ETF is directional
++# (Sell or Buy) in 68.7% of one-second bars against a 2.4% binomial prediction, and the
++# future in 83.2% against 29.0%. Order flow inside ONE market is autocorrelated and clustered
++# -- order splitting, queue jockeying, momentum -- so the marginals are nothing like coin
++# flips. That inflates ALL FOUR corner cells mechanically, with zero cross-market linkage.
++#
++# To measure cross-market tandem trading you must hold each market's OWN directionality fixed
++# and ask only whether the two line up more often than chance. That is independence given the
++# observed marginals, and it is the benchmark these functions provide. On Table 5.II Panel A:
++#
++#            observed   binomial null   independence-given-marginals
++#   PCMOF     43.1%        0.4%              28.6%   -> 1.51x   (real, not 100x)
++#   NCMOF     15.7%        0.4%              28.6%   -> 0.55x   (a DEFICIT, not an excess)
++#
++# so the paper's "NCMOF levels are much greater than the predicted values under either form of
++# the null" reverses under a correctly specified null, while the PCMOF result survives.
++def independence_given_marginals(freq):
++    """Expected cell frequencies under CROSS-market independence, holding each market's own
++    observed marginal state distribution fixed. Takes and returns a 5.II-style percent matrix
++    (rows = Future state, cols = ETF state); the NA row/col is dropped and the 3x3 block is
++    renormalised, since an NA bar carries no directional information in either market."""
++    M = freq.reindex(index=DIR3, columns=DIR3).astype(float).to_numpy()
++    tot = M.sum()
++    if tot <= 0:
++        return pd.DataFrame(np.nan, index=DIR3, columns=DIR3)
++    M = M / tot * 100.0
++    E = np.outer(M.sum(1), M.sum(0)) / 100.0
++    return pd.DataFrame(E, index=DIR3, columns=DIR3)
++
++
++def dependence_summary(freq, n_bars=None):
++    """Cross-market dependence in the 5.II matrix, separated from each market's own
++    directionality.
++
++    Returns observed and independence-implied PCMOF / NCMOF (percent of directional bars),
++    their ratios, and the **corner log odds ratio**
++
++        log OR = log( (SellSell * BuyBuy) / (SellBuy * BuySell) )
++
++    which is the marginal-free statement of the paper's claim: it is invariant to the row and
++    column totals of the table, so unlike the raw corner percentages it cannot be manufactured
++    by within-market clustering, and it is comparable ACROSS the baseline / volatile / MWCB
++    panels even though their marginals differ a lot. logOR > 0 = genuine positive tandem
++    trading. (Invariance is to the table's margins; re-discretising an underlying continuous
++    association at different cut points does move the odds ratio.) With ``n_bars`` (the number of directional bars behind the matrix) the standard
++    error sqrt(sum 1/n_ij) and a z-statistic are added."""
++    M = freq.reindex(index=DIR3, columns=DIR3).astype(float).to_numpy()
++    tot = M.sum()
++    if tot <= 0:
++        return {}
++    P = M / tot * 100.0
++    E = independence_given_marginals(freq).to_numpy()
++    pc, nc = P[0, 0] + P[2, 2], P[0, 2] + P[2, 0]
++    epc, enc = E[0, 0] + E[2, 2], E[0, 2] + E[2, 0]
++    a, b, c, d = P[0, 0], P[0, 2], P[2, 0], P[2, 2]      # SellSell, SellBuy, BuySell, BuyBuy
++    out = {"PCMOF": pc, "NCMOF": nc, "PCMOF_indep": epc, "NCMOF_indep": enc,
++           "PCMOF_ratio": pc / epc if epc > 0 else np.nan,
++           "NCMOF_ratio": nc / enc if enc > 0 else np.nan,
++           "log_OR": float(np.log((a * d) / (b * c))) if min(a, b, c, d) > 0 else np.nan}
++    if n_bars:
++        n = np.array([a, b, c, d]) / 100.0 * float(n_bars)
++        if n.min() > 0:
++            se = float(np.sqrt((1.0 / n).sum()))
++            out["log_OR_se"] = se
++            out["log_OR_z"] = out["log_OR"] / se if se > 0 else np.nan
++    return out
++
++
++def permutation_null(fut_state, etf_state, n_perm=999, seed=0, lo=0.45, hi=0.55):
++    """Distribution-free null for cross-market tandem trading: hold each market's own bar
++    sequence intact and shuffle the PAIRING between them. This destroys only the cross-market
++    association, preserving each market's exact marginal state distribution -- including the
++    over-dispersion, clustering and intraday seasonality that a Binomial(n, 1/2) null assumes
++    away, and that are the real reason the paper's Panel A null is rejected.
++
++    Unlike ``theoretical_null`` this is automatically correct at ANY aggregation. The binomial
++    null depends entirely on the number of new orders per bar, so it cannot be reused across
++    frequencies: at the paper's per-second rates (505 ETF / 112 future) it puts 0.4% in each
++    corner, but at a ten-millisecond bar (~5.1 / ~1.1 orders) it puts ~23%, and in action time
++    (one order per event) ~50%. Comparing a fine-frequency frequency against the per-second
++    0.4% overstates the evidence by one to two orders of magnitude.
++
++    Returns {'PCMOF', 'NCMOF'} -> dict(observed, null_mean, null_lo, null_hi, p_value),
++    where p_value is the two-sided permutation p for observed vs the null distribution."""
++    fs = np.asarray(fut_state, dtype=object); es = np.asarray(etf_state, dtype=object)
++    keep = (fs != "NA") & (es != "NA")
++    fs, es = fs[keep], es[keep]
++    n = len(fs)
++    if n < 10:
++        return {}
++    def _corners(f, e):
++        pc = np.mean(((f == "Sell") & (e == "Sell")) | ((f == "Buy") & (e == "Buy"))) * 100
++        nc = np.mean(((f == "Sell") & (e == "Buy")) | ((f == "Buy") & (e == "Sell"))) * 100
++        return pc, nc
++    obs_pc, obs_nc = _corners(fs, es)
++    rng = np.random.default_rng(seed)
++    draws = np.empty((int(n_perm), 2))
++    for i in range(int(n_perm)):
++        draws[i] = _corners(fs, es[rng.permutation(n)])
++    out = {}
++    for j, (key, obs) in enumerate((("PCMOF", obs_pc), ("NCMOF", obs_nc))):
++        d = draws[:, j]
++        p = (1.0 + np.sum(np.abs(d - d.mean()) >= abs(obs - d.mean()))) / (len(d) + 1.0)
++        out[key] = {"observed": float(obs), "null_mean": float(d.mean()),
++                    "null_lo": float(np.percentile(d, 2.5)), "null_hi": float(np.percentile(d, 97.5)),
++                    "p_value": float(p)}
++    return out
++
++
++def independence_null_from_counts(n_etf, n_fut, n_draw=None, seed=0, lo=0.45, hi=0.55):
++    """Binomial independence null evaluated at the ACTUAL per-bar order counts, rather than at
++    a single representative n. ``n_etf`` / ``n_fut`` are the per-bar total new-order counts of
++    the two markets (arrays); buys are redrawn as Binomial(n_bar, 1/2) independently in each
++    market. This is the frequency-matched version of ``theoretical_null`` -- use it whenever
++    the aggregation is not the one the fixed n=505/112 was calibrated to.
++
++    Returns the same {'PCMOF','NCMOF'} percentages, including bars that come out NA."""
++    ne = np.asarray(n_etf, float); nf = np.asarray(n_fut, float)
++    m = np.isfinite(ne) & np.isfinite(nf)
++    ne, nf = ne[m].astype(int), nf[m].astype(int)
++    if n_draw:                                            # optional resample to a target size
++        r0 = np.random.default_rng(seed)
++        idx = r0.integers(0, len(ne), int(n_draw))
++        ne, nf = ne[idx], nf[idx]
++    rng = np.random.default_rng(seed)
++    be = rng.binomial(np.maximum(ne, 0), 0.5); bf = rng.binomial(np.maximum(nf, 0), 0.5)
++    se = classify(order_imbalance(be, ne - be), lo, hi)
++    sf = classify(order_imbalance(bf, nf - bf), lo, hi)
++    return {"PCMOF": float(np.mean(((sf == "Sell") & (se == "Sell")) | ((sf == "Buy") & (se == "Buy"))) * 100),
++            "NCMOF": float(np.mean(((sf == "Sell") & (se == "Buy")) | ((sf == "Buy") & (se == "Sell"))) * 100)}
++
++
+ # ── end-to-end: build Table 5.II + 5.III from per-bar series ──────────────────
+ def table5_from_series(buy_etf, sell_etf, buy_fut, sell_fut,
+                        ret_etf=None, ret_fut=None, corr_window=100, ret_in_bps=True,
+@@ -182,6 +319,17 @@
+     se = classify(e, lo, hi); sf = classify(f, lo, hi)
+     out = {"frequency": frequency_matrix(sf, se)}
+     out["pcmof_ncmof"] = pcmof_ncmof(out["frequency"])
++    # Cross-market dependence separated from each market's own directionality. Report these
++    # next to the raw corner shares: the raw shares are inflated by within-market clustering
++    # and are NOT a measure of tandem trading on their own (see independence_given_marginals).
++    n_dir = int(np.sum((sf != "NA") & (se != "NA")))
++    out["dependence"] = dependence_summary(out["frequency"], n_bars=n_dir)
++    out["independence_expected"] = independence_given_marginals(out["frequency"])
++    # Frequency-matched binomial null: the fixed n=505/112 of theoretical_null is a
++    # ONE-SECOND calibration and must not be reused at 10ms or in action time.
++    out["binomial_null_matched"] = independence_null_from_counts(
++        np.asarray(buy_etf, float) + np.asarray(sell_etf, float),
++        np.asarray(buy_fut, float) + np.asarray(sell_fut, float))
+     if ret_etf is not None and ret_fut is not None:
+         re = np.asarray(ret_etf, float); rf = np.asarray(ret_fut, float)
+         scale = 1.0 if ret_in_bps else 1e4
