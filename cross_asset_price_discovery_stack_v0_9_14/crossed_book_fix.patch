@@ -1,0 +1,670 @@
+--- pristine/cross_asset_price_discovery_stack_v0_9_14/mstbook_loader.py	2026-06-23 20:21:19.000000000 +0000
++++ stack/cross_asset_price_discovery_stack_v0_9_14/mstbook_loader.py	2026-07-29 20:52:03.885886440 +0000
+@@ -401,6 +401,14 @@
+ # before it is ever materialized -- the single biggest *safe* memory lever (no value change at all).
+ _MSG_NEEDED_COLS = frozenset({
+     "receipttimestamp", "exchangetimestamp", "exchange_timestamp", "sourcetimestamp",   # clocks
++    # The venue's authoritative within-feed event order. lob_reconstruct._event_arrays orders each
++    # feed by this and only interleaves feeds by the clock; without it the replay silently falls back
++    # to clock-only ordering, which inverts adjacent events (UDP reordering / coarse engine stamps),
++    # lets a Modify resurrect an already-Cancelled order, and pins a phantom level that crosses the
++    # top on essentially every snapshot (see test_reconstruct_ordering.py: 100% crossed vs 0%).
++    # Pruning it here disabled that fix on ALL real data while the synthetic tests -- which build
++    # frames directly and never pass through this reader -- kept passing.
++    "sequencenumber",                                                                   # intra-feed order
+     "f", "side", "price", "previousprice",
+     "quantity", "previousquantity", "newquantity", "pairedquantity",                    # qty variants by type
+     "orderreferencenumber", "previousorderreferencenumber",                             # book keys
+--- pristine/cross_asset_price_discovery_stack_v0_9_14/lob_reconstruct.py	2026-06-23 20:21:19.000000000 +0000
++++ stack/cross_asset_price_discovery_stack_v0_9_14/lob_reconstruct.py	2026-07-29 20:53:01.753885116 +0000
+@@ -46,6 +46,12 @@
+ 
+ log = logging.getLogger(__name__)
+ EPS = 1e-9
++# Strings that mean "this field was null in the source", after .astype(str). Which one you get depends
++# on the dtype the CSV reader chose: object/float columns stringify a missing value to "nan", while the
++# pandas nullable "string" dtype (what mstbook_loader._read_messages_csv now requests for the ref/side
++# columns) stringifies pd.NA to "<NA>". Testing only for "nan" therefore silently stopped recognizing
++# nulls the moment the reader switched dtypes -- so match all of them.
++_NA_TOKENS = ("", "nan", "<NA>", "None", "NaN", "null", "NULL")
+ 
+ # message-type -> the column carrying the quantity that the event acts on
+ _QTY = {"mt_add_order": "quantity", "mt_cancel_order": "previousquantity",
+@@ -242,7 +248,23 @@
+         n = len(df)
+         tcol = next((c for c in cands if c in df.columns), None)
+         if tcol is not None:                            # explicit clock column on the frame
+-            ts = pd.to_datetime(df[tcol], unit="ns", utc=True).astype("int64").to_numpy()
++            _t = pd.to_datetime(df[tcol], unit="ns", utc=True)
++            # A NULL clock value becomes NaT, and NaT.astype("int64") is INT64_MIN -- which does not
++            # merely lose the event's position, it sorts it BEFORE every other event in the session.
++            # A feed whose exchange timestamp is null therefore has its whole day collapsed onto the
++            # first grid point, so the opening snapshot already holds the day's net state and the book
++            # is crossed from the first sample. Carry those rows on the frame's own clock index
++            # instead (the fetch indexed it), and say so rather than emitting a 1970 event.
++            if _t.isna().any():
++                _n_bad = int(_t.isna().sum())
++                _idx = df.index
++                if getattr(_idx, "tz", None) is None:
++                    _idx = pd.to_datetime(_idx).tz_localize(tz)
++                _t = _t.fillna(pd.Series(_idx.tz_convert("UTC"), index=df.index))
++                log.warning("%s: %d/%d rows have a NULL %s; falling back to the frame index for those "
++                            "rows (left as NaT they would sort to the start of the session and cross "
++                            "the book from the first snapshot)", mtype, _n_bad, n, tcol)
++            ts = _t.astype("int64").to_numpy()
+         else:                                           # fall back to the index (already the chosen clock)
+             idx = df.index
+             if getattr(idx, "tz", None) is None:
+@@ -260,7 +282,7 @@
+         psize = pd.to_numeric(_col(df, "previousquantity"), errors="coerce").to_numpy(float)
+         ref = _col(df, "orderreferencenumber", "").astype(str).to_numpy()
+         pref = _col(df, "previousorderreferencenumber", "").astype(str).to_numpy()
+-        pref = np.where((pref == "") | (pref == "nan"), ref, pref)   # missing prev-ref -> the ref (legacy)
++        pref = np.where(np.isin(pref, _NA_TOKENS), ref, pref)        # missing prev-ref -> the ref (legacy)
+         maintain = _col(df, "maintainpriority", "").astype(str).str.strip().str.lower().to_numpy()
+         admindel = _col(df, "admindelete", "").astype(str).str.strip().str.lower().to_numpy()
+         if _CODE[mtype] == _LEVEL_SET:                  # MBP: an admin delete clears the level
+@@ -312,12 +334,33 @@
+     elim_rank = np.isin(code, (_CANCEL, _TRADE, _LEVEL_DEL)).astype(np.int8)   # 0=add/modify/level-set, 1=removal
+     if order_by == "sequence":
+         if not np.isfinite(seq_s).any():
+-            # Degraded: no sequencenumber anywhere. The per-feed sequence cummax is meaningless without a
++            # This branch is a DEGRADED MODE, not a supported configuration: it is the legacy clock-only
++            # ordering that the sequence path exists to replace, and on a real multicast feed it crosses
++            # the book on essentially every snapshot. It used to be entered silently, which is how a
++            # column-pruning change in the loader (sequencenumber missing from _MSG_NEEDED_COLS) disabled
++            # the ordering fix across every production session without a single line in the run log.
++            # Say so at WARNING so the degrade is visible in the log next to the crossed-book warning.
++            log.warning("ORDERING DEGRADED: no usable 'sequencenumber' on any message frame, so intra-feed "
++                        "order falls back to the clock alone. Adjacent events invert under UDP reordering / "
++                        "coarse engine stamps, a Modify can resurrect an already-Cancelled order, and the "
++                        "resulting phantom level crosses the top on most snapshots. Confirm the fetch is "
++                        "selecting the sequencenumber column (mstbook_loader._MSG_NEEDED_COLS).")
++            # The per-feed sequence cummax is meaningless without a
+             # sequence, and it is precisely what dragged a late same-instant event ahead of an earlier one;
+             # order by the clock DIRECTLY, removals last within an instant. (Cross-feed order is immaterial:
+             # the book keys orders by (feed, ref), so distinct feeds commute.)
+             order = np.lexsort((elim_rank, ts))
+         else:
++            # PARTIAL coverage is its own hazard: a frame that lacks the column gets seq=inf and is
++            # therefore ordered AFTER every sequenced event in the same feed. If, say, mt_trade is the
++            # frame missing it, every trade is applied at end of day and the orders they consumed rest
++            # untouched all session -- crossing the book exactly like a missing removal stream would.
++            _cov = float(np.isfinite(seq_s).mean())
++            if _cov < 0.999:
++                log.warning("ORDERING PARTIAL: only %.1f%% of events carry a 'sequencenumber'; the rest are "
++                            "ordered LAST within their feed, not at their true position. If an entire "
++                            "message type is missing the column its events all land at end of session.",
++                            100.0 * _cov)
+             seqf = np.where(np.isfinite(seq_s), seq_s, np.inf)    # missing sequence -> last within its feed
+             presort = np.lexsort((elim_rank, seqf, feed_code))    # feed-major, seq-ascending, removals last within a tied packet
+             ck = ts[presort].astype(np.int64).copy(); fc = feed_code[presort]
+--- pristine/cross_asset_price_discovery_stack_v0_9_14/debug_crossing.py	2026-07-29 17:30:11.000000000 +0000
++++ stack/cross_asset_price_discovery_stack_v0_9_14/debug_crossing.py	2026-07-29 21:01:19.664592461 +0000
+@@ -49,6 +49,11 @@
+ 
+ EPS = getattr(lr, "EPS", 1e-9)
+ BENIGN_OPEN_MINUTES = 5          # orphans this early are usually orders resting from before the window
++# Above this share of all cancel/trade events, "the add is missing" stops being explainable by orders
++# carried in from a prior session and starts meaning the capture lost messages. Below it the two are
++# indistinguishable from the time profile alone (see CHECK 5), so the finding is ranked MINOR.
++ORPHAN_RATE_SEVERE = 0.01
++SEV_RANK = {"FATAL": 0, "SEVERE": 1, "MINOR": 2}
+ 
+ 
+ # ══════════════════════════════════════════════════════════════════════════════
+@@ -193,14 +198,28 @@
+ 
+ 
+ def check_sequence(msgs, L):
+-    """Per-feed sequence continuity. Gaps mean the capture dropped messages -> DATA."""
++    """Per-feed sequence continuity AND -- more importantly -- whether the sequence exists at all.
++
++    ``sequencenumber`` is not a nice-to-have here: it is the venue's authoritative within-feed event
++    order, and ``lob_reconstruct._event_arrays`` uses it to order each feed, interleaving feeds by the
++    clock only. Without it the replay drops into its documented DEGRADED mode -- clock-only ordering --
++    where adjacent events invert, a Modify can re-add an order a Cancel already removed, and the
++    resulting phantom level crosses the top on nearly every snapshot. ``test_reconstruct_ordering.py``
++    measures exactly that on a fixture: 100% crossed under clock ordering, 0% under sequence ordering.
++
++    So an absent sequence column is not context for the report, it is a CODE finding in its own right,
++    and it must outrank the downstream symptoms it causes -- otherwise the tool reports the crossing
++    (true) and the orphans (true) and leaves the reader to guess at the cause.
++    """
+     L.append("")
+     L.append("CHECK 4  per-feed sequence continuity")
+     findings = []
++    nonempty = {mt: df for mt, df in msgs.items() if df is not None and len(df)}
++    have = sorted(mt for mt, df in nonempty.items() if "sequencenumber" in df.columns)
++    missing = sorted(mt for mt, df in nonempty.items() if "sequencenumber" not in df.columns)
+     seq_by_feed = defaultdict(list)
+-    for mt, df in msgs.items():
+-        if df is None or not len(df):
+-            continue
++    inv_by_feed = {}
++    for mt, df in nonempty.items():
+         s = pd.to_numeric(lr._col(df, "sequencenumber"), errors="coerce").to_numpy(float)
+         f = lr._col(df, "f", "").astype(str).to_numpy()
+         for name in set(f):
+@@ -208,25 +227,146 @@
+             if v.size:
+                 seq_by_feed[name].append(v)
+     if not seq_by_feed:
+-        L.append("    (no sequencenumber column)")
++        L.append("    NO 'sequencenumber' COLUMN ON ANY FRAME (%s)" % ", ".join(sorted(nonempty)))
++        L.append("    => lob_reconstruct._event_arrays(order_by='sequence') cannot sequence anything and")
++        L.append("       silently falls back to clock-only intra-feed ordering -- its DEGRADED mode, and")
++        L.append("       the exact ordering that test_reconstruct_ordering.py measures at 100% crossed.")
++        findings.append(("CODE", "FATAL",
++                         "no message frame carries 'sequencenumber', so the replay orders each feed by "
++                         "the clock alone -- the degraded mode the sequence path exists to replace. This "
++                         "resurrects cancelled orders via modify and crosses the book on nearly every "
++                         "snapshot regardless of data quality. Check that the fetch SELECTS the column: "
++                         "mstbook_loader._MSG_NEEDED_COLS prunes every column not listed in it, and a "
++                         "column pruned there is gone before the replay ever sees the frame"))
+         return findings
++    if missing:
++        L.append("    'sequencenumber' present on: %s" % ", ".join(have))
++        L.append("    'sequencenumber' MISSING on: %s" % ", ".join(missing))
++        findings.append(("CODE", "SEVERE",
++                         "message type(s) %s carry no 'sequencenumber' while others do -- _event_arrays "
++                         "sorts unsequenced events LAST within their feed, so every one of those events "
++                         "is applied at end of session instead of at its true position"
++                         % ", ".join(missing)))
++    # How much the clock actually disagrees with the venue's own order. This is the size of the fault
++    # the sequence path repairs: every inversion is a pair the degraded ordering would apply backwards.
++    for mt, df in nonempty.items():
++        if "sequencenumber" not in df.columns:
++            continue
++        s = pd.to_numeric(df["sequencenumber"], errors="coerce").to_numpy(float)
++        f = lr._col(df, "f", "").astype(str).to_numpy()
++        t = df.index.tz_convert("UTC").as_unit("ns").astype("int64").to_numpy()
++        for name in set(f):
++            m = (f == name) & np.isfinite(s)
++            if m.sum() < 2:
++                continue
++            o = np.argsort(s[m], kind="stable")
++            tt = t[m][o]
++            bad, tot = inv_by_feed.get(name, (0, 0))
++            inv_by_feed[name] = (bad + int(np.count_nonzero(np.diff(tt) < 0)), tot + int(tt.size - 1))
++    worst_inv = 0.0
+     for name, parts in sorted(seq_by_feed.items()):
+         v = np.unique(np.concatenate(parts))
+         span = v[-1] - v[0] + 1
+         present = v.size
+-        missing = max(0.0, span - present)
+-        frac = missing / span if span > 0 else 0.0
+-        L.append("    %-26s span=%12s present=%12s missing=%6.2f%%"
+-                 % (name[:26], f"{int(span):,}", f"{present:,}", 100 * frac))
++        gap = max(0.0, span - present)
++        frac = gap / span if span > 0 else 0.0
++        bad, tot = inv_by_feed.get(name, (0, 0))
++        inv = bad / tot if tot else 0.0
++        worst_inv = max(worst_inv, inv)
++        L.append("    %-26s span=%12s present=%12s missing=%6.2f%%  clock_inversions=%5.2f%%"
++                 % (name[:26], f"{int(span):,}", f"{present:,}", 100 * frac, 100 * inv))
+         if frac > 0.02:
+             findings.append(("DATA", "SEVERE" if frac < 0.2 else "FATAL",
+                              "feed '%s' is missing %.1f%% of its sequence range -- the capture dropped "
+                              "messages, so the book cannot be correct" % (name, 100 * frac)))
++    if worst_inv > 0.0:
++        L.append("    clock_inversions = adjacent events (in the venue's own sequence order) whose clock")
++        L.append("    RUNS BACKWARDS. Every one is a pair that clock-only ordering applies in reverse.")
++    return findings
++
++
++def check_clock(msgs, clock, tz, session, date_str, L):
++    """Health of the timestamp that orders the replay and places events on the grid.
++
++    Two failure modes here are invisible downstream and both cross the book from the very first
++    snapshot, so they mimic a parsing fault:
++
++      NULL clock   ``pd.to_datetime(...).astype('int64')`` turns NaT into INT64_MIN, which does not
++                   just misplace the event -- it sorts it before every other event in the session.
++      DEAD clock   a feed whose chosen clock is constant (or zero) has its entire day collapsed onto
++                   one instant, so the opening snapshot already holds that feed's end-of-day net state.
++
++    Either one puts a whole feed's worth of net state at t=0 with a *stable* resting-order count, which
++    is precisely the signature CHECK 6 attributes to "structural parsing". Measure it instead of
++    inferring it.
++    """
++    L.append("")
++    L.append("CHECK 4b timestamp health (clock=%s)" % clock)
++    findings = []
++    d = pd.Timestamp(date_str[:4] + "-" + date_str[4:6] + "-" + date_str[6:])
++    g0 = pd.Timestamp(f"{d.date()} {session[0]}", tz=tz).tz_convert("UTC").value
++    g1 = pd.Timestamp(f"{d.date()} {session[1]}", tz=tz).tz_convert("UTC").value
++    cands = lr._CLOCK_COLS.get(clock, lr._CLOCK_COLS["receipt"])
++    per_feed = defaultdict(lambda: [0, 0, 0, np.inf, -np.inf])   # n, n_null, n_outside, tmin, tmax
++    src = {}
++    for mt, df in msgs.items():
++        if df is None or not len(df):
++            continue
++        tcol = next((c for c in cands if c in df.columns), None)
++        src[mt] = tcol or "(frame index)"
++        if tcol is not None:
++            t = pd.to_datetime(df[tcol], unit="ns", utc=True)
++        else:
++            idx = df.index
++            if getattr(idx, "tz", None) is None:
++                idx = pd.to_datetime(idx).tz_localize(tz)
++            t = pd.Series(idx.tz_convert("UTC"), index=df.index)
++        null = t.isna().to_numpy()
++        tv = t.astype("int64").to_numpy()
++        f = lr._col(df, "f", "").astype(str).to_numpy()
++        for name in set(f):
++            m = f == name
++            rec = per_feed[name]
++            rec[0] += int(m.sum())
++            rec[1] += int(np.count_nonzero(null[m]))
++            good = m & ~null
++            if good.any():
++                v = tv[good]
++                rec[2] += int(np.count_nonzero((v < g0) | (v > g1)))
++                rec[3] = min(rec[3], float(v.min()))
++                rec[4] = max(rec[4], float(v.max()))
++    if not per_feed:
++        L.append("    (no messages)")
++        return findings
++    if len(set(src.values())) > 1:
++        L.append("    NOTE: the clock is read from different sources per message type: %s"
++                 % ", ".join("%s=%s" % (k, v) for k, v in sorted(src.items())))
++    L.append("    %-26s %10s %8s %9s  %s" % ("feed", "events", "null", "off-sess", "clock span"))
++    for name, (n, nnull, noff, tmin, tmax) in sorted(per_feed.items()):
++        if not np.isfinite(tmin):
++            span_txt = "ALL NULL"
++        else:
++            span_txt = "%s -> %s" % (pd.Timestamp(int(tmin), tz="UTC").tz_convert(tz).strftime("%H:%M:%S"),
++                                     pd.Timestamp(int(tmax), tz="UTC").tz_convert(tz).strftime("%H:%M:%S"))
++        L.append("    %-26s %10s %8s %8.1f%%  %s"
++                 % (name[:26], f"{n:,}", f"{nnull:,}", 100.0 * noff / max(n, 1), span_txt))
++        if nnull:
++            findings.append(("CODE", "FATAL",
++                             "feed '%s': %s events have a NULL %s clock. NaT casts to INT64_MIN, so every "
++                             "one of them sorts AHEAD of the whole session and is applied before the open "
++                             "-- the book is wrong from the first snapshot no matter how good the data is"
++                             % (name, f"{nnull:,}", clock)))
++        elif np.isfinite(tmin) and n > 1000 and (tmax - tmin) < 60e9:
++            findings.append(("DATA", "FATAL",
++                             "feed '%s': %s events span only %.1fs of %s clock -- the venue is not "
++                             "populating this timestamp, so the feed's entire day collapses onto one "
++                             "instant and its net end-of-day state appears at the open"
++                             % (name, f"{n:,}", (tmax - tmin) / 1e9, clock)))
+     return findings
+ 
+ 
+ # ══════════════════════════════════════════════════════════════════════════════
+-# CHECK 5-7: instrumented replay
++# CHECK 5-8: instrumented replay
+ # ══════════════════════════════════════════════════════════════════════════════
+ def instrumented_replay(msgs, tz, clock, price_scale, session, date_str, interval, order_by, L):
+     """Replay with lob_reconstruct's OWN primitives (_event_arrays + _Book), instrumented to record
+@@ -257,6 +397,16 @@
+     orphan_other_feed = 0
+     orphan_by_feed = Counter()
+     resting_trace, cross_trace, feedcross_trace, ts_trace = [], [], [], []
++    # --- provenance for the ORDERS THAT PIN THE TOP (the mirror of the orphan analysis) --------------
++    # CHECK 5 asks "a removal arrived -- where is its order?". That can only ever explain a removal that
++    # did nothing. It cannot explain a CROSSED book, because crossing needs the opposite fault: an order
++    # that should have LEFT and is still resting. Nothing here measured that, which is why a session can
++    # come back "CODE, structural" with no statement of what is actually holding the top apart.
++    born = {}                       # composite key -> ts of the add/modify that created the resting order
++    killed = set()                  # composite keys a cancel/trade has already successfully removed
++    resurrect_by_feed = Counter()   # modify whose previous ref was ALREADY removed by a cancel/trade
++    resurrect_keys = {}             # composite key -> ts of the resurrecting modify
++    pin_price = Counter()           # (feed, side, price) -> snapshots this price held a venue crossed
+     gi, ng = 0, len(grid_ns)
+ 
+     def _snap(ts_ns):
+@@ -272,6 +422,9 @@
+             aa = min((p for p, s in a.items() if s > EPS), default=None)
+             if bb is not None and aa is not None and bb > aa + EPS:
+                 nfeed += 1
++                # the two prices actually holding THIS venue's own book apart, this snapshot
++                pin_price[(int(fd), 0, float(bb))] += 1
++                pin_price[(int(fd), 1, float(aa))] += 1
+         resting_trace.append(len(book.orders))
+         cross_trace.append(crossed)
+         feedcross_trace.append(nfeed)
+@@ -284,6 +437,9 @@
+         code, feed = ev.code[j], ev.feed[j]
+         if code == lr._ADD:
+             book.add(feed, ev.ref[j], ev.side[j], ev.price[j], ev.size[j])
++            k = int(feed) * span + int(ev.ref[j])
++            born[k] = ts
++            killed.discard(k)                                   # a genuine re-use of the reference
+         elif code == lr._CANCEL:
+             if not book.remove(feed, ev.ref[j]):
+                 orphan_by_feed[feed] += 1
+@@ -294,9 +450,24 @@
+                     orphan_absent_ts.append(ts)
+                     if ev.ref[j] in created_anyfeed:
+                         orphan_other_feed += 1
++            else:
++                killed.add(int(feed) * span + int(ev.ref[j]))
+         elif code == lr._MODIFY:
++            # THE resurrection test. modify() is remove-old + add-new, so a modify whose previous
++            # reference is no longer in the book *because a cancel/trade already removed it* does not
++            # modify anything -- it RE-CREATES a dead order. That phantom never receives another
++            # removal (its cancel was spent) and pins the top for the rest of the session. It is the
++            # documented consequence of applying a feed's events out of the venue's own order, and it
++            # leaves NO orphan behind, so CHECK 5 is structurally blind to it.
++            pk = int(feed) * span + int(ev.pref[j])
++            if (feed, ev.pref[j]) not in book.orders and pk in killed:
++                resurrect_by_feed[feed] += 1
++                resurrect_keys[int(feed) * span + int(ev.ref[j])] = ts
+             book.modify(feed, ev.pref[j], ev.ref[j], ev.side[j], ev.price[j], ev.size[j],
+                         ev.pprice[j], ev.psize[j], ev.maintain[j])
++            k = int(feed) * span + int(ev.ref[j])
++            born.setdefault(k, ts)
++            killed.discard(k)
+         elif code == lr._LEVEL_SET:
+             book.set_level(feed, ev.side[j], ev.price[j], ev.size[j])
+         elif code == lr._LEVEL_DEL:
+@@ -313,15 +484,38 @@
+                         if ev.ref[j] in created_anyfeed:
+                             orphan_other_feed += 1
+                     book.reduce_at_price(feed, ev.price[j], ev.size[j])
++            elif (feed, ev.ref[j]) not in book.orders:          # the trade consumed the order outright
++                killed.add(int(feed) * span + int(ev.ref[j]))
+     while gi < ng:
+         _snap(grid_ns[gi]); gi += 1
+ 
++    # End-of-session census of orders sitting on the WRONG side of their own venue's top. Each one is
++    # an order the venue removed and our replay kept. Reported with the time it entered the book, so a
++    # phantom that has been pinning the top since 09:31 is distinguishable from ordinary end-of-day rest.
++    resting_keys = {int(fd) * span + int(rf) for (fd, rf) in book.orders}
++    wrong_side = defaultdict(list)
++    for (fd, rf), (sd, px, sz) in book.orders.items():
++        b = book.bid.get(fd) or {}
++        a = book.ask.get(fd) or {}
++        bb = max((p for p, s in b.items() if s > EPS), default=None)
++        aa = min((p for p, s in a.items() if s > EPS), default=None)
++        if bb is None or aa is None or not (bb > aa + EPS):
++            continue                                            # this venue's book is not crossed
++        if (sd == 0 and px > aa + EPS) or (sd == 1 and px < bb - EPS):
++            k = int(fd) * span + int(rf)
++            wrong_side[int(fd)].append((float(px), int(sd), float(sz), born.get(k),
++                                        k in resurrect_keys))
+     return dict(feed_names=ev.feed_names, book=book,
+                 orphan_add_present=orphan_add_present, orphan_add_absent=orphan_add_absent,
+                 orphan_absent_ts=np.array(orphan_absent_ts, dtype="int64"),
+                 orphan_by_feed=orphan_by_feed, orphan_other_feed=orphan_other_feed,
+                 resting=np.array(resting_trace), crossed=np.array(cross_trace),
+-                feedcross=np.array(feedcross_trace), grid=grid, g0=g0)
++                feedcross=np.array(feedcross_trace), grid=grid, g0=g0,
++                n_removals=int(np.count_nonzero(np.isin(ev.code, (lr._CANCEL, lr._TRADE)))),
++                resurrect_by_feed=resurrect_by_feed,
++                n_resurrect_resting=len(set(resurrect_keys) & resting_keys),
++                resurrect_keys=resurrect_keys, pin_price=pin_price, wrong_side=wrong_side,
++                stats=dict(book.stats), tz=tz)
+ 
+ 
+ def report_replay(R, L):
+@@ -344,6 +538,10 @@
+                  % (f"{R['orphan_add_present']:,}", pres))
+         L.append("      add ABSENT everywhere              : %10s (%5.1f%%)  -> DATA (message missing)"
+                  % (f"{R['orphan_add_absent']:,}", 100 - pres))
++        nrem = R.get("n_removals") or 0
++        rate = R["orphan_add_absent"] / nrem if nrem else 0.0
++        L.append("      orphan RATE: %s of %s cancel/trade events (%.3f%%)"
++                 % (f"{tot:,}", f"{nrem:,}", 100.0 * tot / max(nrem, 1)))
+         if R["orphan_add_absent"]:
+             t = R["orphan_absent_ts"]
+             mins = (t - R["g0"].value) / 6e10
+@@ -353,12 +551,32 @@
+             if early > 0.8:
+                 L.append("        => consistent with orders RESTING BEFORE the session window: benign, "
+                          "expected when the fetch starts at 09:30")
++            elif rate < ORPHAN_RATE_SEVERE:
++                # Spread-across-the-session is NOT sufficient on its own. An order carried in from a
++                # previous session (GTC / good-till-cancel) has no add anywhere in a one-day fetch and
++                # is cancelled at whatever hour its owner chooses -- uniformly across the day, by
++                # construction. That is the same time profile as dropped messages, so the only thing
++                # separating them is the RATE: carry-over is a tail (well under 1% of removals),
++                # a capture that is genuinely losing messages is not.
++                # It also cannot be the cause of a crossed book either way: an orphaned removal removes
++                # nothing, and crossing requires an order that stayed. Rank it accordingly.
++                L.append("        => %.3f%% of removals; at this rate the uniform time profile is equally "
++                         "consistent with orders CARRIED IN from a prior session (GTC), which have no add "
++                         "in a single-day fetch and are cancelled at any hour. Note an orphaned removal "
++                         "removes nothing, so it cannot itself cross the book." % (100 * rate))
++                findings.append(("DATA", "MINOR",
++                                 "%.3f%% of cancel/trade events reference an order with no add in the "
++                                 "fetch. Spread across the session, but at a rate consistent with "
++                                 "prior-session carry-over rather than a lossy capture -- and orphaned "
++                                 "removals cannot cross a book in any case, so this does not explain the "
++                                 "crossing" % (100 * rate)))
+             else:
+                 findings.append(("DATA", "SEVERE",
+                                  "%.1f%% of orphaned removals reference orders whose add never appears, "
+-                                 "and they are spread across the session (not just the open) -- messages "
+-                                 "are genuinely missing from the fetch"
+-                                 % (100.0 * R["orphan_add_absent"] / tot)))
++                                 "they are spread across the session (not just the open), and they are "
++                                 "%.2f%% of all removals -- too many for prior-session carry-over, so "
++                                 "messages are genuinely missing from the fetch"
++                                 % (100.0 * R["orphan_add_absent"] / tot, 100 * rate)))
+         if R.get("orphan_other_feed"):
+             L.append("      of the ABSENT: %s reference an order added on a DIFFERENT feed -- feed "
+                      "attribution differs between the add and the removal" % f"{R['orphan_other_feed']:,}")
+@@ -434,6 +652,170 @@
+                              "individual venue books are themselves crossed while the book is NOT "
+                              "accumulating -- a single venue's own replay is wrong, which no cross-venue "
+                              "or leak explanation can account for"))
++
++    findings += report_pins(R, growth, L)
++    return findings
++
++
++def report_pins(R, growth, L):
++    """CHECK 8 -- name the orders holding the top apart, and say how they got there.
++
++    Everything above this point describes the crossing; none of it says WHICH orders are crossed or why
++    they are still in the book. That gap is why a session can be diagnosed as "structural (side/scale/
++    column parsing)" when the side tokens are 100% clean and the scale is uniform -- the report has no
++    other vocabulary for "the book is wrong from the start".
++
++    A crossed book needs an order that should have left and did not. There are only a few ways to get
++    one, and they are separable:
++      resurrected   a Modify re-added an order a Cancel had already removed. Its removal is spent, so
++                    the phantom is immortal. Caused by applying a feed's events out of the venue's own
++                    order -- i.e. by CHECK 4.
++      never removed the removal for it is simply absent from the fetch (DATA), which shows up as the
++                    book accumulating -- already covered by CHECK 6's growth ratio.
++    """
++    findings = []
++    tz = R.get("tz", "America/New_York")
++    fname = R["feed_names"]
++
++    def _fn(c):
++        return fname[c] if c < len(fname) else str(c)
++
++    def _hhmm(ts):
++        return "  ?  " if ts is None else pd.Timestamp(int(ts), tz="UTC").tz_convert(tz).strftime("%H:%M:%S")
++
++    L.append("")
++    L.append("CHECK 8  what is pinning the top (order-level provenance)")
++    st = R.get("stats") or {}
++    L.append("    replay counters: %s" % ", ".join(
++        "%s=%s" % (k, f"{v:,}") for k, v in sorted(st.items())
++        if k in ("dup_add", "cancel_no_order", "trade_no_ref", "trade_no_ref_undisplayed",
++                 "trade_on_mbp_skipped", "modify_reprioritized", "mbp_level_events")) or "(none)")
++
++    res = R.get("resurrect_by_feed") or Counter()
++    n_res = sum(res.values())
++    n_res_resting = R.get("n_resurrect_resting", 0)
++    L.append("    modifies that re-created an order a cancel had ALREADY removed : %s" % f"{n_res:,}")
++    if n_res:
++        L.append("      by feed: %s" % ", ".join("%s=%s" % (_fn(k), f"{v:,}") for k, v in res.most_common(6)))
++        L.append("      of those, still resting at the close (immortal -- their cancel is spent): %s"
++                 % f"{n_res_resting:,}")
++        findings.append(("CODE", "FATAL",
++                         "%s modifies re-added an order that a cancel/trade had already removed (%s of "
++                         "them are still resting at the close). A modify is remove-old + add-new, so a "
++                         "modify applied AFTER the cancel of the order it references resurrects that "
++                         "order permanently -- its removal is already spent. This is the out-of-order "
++                         "intra-feed replay in CHECK 4, and it leaves no orphan, which is why CHECK 5 "
++                         "cannot see it" % (f"{n_res:,}", f"{n_res_resting:,}")))
++
++    ws = R.get("wrong_side") or {}
++    n_ws = sum(len(v) for v in ws.values())
++    L.append("    orders resting on the WRONG side of their own venue's top at the close : %s" % f"{n_ws:,}")
++    for fd, rows in sorted(ws.items(), key=lambda kv: -len(kv[1]))[:6]:
++        rows = sorted(rows, key=lambda r: (r[3] is None, r[3]))
++        n_from_res = sum(1 for r in rows if r[4])
++        L.append("      %-24s %5d orders  oldest entered %s  resurrected=%d"
++                 % (_fn(fd)[:24], len(rows), _hhmm(rows[0][3]), n_from_res))
++        for px, sd, sz, ts, was_res in rows[:3]:
++            L.append("          %s %10.4f x%-10.0f entered %s%s"
++                     % ("Bid" if sd == 0 else "Ask", px, sz, _hhmm(ts),
++                        "   <-- RESURRECTED by a modify" if was_res else ""))
++    if n_ws and growth < 2.0 and not n_res:
++        findings.append(("CODE", "SEVERE",
++                         "%s orders are resting on the wrong side of their own venue's top at the close "
++                         "while the book is NOT accumulating (%.1fx) -- these orders were removed by the "
++                         "venue and kept by the replay. With no accumulation there is no missing-removal "
++                         "explanation, so the removals arrived and were misapplied" % (f"{n_ws:,}", growth)))
++
++    pin = R.get("pin_price") or Counter()
++    if pin:
++        L.append("    longest-held pinned prices (venue, side, price, snapshots held):")
++        for (fd, sd, px), k in pin.most_common(6):
++            L.append("      %-24s %s %10.4f  %s snapshots" % (_fn(fd)[:24], "Bid" if sd == 0 else "Ask",
++                                                              px, f"{k:,}"))
++    return findings
++
++
++def _crossing_rate(msgs, tz, clock, price_scale, session, date_str, interval, order_by):
++    """Minimal replay -- consolidated crossing rate only, no instrumentation. Used for the A/B."""
++    ev = lr._event_arrays(dict(msgs), tz, clock=clock, price_scale=price_scale, consume=False,
++                          order_by=order_by)
++    if ev is None:
++        return float("nan"), 0
++    d = pd.Timestamp(date_str[:4] + "-" + date_str[4:6] + "-" + date_str[6:])
++    grid = pd.date_range(pd.Timestamp(f"{d.date()} {session[0]}", tz=tz),
++                         pd.Timestamp(f"{d.date()} {session[1]}", tz=tz), freq=interval)
++    grid_ns = grid.tz_convert("UTC").as_unit("ns").astype("int64").to_numpy()
++    book = lr._Book()
++    n_cross, gi, ng = 0, 0, len(grid_ns)
++
++    def _snap():
++        b, a = book.consolidated("Bid", 100, True), book.consolidated("Ask", 100, True)
++        return bool(b and a and max(b) > min(a) + EPS)
++
++    for j in range(len(ev.ts)):
++        while gi < ng and grid_ns[gi] < ev.ts[j]:
++            n_cross += _snap(); gi += 1
++        code, feed = ev.code[j], ev.feed[j]
++        if code == lr._ADD:
++            book.add(feed, ev.ref[j], ev.side[j], ev.price[j], ev.size[j])
++        elif code == lr._CANCEL:
++            book.remove(feed, ev.ref[j])
++        elif code == lr._MODIFY:
++            book.modify(feed, ev.pref[j], ev.ref[j], ev.side[j], ev.price[j], ev.size[j],
++                        ev.pprice[j], ev.psize[j], ev.maintain[j])
++        elif code == lr._LEVEL_SET:
++            book.set_level(feed, ev.side[j], ev.price[j], ev.size[j])
++        elif code == lr._LEVEL_DEL:
++            book.set_level(feed, ev.side[j], ev.price[j], 0.0)
++        elif code == lr._TRADE:
++            if not book.reduce(feed, ev.ref[j], ev.size[j]) and feed not in book.mbp_feeds:
++                book.reduce_at_price(feed, ev.price[j], ev.size[j])
++    while gi < ng:
++        n_cross += _snap(); gi += 1
++    return (n_cross / ng if ng else float("nan")), ng
++
++
++def check_ordering_ab(msgs, tz, clock, price_scale, session, date_str, interval, L, order_by="sequence"):
++    """CHECK 9 -- settle the ordering question by experiment instead of by argument.
++
++    Replays the SAME messages twice, changing only the intra-feed event order, and reports the crossing
++    rate of each. If the run AS CONFIGURED crosses and the other ordering does not, the messages were
++    sufficient and the fault is ordering (CODE). If both cross equally, ordering is exonerated and the
++    fault is elsewhere. Only meaningful when a sequencenumber exists -- without one both runs ARE the
++    same run, which is the state CHECK 4 reports.
++
++    A finding is raised only against the CONFIGURED ordering. A session that is replaying correctly and
++    would merely have crossed under the legacy ordering is not faulty -- that gap is the fix working,
++    and reporting it as a fault would flag every healthy session on a jittery feed.
++    """
++    L.append("")
++    L.append("CHECK 9  ordering A/B (same messages, intra-feed order is the only difference)")
++    findings = []
++    if not any(df is not None and len(df) and "sequencenumber" in df.columns for df in msgs.values()):
++        L.append("    SKIPPED: no sequencenumber, so 'sequence' and 'clock' ordering are the same run.")
++        L.append("    Re-fetch with the column selected (CHECK 4) and this A/B becomes decisive.")
++        return findings
++    seq_rate, n = _crossing_rate(msgs, tz, clock, price_scale, session, date_str, interval, "sequence")
++    clk_rate, _ = _crossing_rate(msgs, tz, clock, price_scale, session, date_str, interval, "clock")
++    cfg = "sequence" if order_by == "sequence" else "clock"
++    L.append("    crossed under CLOCK    ordering (legacy)   : %6.2f%%  of %s snapshots"
++             % (100 * clk_rate, f"{n:,}"))
++    L.append("    crossed under SEQUENCE ordering (venue's)  : %6.2f%%" % (100 * seq_rate))
++    L.append("    (this run is configured order_by=%s)" % order_by)
++    cur, alt, alt_name = ((seq_rate, clk_rate, "clock") if cfg == "sequence"
++                          else (clk_rate, seq_rate, "sequence"))
++    if cur > 0.05 and alt < 0.5 * cur:
++        L.append("    => switching to %s ordering removes %.0f%% of the crossing."
++                 % (alt_name, 100 * (1 - alt / cur)))
++        findings.append(("CODE", "FATAL" if alt < 0.01 else "SEVERE",
++                         "replaying the identical messages in %s order drops the crossing rate from "
++                         "%.1f%% to %.1f%% -- the messages were sufficient and this run is applying "
++                         "them out of order" % (alt_name, 100 * cur, 100 * alt)))
++    elif cur > 0.05:
++        L.append("    => the alternative ordering does NOT fix it; the fault is not intra-feed ordering.")
++    else:
++        L.append("    => this run does not cross. The %.1f%% under %s ordering is the margin the "
++                 "sequence path is buying on this feed." % (100 * alt, alt_name))
+     return findings
+ 
+ 
+@@ -445,10 +827,14 @@
+         L.append("VERDICT: no fault localized. The book reconstructs cleanly on this session.")
+         L.append("=" * 78)
+         return 0
+-    order = {"FATAL": 0, "SEVERE": 1}
+-    findings = sorted(findings, key=lambda x: (order.get(x[1], 9), x[0]))
++    findings = sorted(findings, key=lambda x: (SEV_RANK.get(x[1], 9), x[0]))
+     kinds = Counter(k for k, _s, _m in findings)
+-    lead = "DATA" if kinds["DATA"] > kinds["CODE"] else ("CODE" if kinds["CODE"] > kinds["DATA"] else "MIXED")
++    # MINOR findings are reported but do not vote. A single tail-rate observation should not be able to
++    # outvote a FATAL, and it should never be able to swing the verdict to DATA -- which sends the reader
++    # to re-fetch a session whose messages are fine.
++    voting = Counter(k for k, s, _m in findings if s != "MINOR")
++    lead = ("DATA" if voting["DATA"] > voting["CODE"]
++            else ("CODE" if voting["CODE"] > voting["DATA"] else "MIXED"))
+     L.append("VERDICT: %s  (%d DATA finding(s), %d CODE finding(s))" % (lead, kinds["DATA"], kinds["CODE"]))
+     L.append("=" * 78)
+     for kind, sev, msg in findings:
+@@ -481,6 +867,9 @@
+     ap.add_argument("--session-end", default="16:00")
+     ap.add_argument("--tz", default="America/New_York")
+     ap.add_argument("--order-by", default="sequence")
++    ap.add_argument("--ab-ordering", action="store_true",
++                    help="CHECK 9: replay twice (sequence vs clock ordering) and compare crossing. "
++                         "Two extra full replays -- slow on a full session, but decisive")
+     ap.add_argument("--save-messages", default=None, help="pickle the fetched messages for offline iteration")
+     ap.add_argument("--no-replay", action="store_true", help="frame checks only (CHECK 1-4), no replay")
+     ap.add_argument("--out", default=None, help="also write the report to this path")
+@@ -505,14 +894,19 @@
+          % (a.product, date_str, a.clock, a.price_scale),
+          "=" * 78, ""]
+     findings = []
++    session = (a.session_start, a.session_end)
+     findings += check_inventory(msgs, failures, L)
+     findings += check_feed_matrix(msgs, L)
+     findings += check_fields(msgs, L)
+     findings += check_sequence(msgs, L)
++    findings += check_clock(msgs, a.clock, a.tz, session, date_str, L)
+     if not a.no_replay:
+         R = instrumented_replay(msgs, a.tz, a.clock, a.price_scale,
+-                                (a.session_start, a.session_end), date_str, a.interval, a.order_by, L)
++                                session, date_str, a.interval, a.order_by, L)
+         findings += report_replay(R, L)
++        if a.ab_ordering:
++            findings += check_ordering_ab(msgs, a.tz, a.clock, a.price_scale, session, date_str,
++                                          a.interval, L, order_by=a.order_by)
+     rc = verdict(findings, L)
+     text = "\n".join(L)
+     print(text)
