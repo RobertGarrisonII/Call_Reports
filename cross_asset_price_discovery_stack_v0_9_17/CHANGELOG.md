@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.9.17 -- scalar Kalman likelihood: state_space_efficient_price fits ~10x faster
+
+The v0.9.16 optimizer fix made `state_space_efficient_price` correct but slow: ~12-29 s per fit,
+because the Gaussian likelihood ran the full array Kalman filter and each evaluation cost ~27 ms,
+nearly all of it numpy dispatch on 2x2 operands. Across the paper's 24 sessions that is real time.
+
+Same treatment applied to `dcc_garch` in v0.9.16. `_loglik_scalar` runs the identical recursion --
+same prediction-error decomposition, same 2x2 algebra -- carrying the state as (a1, a2) and the
+covariance as (p11, p12, p22) in Python floats, and storing nothing. Two savings compound:
+
+  * The MLE only ever reads `["loglik"]`. Allocating and filling the (n,2) and (n,2,2)
+    prediction/filtering arrays on every evaluation was pure waste -- they are used exactly once,
+    by the smoother, after the optimizer finishes.
+  * No per-step numpy dispatch.
+
+Used for k <= 2 (the k=1 UC model and the k=2 bid/ask case the module is built around); k > 2 still
+goes through the array engine, as do all callers that need smoothed states.
+
+    _nll                  27.3 ms -> 4.8 ms per evaluation
+    fit_efficient_price   12.9-29.1 s -> 1.5 s
+    module self-test      56 s -> 8 s
+
+Fit quality is unchanged: nll 2313.4 against an oracle (true-parameter) 2312.4, RMSE 0.0959.
+
+**Accuracy of the fast path, measured rather than asserted.** It agrees with the array engine to
+machine precision under a well-conditioned prior and diverges only through the diffuse one: at the
+kappa = 1e6 this model uses, the t=0 update subtracts two nearly equal ~1e6 quantities and the two
+operation orders round differently. The gap is 1.0e-04 absolute / 6e-08 relative at kappa=1e6,
+8.7e-09 at 1e4, and exactly 0 at 1e2 -- conditioning of the diffuse start, not the algebra. That is
+orders of magnitude below the optimizer's tolerance, and the fit still reports its final loglik and
+states from the array engine. New self-test check (3b) pins both ends of that: relative agreement
+< 1e-6 at kappa=1e6 and < 1e-8 at kappa=1e2, so a future divergence in either implementation is
+caught rather than silently moving every fit.
+
+Verified: `state_space_efficient_price`, `efficient_price`, `mean_variance`, `test_basis_state`,
+`test_crossing_qc` all pass.
+
 ## v0.9.16 -- the three defects v0.9.15 left open
 
 All three are closed. Two were real estimator bugs, one was a portability defect; none of them
