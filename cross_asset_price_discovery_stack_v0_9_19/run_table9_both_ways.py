@@ -78,7 +78,12 @@ def main(argv=None):
     ap.add_argument("--spec", default="informational", help="standard | weighted | informational")
     ap.add_argument("--corr-window", type=int, default=100,
                     help="bars in the correlation window (paper: 100)")
-    ap.add_argument("--n-lags", type=int, default=6)
+    ap.add_argument("--n-lags", default="6",
+                    help="fixed integer, or an information criterion: bic | aic | hq. "
+                         "A criterion is resolved ONCE on the pooled SVAR frame and the chosen "
+                         "order is printed and used for BOTH estimator blocks")
+    ap.add_argument("--pmax", type=int, default=12,
+                    help="largest lag considered when --n-lags is a criterion")
     ap.add_argument("--horizon", type=int, default=10)
     ap.add_argument("--ident", default="cholesky", choices=["cholesky", "identity"])
     ap.add_argument("--cumulative", action="store_true")
@@ -103,9 +108,36 @@ def main(argv=None):
         print("      format and that the machinery runs; they say nothing about SPY/ES.")
     print()
 
+    # Resolve the lag before anything else so it can be REPORTED, not just used. The paper's
+    # footnote 17 records AIC pointing at 60 lags and 6 being used because the full model would
+    # not run there -- exactly the kind of choice that should be visible in the output.
+    import correlation_svar as cs
+    n_lags, crit, ic = cs.resolve_n_lags(sessions, a.n_lags, pmax=a.pmax,
+                                         spec=a.spec, corr_window=a.corr_window)
+    if crit is not None:
+        if n_lags is None:
+            print("could not select a lag (no session had > pmax+5 usable rows); "
+                  "pass --n-lags <int>", file=sys.stderr)
+            return 1
+        print("lag order: p=%d chosen by %s over p<=%d (pooled SVAR frame)" % (n_lags, crit.upper(), a.pmax))
+        show = ic[["aic", "bic", "hqic"]].round(3)
+        print(show.to_string())
+        if n_lags >= a.pmax:
+            print("  WARNING: the criterion selected p = pmax = %d, i.e. it is still improving at the"
+                  " edge of the search. The chosen order is a BOUND, not an optimum -- re-run with a"
+                  " larger --pmax before reporting it." % a.pmax)
+        n_nan = int(ic[["aic", "bic", "hqic"]].isna().all(axis=1).sum())
+        if n_nan:
+            print("  NOTE: %d of %d candidate orders could not be scored (singular design at that p);"
+                  " the selection is the minimum over the ones that could." % (n_nan, len(ic)))
+        print("  (AIC is not consistent for lag order and on ~23k-bar samples runs away -- the "
+              "paper's own footnote 17 reports it choosing 60; BIC's log(T) penalty is what keeps "
+              "this finite.)")
+        print()
+
     tbl = pt.table_correlation_irf_both_ways(
         sessions, spec=a.spec, ident=a.ident, cumulative=a.cumulative, n_boot=a.n_boot,
-        n_lags=a.n_lags, horizon=a.horizon, corr_window=a.corr_window, min_obs=a.min_obs,
+        n_lags=n_lags, horizon=a.horizon, corr_window=a.corr_window, min_obs=a.min_obs,
         seed=a.seed, n_jobs=a.n_jobs)
     if tbl.df.empty:
         print(tbl.notes or "no output")
@@ -123,7 +155,7 @@ def main(argv=None):
 
     if a.out_dir:
         os.makedirs(a.out_dir, exist_ok=True)
-        stem = os.path.join(a.out_dir, f"table9_both_ways_{a.spec}_w{a.corr_window}")
+        stem = os.path.join(a.out_dir, f"table9_both_ways_{a.spec}_w{a.corr_window}_p{n_lags}")
         tbl.df.to_csv(stem + ".csv")
         with open(stem + ".md", "w") as fh:
             fh.write(tbl.to_markdown() + "\n")

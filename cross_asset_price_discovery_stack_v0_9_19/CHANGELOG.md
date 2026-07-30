@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.9.19 -- the SVAR lag order is chosen by criterion, once, and reported
+
+The paper's p=6 was never a choice, it was a constraint. Footnote 17: AIC pointed at 60 lags and
+6 was used because the full model would not run there. That leaves the lag as an unreported
+researcher degree of freedom sitting under every number in Table 9. It is now selected by
+information criterion, ONCE, on the same pooled frame Eq. (5) is fitted on, and printed.
+
+`--n-lags` accepts `bic` (the new default), `aic`, `hq`, or a fixed integer. `--n-lags 6`
+reproduces the paper exactly; `criterion=None` is byte-for-byte what it always was.
+
+**BIC not AIC, deliberately.** AIC is not consistent for lag order, and on a ~23k-bar intraday
+sample it chases the effective sample straight into unusable lengths -- the paper's own 60 is that
+failure, not a finding. BIC's log(T) penalty is what makes the choice finite. On a synthetic run
+the difference is visible in the printed table: AIC keeps falling monotonically to the edge of the
+search while BIC has an interior minimum.
+
+### What was wired
+
+* `correlation_svar.select_svar_lag()` -- the single source of truth. Scores candidates on the
+  actual stacked SVAR frame (not a proxy), all on the common sample of the largest candidate.
+* `correlation_svar.resolve_n_lags()` -- the adapter that lets every CLI take `6` or `bic`.
+* Threaded `criterion`/`pmax` through `correlation_irf_inference`,
+  `paper_tables.table_correlation_irf_both_ways`, and `run_table9_both_ways.py`; the resolved p is
+  returned in the inference dict and written into the table note.
+* `run_paper_replication.sh` gains STAGE 4c, which resolves the lag once and reuses that integer
+  in stages 5 and 6, and records both the criterion and the resolved p in the manifest.
+
+### Three correctness points that came out of doing it
+
+* **Selection is now POOLED across regimes by default** (`lag_pooled=True`). It used to happen
+  inside the per-regime loop, so benchmark could be fitted at one order and volatile at another --
+  and Table 9 compares the same shock across those columns. A difference would then be partly a
+  model difference. Same reason the paired Pearson/HY table resolves p once and hands the same
+  value to both blocks: the table exists to isolate the estimator, so nothing else may vary.
+* **The lag is resolved once and held fixed across bootstrap replicates.** Re-selecting per
+  replicate sounds more honest but is not what the reported table is -- the point estimate is a
+  VAR(p*) fit, so the resampling distribution must be of that estimator. It would also let a
+  replicate land on a different p, changing the number of shocks and breaking the Romano-Wolf
+  alignment across draws.
+* **A failed selection no longer masquerades as p=1.** `pds.select_lag_var` returns `max(1, pmin)`
+  when every candidate is NaN, which is indistinguishable from a real selection at the call site.
+  `select_svar_lag` now drops exactly-constant columns first (one degenerate regressor -- a spread
+  that never moves, a microprice deviation identically zero on a symmetric book -- makes the design
+  singular and NaNs the whole table) and returns `None` if nothing scored, so callers fall back
+  loudly. The CLI also warns when the criterion picks p == pmax, which is a BOUND rather than an
+  optimum, and reports how many candidate orders could not be scored.
+
+### Also fixed
+
+`run_paper_replication.sh` set `FRAMES` inside STAGE 2, so any `--stages` subset that skipped
+stage 2 under `--source load` pointed every later stage at a pickle that was never written. It is
+now resolved from `--pickle` at startup. Found by running `--stages 5` against a real pickle.
+
 ## v0.9.18 -- per-session process pool + the GARCH recursion off numpy; mean_variance 115s -> 36s
 
 Two changes, both bit-identical in output. The measurements below drove the design, and one of

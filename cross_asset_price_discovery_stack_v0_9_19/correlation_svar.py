@@ -303,10 +303,74 @@ def orthogonalized_irf(A, Sigma, H, ident="cholesky"):
 
 
 # ── Table 9: IRF of correlation to each shock, by regime ──────────────────────
+def select_svar_lag(data, spec="informational", n_levels=10, target_qty=None,
+                    corr_method="rolling", corr_window=100, wspread_kind="cost_to_fill",
+                    extra_fn=None, criterion="bic", pmax=12):
+    """Choose the SVAR lag order from the data by information criterion. Returns (p*, IC table).
+
+    Selection is on the SAME frame Eq. (5) is estimated on -- every session's built SVAR variables
+    stacked -- so the criterion scores the model actually fitted, not a proxy. Candidates are all
+    evaluated on the common sample of the largest one (``pds.select_lag_var``), which is required
+    for the ICs to be comparable across p.
+
+    Why this exists as a public function rather than a flag buried in the estimator: the paper's
+    lag length is a stated compromise -- footnote 17 reports AIC pointing at 60 lags and 6 being
+    used because the full model would not run at that length. That makes the lag a researcher
+    degree of freedom, so it should be (a) chosen by a rule, (b) computed once, and (c) REPORTED.
+    Every caller -- the Table 9 driver, the paired table, the replication script -- resolves the
+    lag through this one function so the number in the table note is the number that was fitted.
+
+    BIC is the default rather than AIC deliberately. AIC is not consistent for lag order and, on
+    ~23k-bar intraday samples, it chases the enormous effective sample into lag lengths that make
+    the SVAR unusable (the paper's own 60). BIC's log(T) penalty is what keeps the choice finite
+    and is the standard choice for this kind of high-frequency VAR."""
+    if isinstance(data, pd.DataFrame):
+        frames = [data]
+    else:
+        frames = [item[-1] for item in data]
+    Xs = []
+    for df in frames:
+        X, _nm, _ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
+                                       corr_window, wspread_kind, extra_fn=extra_fn)
+        if len(X) > pmax + 5:
+            Xs.append(X)
+    if not Xs:
+        return None, pd.DataFrame()
+    X = np.vstack(Xs)
+    # Drop exactly-constant columns before scoring. One degenerate regressor (a spread that never
+    # moves on a quiet session, a microprice deviation that is identically zero on a symmetric
+    # book) makes the VAR design singular, every candidate's log-determinant non-finite, and the
+    # whole IC table NaN -- at which point pds.select_lag_var falls back to p=1 and returns it as
+    # though it were a selection. Removing the constant column keeps the criterion computable on
+    # the columns that carry information; it does not change the fitted model, only the scoring.
+    keep = X.std(axis=0) > EPS
+    if keep.any() and not keep.all():
+        X = X[:, keep]
+    p, tab = pds.select_lag_var(X, pmax=pmax, criterion=criterion)
+    col = tab[{"aic": "aic", "hq": "hqic", "hqic": "hqic"}.get(str(criterion).lower(), "bic")]
+    if not col.notna().any():
+        # Every candidate failed to score. Say so instead of handing back the p=1 fallback, which
+        # is indistinguishable from a real selection at the call site.
+        return None, tab
+    return p, tab
+
+
+def resolve_n_lags(data, n_lags, pmax=12, **kw):
+    """Accept either a fixed integer lag or a criterion name ('bic'/'aic'/'hq'/'hqic').
+
+    Returns (p, criterion_or_None, table). This is the adapter every CLI uses so `--n-lags 6` and
+    `--n-lags bic` are both valid and resolve through the same code path."""
+    if isinstance(n_lags, str) and not str(n_lags).strip().lstrip("+-").isdigit():
+        crit = str(n_lags).strip().lower()
+        p, tab = select_svar_lag(data, criterion=crit, pmax=pmax, **kw)
+        return (int(p) if p is not None else None), crit, tab
+    return int(n_lags), None, pd.DataFrame()
+
+
 def correlation_irf(data, spec="informational", n_lags=6, horizon=10, ident="cholesky",
                     cumulative=False, n_levels=10, corr_method="rolling", corr_window=100,
                     target_qty=None, wspread_kind="cost_to_fill", min_obs=400, extra_fn=None,
-                    criterion=None, pmax=12):
+                    criterion=None, pmax=12, lag_pooled=True):
     """Reproduce Table 9 in the spread framework. `data` is a (date, regime, df) session
     list (one VAR per regime, frames stacked) or a single df (regime 'all'). Returns a
     DataFrame: rows = shock variables, columns = regimes, values = the impact (h=0)
@@ -324,17 +388,34 @@ def correlation_irf(data, spec="informational", n_lags=6, horizon=10, ident="cho
 
     out = {}
     names_ref = None
+    # Lag order. With a criterion set, select it ONCE over the pooled sample rather than per
+    # regime: Table 9 compares the same shock's response ACROSS regime columns, so a benchmark
+    # column fit at p=4 and a volatile column at p=9 would differ partly because the models
+    # differ, not because the market does. `lag_pooled=False` restores per-regime selection for
+    # the cases where each regime is read on its own.
+    p_pooled = None
+    if criterion is not None and lag_pooled:
+        p_pooled = select_svar_lag(data, spec=spec, n_levels=n_levels, target_qty=target_qty,
+                                   corr_method=corr_method, corr_window=corr_window,
+                                   wspread_kind=wspread_kind, extra_fn=extra_fn,
+                                   criterion=criterion, pmax=pmax)[0]
+    keep_min = (pmax if criterion is not None else n_lags) + 5   # room for the LARGEST candidate
     for regime, frames in groups.items():
         Xs, names = [], None
         for df in frames:
             X, nm, ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
                                          corr_window, wspread_kind, extra_fn=extra_fn)
-            if len(X) > n_lags + 5:
+            if len(X) > keep_min:
                 Xs.append(X); names = nm; corr_idx = ci
         if not Xs or sum(len(x) for x in Xs) < min_obs:
             continue
         X = np.vstack(Xs); names_ref = names
-        p_use = pds.select_lag_var(X, pmax=pmax, criterion=criterion)[0] if criterion is not None else n_lags
+        if p_pooled is not None:
+            p_use = p_pooled
+        elif criterion is not None:
+            p_use = pds.select_lag_var(X, pmax=pmax, criterion=criterion)[0]
+        else:
+            p_use = n_lags
         A, Sigma, _ = var_ols(X, p_use)
         Theta = orthogonalized_irf(A, Sigma, horizon, ident)
         if cumulative:
@@ -410,7 +491,7 @@ def correlation_irf_inference(data, spec="informational", n_lags=6, horizon=10, 
                               cumulative=False, n_levels=10, corr_method="rolling", corr_window=100,
                               target_qty=None, wspread_kind="cost_to_fill", min_obs=400, extra_fn=None,
                               n_boot=499, alpha=0.05, rw_by_regime=False, block_len=None, seed=0,
-                              n_jobs=None):
+                              n_jobs=None, criterion=None, pmax=12):
     """`correlation_irf` with bootstrap standard errors and **Romano-Wolf joint significance**
     built in, so the IRF table comes out publication-ready: each cell is the impact (or
     cumulative) response x100 with a bootstrap SE and stars from the FWER-controlled
@@ -432,6 +513,19 @@ def correlation_irf_inference(data, spec="informational", n_lags=6, horizon=10, 
     """
     from inference import romano_wolf_from_boot, moving_block_bootstrap, parallel_bootstrap
 
+    # Resolve the lag ONCE on the full sample, then hold it fixed across bootstrap replicates.
+    # Re-selecting inside each replicate would propagate model-selection uncertainty, which sounds
+    # more honest but is not what the reported table is: the point estimate is a VAR(p*) fit, so
+    # the resampling distribution must be of THAT estimator. Re-selecting also lets a replicate
+    # land on a different p and silently change the number of shocks, breaking the Romano-Wolf
+    # alignment across draws.
+    if criterion is not None:
+        p_sel = select_svar_lag(data, spec=spec, n_levels=n_levels, target_qty=target_qty,
+                                corr_method=corr_method, corr_window=corr_window,
+                                wspread_kind=wspread_kind, extra_fn=extra_fn,
+                                criterion=criterion, pmax=pmax)[0]
+        if p_sel is not None:
+            n_lags = int(p_sel)
     kw = dict(spec=spec, n_lags=n_lags, horizon=horizon, ident=ident, cumulative=cumulative,
               n_levels=n_levels, corr_method=corr_method, corr_window=corr_window,
               target_qty=target_qty, wspread_kind=wspread_kind, min_obs=min_obs, extra_fn=extra_fn)
@@ -439,7 +533,8 @@ def correlation_irf_inference(data, spec="informational", n_lags=6, horizon=10, 
     empty = {"point": point, "se": pd.DataFrame(), "tstat": pd.DataFrame(), "padj": pd.DataFrame(),
              "reject": pd.DataFrame(), "ci_lower": pd.DataFrame(), "ci_upper": pd.DataFrame(),
              "table": pd.DataFrame(), "joint": pd.DataFrame(), "alpha": alpha, "n_boot": 0,
-             "rw_scope": "by_regime" if rw_by_regime else "joint"}
+             "rw_scope": "by_regime" if rw_by_regime else "joint",
+             "n_lags": int(n_lags), "lag_criterion": criterion}
     if point.empty:
         return empty
     rows, cols = list(point.index), list(point.columns)
@@ -511,7 +606,9 @@ def correlation_irf_inference(data, spec="informational", n_lags=6, horizon=10, 
     return {"point": point, "se": mk(se), "tstat": mk(tstat), "padj": mk(padj),
             "reject": pd.DataFrame(reject, index=rows, columns=cols),
             "ci_lower": mk(lo), "ci_upper": mk(hi), "table": table, "joint": joint,
-            "alpha": alpha, "n_boot": int(B.shape[0]), "rw_scope": "by_regime" if rw_by_regime else "joint"}
+            "alpha": alpha, "n_boot": int(B.shape[0]),
+            "rw_scope": "by_regime" if rw_by_regime else "joint",
+            "n_lags": int(n_lags), "lag_criterion": criterion}
 
 
 def fevd_correlation(data, spec="informational", n_lags=6, horizon=20, **kw):

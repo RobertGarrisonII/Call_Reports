@@ -195,6 +195,7 @@ def table_correlation_irf(sessions, spec="informational", ident="cholesky", cumu
 def table_correlation_irf_both_ways(sessions, spec="informational", ident="cholesky",
                                     cumulative=False, extra_fn=None, n_boot=499, n_lags=4,
                                     horizon=6, corr_window=80, min_obs=200, seed=0, n_jobs=None,
+                                    criterion=None, pmax=12,
                                     title="Table 9 (repro): IRF of return correlation, Pearson vs Hayashi-Yoshida"):
     """Table 9 estimated twice -- once on the paper's grid-sampled Pearson d-correlation and once
     on the Epps-robust Hayashi-Yoshida d-correlation over the same window -- reported side by side
@@ -216,10 +217,20 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
 
     Both columns carry day-cluster bootstrap SEs and Romano-Wolf FWER stars (from
     csv.correlation_irf_inference), so significance is comparable across the pair."""
+    # Resolve the lag ONCE, here, so BOTH estimator blocks are fitted at the same order --
+    # otherwise a Pearson/HY difference could be a lag difference, which is the one thing this
+    # table exists to rule out.
+    lag_note = ""
+    if criterion is not None:
+        p_sel = csv.select_svar_lag(sessions, spec=spec, corr_window=corr_window,
+                                    extra_fn=extra_fn, criterion=criterion, pmax=pmax)[0]
+        if p_sel is not None:
+            lag_note = f" Lag order p={int(p_sel)} chosen by {str(criterion).upper()} over p<={pmax} on the pooled SVAR frame."
+            n_lags = int(p_sel)
     kw = dict(spec=spec, n_lags=n_lags, horizon=horizon, ident=ident, cumulative=cumulative,
               corr_window=corr_window, min_obs=min_obs, extra_fn=extra_fn, seed=seed, n_jobs=n_jobs)
     base = ("Impact" if not cumulative else f"Cumulative ({horizon}-step)") + \
-           f" orthogonalized response of d-correlation, x100; identification = {ident}; VAR({n_lags})."
+           f" orthogonalized response of d-correlation, x100; identification = {ident}; VAR({n_lags})." + lag_note
     out, nums = {}, {}
     for label, method in (("Pearson", "rolling"), ("HY", "hy")):
         if n_boot and n_boot > 0:

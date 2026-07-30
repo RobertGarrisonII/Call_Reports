@@ -33,12 +33,24 @@
 #      regressor in Eq. (5). STAGE 5 reports Table 9 on both that and the
 #      Hayashi-Yoshida correlation, with the difference as the artifact estimate.
 #
+#   5. The SVAR lag length was a stated compromise, not a choice: footnote 17
+#      records AIC pointing at 60 lags and 6 being used because the full model
+#      would not run there. That makes p a researcher degree of freedom, so
+#      STAGE 4c picks it by criterion (--n-lags bic, the default) ONCE on the
+#      pooled SVAR frame, prints the whole AIC/BIC/HQ table, and reuses that one
+#      number everywhere downstream -- so the p in the table note is the p that
+#      was fitted. BIC rather than AIC: AIC is not consistent for lag order and
+#      on ~23k-bar intraday samples runs away (the paper's own 60); the log(T)
+#      penalty is what keeps it finite. Pass --n-lags 6 to reproduce the paper.
+#
 # Usage
 #   ./run_paper_replication.sh                          # demo: runs anywhere, no data needed
 #   ./run_paper_replication.sh --source extract         # full paper sample via MayStreet
 #   ./run_paper_replication.sh --source load --pickle output/frames_*.pkl
 #   ./run_paper_replication.sh --stages 1,4,5           # re-run selected stages
 #   ./run_paper_replication.sh --dry-run                # print the commands only
+#   ./run_paper_replication.sh --n-lags 6               # the paper's fixed lag, for comparison
+#   ./run_paper_replication.sh --n-lags bic --pmax 20   # data-driven lag (default), wider search
 #
 # Environment
 #   PYTHON=python3   interpreter (default: python3)
@@ -55,7 +67,9 @@ INTERVAL="1s"
 FINE_INTERVAL="10ms"
 N_BOOT=499
 CORR_WINDOW=100
-N_LAGS=6
+N_LAGS="bic"          # integer, or an information criterion: bic | aic | hq
+PMAX=12
+N_LAGS_INT=""        # resolved integer, filled in by STAGE 4c
 STAGES="0,1,2,3,4,5,6,7"
 DRY=0
 QUICK=0
@@ -79,6 +93,7 @@ while [ "$#" -gt 0 ]; do
     --n-boot)        N_BOOT="$2"; shift 2 ;;
     --corr-window)   CORR_WINDOW="$2"; shift 2 ;;
     --n-lags)        N_LAGS="$2"; shift 2 ;;
+    --pmax)          PMAX="$2"; shift 2 ;;
     --volatile)      VOLATILE="$2"; shift 2 ;;
     --baseline)      BASELINE="$2"; shift 2 ;;
     --mwcb)          MWCB="$2"; shift 2 ;;
@@ -96,6 +111,12 @@ LOG="${OUT}/replication.log"
 mkdir -p "$OUT"
 
 JOBS_FLAG=""; [ -n "$NJ" ] && JOBS_FLAG="--n-jobs $NJ"
+
+# Resolve the frames path HERE, not inside STAGE 2. Stages 4c/5/6 all read it, and --stages lets
+# any of them run without STAGE 2 -- in which case the old in-stage assignment left FRAMES pointing
+# at a file that was never written, and every downstream stage failed on a missing pickle.
+FRAMES="${OUT}/frames.pkl"
+if [ "$SOURCE" = "load" ] && [ -n "$PICKLE" ]; then FRAMES="$PICKLE"; fi
 
 # BLAS must stay single-threaded: the bootstrap parallelises over replicates, and
 # nested BLAS threads oversubscribe every core and slow the whole run down.
@@ -126,7 +147,7 @@ run_rc() { printf '   + %s\n' "$*" | tee -a "$LOG"; [ "$DRY" -eq 1 ] && return 0
            set +e; "$@" >>"$LOG" 2>&1; local rc=$?; set -e; return $rc; }
 
 echo "cross-asset replication  run=${RUN_ID}  source=${SOURCE}  out=${OUT}" | tee "$LOG"
-echo "interval=${INTERVAL} (+${FINE_INTERVAL})  corr_window=${CORR_WINDOW}  n_lags=${N_LAGS}  n_boot=${N_BOOT}" | tee -a "$LOG"
+echo "interval=${INTERVAL} (+${FINE_INTERVAL})  corr_window=${CORR_WINDOW}  n_lags=${N_LAGS} (pmax=${PMAX})  n_boot=${N_BOOT}" | tee -a "$LOG"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 0 — preflight
@@ -186,7 +207,6 @@ fi
 # they share one clock -- a vendor snapshot for one leg and a message replay for
 # the other would corrupt the cross-asset lead-lag by construction.
 # ══════════════════════════════════════════════════════════════════════════════
-FRAMES="${OUT}/frames.pkl"
 if have_stage 2; then
   say "STAGE 2  reconstruct / load the session books"
   case "$SOURCE" in
@@ -308,6 +328,59 @@ EOF
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STAGE 4c — resolve the SVAR lag order ONCE
+#
+# The paper's p=6 is a stated compromise (footnote 17: AIC suggested 60, 6 was
+# used because the full model would not run there), which makes it a researcher
+# degree of freedom. Pick it by criterion on the SAME pooled frame Eq. (5) is
+# fitted on, print the whole IC table so the choice is inspectable, and reuse
+# that ONE integer in every downstream stage -- so the p reported in a table
+# note is provably the p that was fitted, and Pearson/HY differ only in the
+# estimator rather than also in the model.
+# ══════════════════════════════════════════════════════════════════════════════
+if have_stage 4 || have_stage 5 || have_stage 6; then
+  case "$N_LAGS" in
+    ''|*[!0-9]*)                                  # a criterion, not an integer
+      say "STAGE 4c  SVAR lag order by ${N_LAGS^^} (pmax=${PMAX})"
+      if [ "$DRY" -eq 1 ]; then
+        info "(dry-run) would resolve --n-lags ${N_LAGS} on the session frames"
+      elif [ "$SOURCE" = "demo" ]; then
+        info "demo mode: each driver resolves ${N_LAGS} on its own synthetic frames"
+      else
+        N_LAGS_INT="$($PY - "$FRAMES" "$N_LAGS" "$PMAX" "$CORR_WINDOW" <<'EOF' 2>>"$LOG" || true
+import pickle, sys, glob, warnings
+warnings.simplefilter("ignore")
+import correlation_svar as cs
+path, crit, pmax, win = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+raw = []
+for f in sorted(glob.glob(path)):
+    with open(f, "rb") as fh:
+        raw.extend(pickle.load(fh))
+sess = [r if len(r) == 3 else (r[0], "benchmark", r[1]) for r in raw]
+p, tab = cs.select_svar_lag(sess, spec="informational", corr_window=win,
+                            criterion=crit, pmax=pmax)
+if p is None:
+    sys.exit(1)
+sys.stderr.write(tab[["aic", "bic", "hqic"]].round(3).to_string() + "\n")
+print(int(p))
+EOF
+)"
+        if [ -n "$N_LAGS_INT" ]; then
+          info "selected p=${N_LAGS_INT} by ${N_LAGS^^} over p<=${PMAX} (IC table in the log)"
+          if [ "$N_LAGS_INT" -ge "$PMAX" ] 2>/dev/null; then
+            info "WARNING: p == pmax, so the criterion is still improving at the edge of the search."
+            info "That is a BOUND, not an optimum -- re-run with a larger --pmax before reporting it."
+          fi
+        else
+          info "selection failed (too few usable rows?); downstream stages fall back to their defaults"
+        fi
+      fi
+      ;;
+    *) N_LAGS_INT="$N_LAGS"; info "SVAR lag order: fixed p=${N_LAGS_INT} (no criterion)" ;;
+  esac
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # STAGE 5 — Table 9 both ways, at both aggregations
 #
 # Attenuation grows as the bar shrinks, so the ten-millisecond specification is
@@ -315,7 +388,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 if have_stage 5; then
   say "STAGE 5  Table 9 on Pearson AND Hayashi-Yoshida d-correlation"
-  T9ARGS="--spec informational --n-lags ${N_LAGS} --n-boot ${N_BOOT} --out-dir ${OUT}"
+  T9ARGS="--spec informational --n-lags ${N_LAGS} --pmax ${PMAX} --n-boot ${N_BOOT} --out-dir ${OUT}"
   [ -n "$NJ" ] && T9ARGS="$T9ARGS --n-jobs $NJ"
   if [ "$SOURCE" = "demo" ]; then
     # shellcheck disable=SC2086
@@ -349,7 +422,7 @@ if have_stage 6; then
     *)     # shellcheck disable=SC2086
            run $PY run_analysis.py --source load --pickle "$FRAMES" \
                --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
-               --interval "$INTERVAL" --n-lags "$N_LAGS" --legacy \
+               --interval "$INTERVAL" ${N_LAGS_INT:+--n-lags "$N_LAGS_INT"} --legacy \
                --output-dir "$OUT" --save-dataset $QFLAG $JOBS_FLAG ;;
   esac
 fi
@@ -362,7 +435,8 @@ if have_stage 7; then
   {
     echo "# Replication run ${RUN_ID}"
     echo
-    echo "source=${SOURCE}  interval=${INTERVAL}  corr_window=${CORR_WINDOW}  n_lags=${N_LAGS}  n_boot=${N_BOOT}"
+    echo "source=${SOURCE}  interval=${INTERVAL}  corr_window=${CORR_WINDOW}  n_boot=${N_BOOT}"
+    echo "lag order: requested=${N_LAGS} (pmax=${PMAX})  resolved p=${N_LAGS_INT:-per-driver}"
     echo "volatile=${VOLATILE}"
     echo "baseline=${BASELINE}"
     echo "mwcb=${MWCB}"
@@ -373,6 +447,7 @@ if have_stage 7; then
     echo "- Table 5 benchmarked against independence GIVEN the observed marginals + corner log OR"
     echo "- Table 7 null computed at each aggregation's actual per-bar order counts"
     echo "- Table 9 reported on Pearson AND Hayashi-Yoshida d-correlation, with the difference"
+    echo "- SVAR lag order chosen by ${N_LAGS} on the pooled frame (paper fixed it at 6; see fn.17)"
     echo "- cluster SE falls back to Newey-West at G=1 instead of returning a silent NaN"
     echo
     echo "## Artifacts"
