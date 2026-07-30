@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.9.20 -- the replication driver sizes itself from the machine, and the memory guess is measurable
+
+Concurrency was already system-detected in `autoscale.py` -- but `run_paper_replication.sh` never
+asked it, and one library bypassed it. Both fixed, plus the one number in the sizing model that was
+a placeholder is now measurable.
+
+### The replication driver now sizes from autoscale
+
+It only forwarded `--n-jobs` if you exported `N_JOBS`. Unset, it passed nothing and the fallback
+was `inference.py`'s `os.cpu_count()`. STAGE 0 now resolves cores, RAM, `extraction_workers` and
+`cpu_jobs` from `autoscale.py`, prints them, and threads them through -- extraction gets
+`--max-workers` from the MEMORY budget while the bootstrap gets all cores, which is the split that
+matters. The manifest records what was actually used.
+
+### `inference.parallel_bootstrap` no longer calls `os.cpu_count()`
+
+`cpu_count()` ignores CPU affinity, so inside a container pinned to a subset of a large node it
+reports the NODE's cores and the pool oversubscribes every one of them -- precisely the trap
+`autoscale`'s docstring was written about, in the one module that wasn't using it. Now
+`autoscale.cpu_jobs()` (max across cpu_count / /proc/cpuinfo / sched_getaffinity, honouring
+`BOOT_WORKERS`), with the old call retained only as a fallback if the import fails.
+
+### PEAK_GB_GUESS is now measured rather than guessed
+
+`extraction_workers = (RAM - reserve) / PEAK_GB_GUESS`, and that 32 GiB was a placeholder for "one
+day of raw messages". It is the binding constraint on the longest stage: too large and you burn
+wall clock, too small and you OOM the node. It cannot be derived -- it depends on the venue mix and
+message volume of the actual sessions -- so measure it.
+
+* `autoscale.observed_peak_gb()` / `recommend_peak_gb()` -- high-water RSS of the largest single
+  child (`RUSAGE_CHILDREN`, which is the per-worker figure the budget divides by, not the sum),
+  plus 30% headroom rounded UP (the worker count is a floor division, so rounding the peak down is
+  the direction that OOMs; and the budget must survive the worst session, not the measured one).
+* `autoscale.py measure -- <cmd>` -- runs a command and reports its peak plus the
+  `PEAK_GB_GUESS` to export. Uses `RUSAGE_CHILDREN` rather than GNU `/usr/bin/time`, which is
+  absent on minimal images.
+* STAGE 2 wraps the extraction in it, so a real run tells you the number for the next one.
+* STAGE 0 says outright when extraction is capped by memory rather than cores, so the 14-of-128
+  case is visible instead of silently costing throughput.
+
+On a 128 vCPU / 512 GiB node with 24 sessions: cores=128, cpu_jobs=128, extraction_workers=14 at
+the built-in guess -- and 24 (the session count, the natural cap) once a measured
+`PEAK_GB_GUESS=6` replaces it.
+
+### Fixed while testing
+
+`autoscale.py`'s `_main` returned the exit code but `__main__` discarded it, so
+`measure -- <failing cmd>` exited 0. STAGE 2 gates on that status, so a failed extraction would
+have reported success -- the same silent-failure shape as the rest of this series. Verified: child
+exit 3 now surfaces as 3.
+
 ## v0.9.19 -- the SVAR lag order is chosen by criterion, once, and reported
 
 The paper's p=6 was never a choice, it was a constraint. Footnote 17: AIC pointed at 60 lags and

@@ -110,6 +110,16 @@ OUT="${OUT_ROOT}/replication_${RUN_ID}"
 LOG="${OUT}/replication.log"
 mkdir -p "$OUT"
 
+# Size the pools from the MACHINE via autoscale, not from a default buried in a library. Leaving
+# --n-jobs unset used to fall through to inference.py's os.cpu_count(), which ignores CPU affinity
+# and so reports the whole node's cores inside a pinned container. autoscale takes the max across
+# cpu_count / /proc/cpuinfo / sched_getaffinity and honours the same env overrides the other shell
+# drivers use, so bash and Python cannot disagree about how wide to run.
+N_SESS=$(echo "${VOLATILE},${BASELINE},${MWCB}" | tr ',' '\n' | grep -c . || echo 24)
+AS_CORES="$($PY autoscale.py cores 2>/dev/null || echo 1)"
+AS_RAM="$($PY autoscale.py ram 2>/dev/null || echo 0)"
+AS_EXTRACT="$($PY autoscale.py workers --sessions "$N_SESS" 2>/dev/null || echo 1)"
+[ -z "$NJ" ] && NJ="$($PY autoscale.py jobs 2>/dev/null || echo 1)"
 JOBS_FLAG=""; [ -n "$NJ" ] && JOBS_FLAG="--n-jobs $NJ"
 
 # Resolve the frames path HERE, not inside STAGE 2. Stages 4c/5/6 all read it, and --stages lets
@@ -166,6 +176,13 @@ except ImportError:
 import lob_reconstruct, mstbook_loader, correlation_svar, tandem_order_flow, paper_tables  # noqa: F401
 print("stack imports OK")
 EOF
+  info "cores=${AS_CORES}  ram=${AS_RAM}GiB  extraction_workers=${AS_EXTRACT} (${N_SESS} sessions)  cpu_jobs=${NJ}"
+  info "  sizing comes from autoscale.py; override with CORES/RAM_GB/WORKERS/BOOT_WORKERS/PEAK_GB_GUESS"
+  if [ "${AS_EXTRACT}" -lt "${AS_CORES}" ] 2>/dev/null && [ "${AS_EXTRACT}" -lt "${N_SESS}" ] 2>/dev/null; then
+    info "  NOTE: extraction is capped at ${AS_EXTRACT} by the per-worker MEMORY budget"
+    info "  (PEAK_GB_GUESS), not by cores. STAGE 2 measures the real peak and prints the value"
+    info "  to export -- that guess is the one number here that is not measured."
+  fi
   info "OK"
 fi
 
@@ -220,10 +237,10 @@ if have_stage 2; then
       ;;
     extract)
       info "extracting ${INTERVAL} books for $(echo "$VOLATILE,$BASELINE,$MWCB" | tr ',' '\n' | wc -l) sessions"
-      run $PY run_analysis.py --source extract \
+      run_show $PY autoscale.py measure -- $PY run_analysis.py --source extract \
           --dates "${VOLATILE},${BASELINE},${MWCB}" \
           --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
-          --interval "$INTERVAL" --n-levels 10 \
+          --interval "$INTERVAL" --n-levels 10 --max-workers "$AS_EXTRACT" \
           --output-dir "$OUT" --save-dataset --save-objects --only extract
       # run_analysis writes the extracted frames into its run folder; point at them
       FOUND="$(ls -1t "${OUT}"/*aggregated*.pkl 2>/dev/null | head -1 || true)"
@@ -437,6 +454,7 @@ if have_stage 7; then
     echo
     echo "source=${SOURCE}  interval=${INTERVAL}  corr_window=${CORR_WINDOW}  n_boot=${N_BOOT}"
     echo "lag order: requested=${N_LAGS} (pmax=${PMAX})  resolved p=${N_LAGS_INT:-per-driver}"
+    echo "sizing:    cores=${AS_CORES} ram=${AS_RAM}GiB extraction_workers=${AS_EXTRACT} cpu_jobs=${NJ}"
     echo "volatile=${VOLATILE}"
     echo "baseline=${BASELINE}"
     echo "mwcb=${MWCB}"

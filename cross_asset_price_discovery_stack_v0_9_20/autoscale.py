@@ -29,8 +29,12 @@ CLI (so the shell driver stops duplicating the logic):
     python autoscale.py workers --sessions 12 [--peak-gb 32]
     python autoscale.py jobs
     python autoscale.py panel --sessions 24
+    python autoscale.py peak                 # PEAK_GB_GUESS implied by this process's high-water RSS
+    python autoscale.py measure -- <cmd>     # run <cmd>, report its peak RSS + the PEAK_GB_GUESS to export
 """
+import math
 import os
+import sys
 
 _SESSION_CAP = 12          # default #sessions cap (the Liberation-Day window); callers pass their own
 _PEAK_GB_GUESS = 32        # per-worker peak RSS guess for one full day of messages on the 1s grid
@@ -162,6 +166,43 @@ def cpu_jobs(cores=None):
     return detected_cores() if cores is None else cores
 
 
+def observed_peak_gb():
+    """Largest resident-set size reached so far, in GiB: max(this process, biggest single child).
+
+    ``_PEAK_GB_GUESS`` is the one number in this module that is a GUESS rather than a measurement,
+    and it is the binding constraint on extraction: workers = (RAM - reserve) / peak, so a placeholder
+    that is 4x too large costs 4x the wall clock, and one that is too small OOMs the node. It cannot
+    be derived from first principles -- it depends on the venue mix and message volume of YOUR
+    sessions -- so measure it instead.
+
+    RUSAGE_CHILDREN.ru_maxrss is the high-water mark of the largest single child, which is exactly
+    the per-worker peak the budget needs (not the sum across workers). Call after an extraction run;
+    `autoscale.py peak` prints it and the PEAK_GB_GUESS it implies."""
+    try:
+        import resource
+    except ImportError:                                        # non-POSIX
+        return None
+    ru_self = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    ru_kids = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    peak_kb = max(ru_self, ru_kids)                            # Linux reports kB; macOS reports bytes
+    if sys.platform == "darwin":
+        peak_kb = peak_kb / 1024.0
+    return peak_kb / (1024.0 * 1024.0)
+
+
+def recommend_peak_gb(observed=None, safety=1.30):
+    """PEAK_GB_GUESS to export, from an observed per-worker peak plus headroom.
+
+    The 30% margin covers the spread across sessions -- a crash day carries far more messages than
+    a calm one, and the budget has to survive the worst session in the sample, not the one that
+    happened to be measured. Rounded UP to a whole GiB: the worker count is a floor division, so
+    rounding the peak down is the direction that OOMs."""
+    obs = observed_peak_gb() if observed is None else float(observed)
+    if not obs or obs <= 0:
+        return None
+    return max(1, int(math.ceil(obs * float(safety))))
+
+
 def panel_workers(n_items, peak_gb=None, ram=None, cores=None):
     """PROCESS-pool size for per-session work that ships ONE ALREADY-AGGREGATED frame per worker.
 
@@ -191,10 +232,49 @@ def panel_workers(n_items, peak_gb=None, ram=None, cores=None):
     return max(1, min(int(cores), max(1, int(n_items)), memw))
 
 
+def measure(cmd):
+    """Run `cmd` (a list) to completion and report the peak RSS of the largest child.
+
+    Exists because the peak that matters belongs to the EXTRACTION SUBPROCESS, not to whatever
+    Python happens to be asking. GNU /usr/bin/time would do it, but it is absent on plenty of
+    minimal images, so do it with RUSAGE_CHILDREN, which is in the standard library and gives the
+    same high-water mark for the largest single child -- exactly the per-worker figure the budget
+    divides RAM by. Returns the child's exit code; prints the measurement to stderr so it survives
+    a stdout pipe."""
+    import resource
+    import subprocess
+    before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    rc = subprocess.call(cmd)
+    after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    peak_kb = max(after, before)
+    if sys.platform == "darwin":
+        peak_kb = peak_kb / 1024.0
+    gb = peak_kb / (1024.0 * 1024.0)
+    rec = recommend_peak_gb(gb)
+    sys.stderr.write("\n[autoscale] measured peak RSS of the largest child: %.2f GiB\n" % gb)
+    sys.stderr.write("[autoscale] recommended PEAK_GB_GUESS=%s (observed x1.30, rounded up)\n" % rec)
+    if rec:
+        sys.stderr.write("[autoscale] with that, extraction_workers = %d on this node "
+                         "(was %d at the built-in guess of %d GiB)\n"
+                         % (extraction_workers(_SESSION_CAP, peak_gb=rec),
+                            extraction_workers(_SESSION_CAP), _PEAK_GB_GUESS))
+        sys.stderr.write("[autoscale] export PEAK_GB_GUESS=%s to use it on the next run\n" % rec)
+    return rc
+
+
 def _main(argv=None):
     import argparse
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "measure":                          # `autoscale.py measure -- cmd ...`
+        rest = argv[1:]
+        if rest and rest[0] == "--":
+            rest = rest[1:]
+        if not rest:
+            sys.stderr.write("usage: autoscale.py measure -- <command> [args...]\n")
+            return 2
+        return measure(rest)
     ap = argparse.ArgumentParser(description="runtime worker sizing (single source for shell + python)")
-    ap.add_argument("field", choices=["cores", "ram", "reserve", "workers", "jobs", "panel"])
+    ap.add_argument("field", choices=["cores", "ram", "reserve", "workers", "jobs", "panel", "peak"])
     ap.add_argument("--sessions", type=int, default=_SESSION_CAP)
     ap.add_argument("--peak-gb", type=int, default=None)
     a = ap.parse_args(argv)
@@ -203,9 +283,13 @@ def _main(argv=None):
            "reserve": reserve_gb,
            "workers": lambda: extraction_workers(a.sessions, a.peak_gb),
            "jobs": cpu_jobs,
-           "panel": lambda: panel_workers(a.sessions, a.peak_gb)}[a.field]()
+           "panel": lambda: panel_workers(a.sessions, a.peak_gb),
+           "peak": lambda: (recommend_peak_gb() or 0)}[a.field]()
     print(int(val))
 
 
 if __name__ == "__main__":
-    _main()
+    # Propagate the exit code. `measure` wraps a real command (the extraction run), so swallowing
+    # its status would let a failed extraction report success to the shell -- and the caller gates
+    # on that status.
+    sys.exit(_main() or 0)
