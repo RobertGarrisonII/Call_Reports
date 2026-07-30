@@ -31,7 +31,7 @@ if _HERE not in _sys.path:
 OUTPUT_DIR = _os.path.join(_HERE, "output")
 _os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-__version__ = "0.9.15"
+__version__ = "0.9.16"
 
 __all__ = [
     'autoscale',

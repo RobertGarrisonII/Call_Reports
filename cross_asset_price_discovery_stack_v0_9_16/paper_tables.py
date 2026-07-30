@@ -577,7 +577,16 @@ def build_all_tables(sessions, counts_fn, vol, mwcb_treated, mwcb_control, relea
 
 
 def write_report(tables, md_path, tex_path):
-    """Write all tables to a combined Markdown report and a combined LaTeX file."""
+    """Write all tables to a combined Markdown report and a combined LaTeX file.
+
+    Creates the destination directory if it does not exist. Without this the reporting layer
+    could not be smoke-tested on an ordinary checkout: the self-test's default output directory
+    was an absolute path from one particular machine, so `python paper_tables.py` ended in
+    FileNotFoundError everywhere else."""
+    for _p in (md_path, tex_path):
+        _d = os.path.dirname(os.path.abspath(_p))
+        if _d:
+            os.makedirs(_d, exist_ok=True)
     md = ["# Cross-Asset Price-Discovery / Liquidity-Contagion: Table Report", "",
           "Reproduction and revamped tables for Garrison, Jain & Paddrik (2026).", ""]
     tex = [r"\documentclass{article}", r"\usepackage{booktabs}", r"\usepackage[margin=1in]{geometry}",
@@ -676,7 +685,10 @@ def _selftest():
     print("\nbuilding tables:")
     tables = build_all_tables(sessions, _counts_fn, vol, treated, control, release_by_date,
                               calm_df, stress_df, n_boot=30)
-    out_dir = os.environ.get("OUT_DIR", "/mnt/user-data/outputs")
+    # Default to a path that exists in any checkout; override with OUT_DIR=... for a
+    # shared artifact location. An absolute machine-specific default made the module's
+    # own self-test fail everywhere but one host.
+    out_dir = os.environ.get("OUT_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
     md, tex = write_report(tables, os.path.join(out_dir, "paper_tables_report.md"),
                            os.path.join(out_dir, "paper_tables_report.tex"))
 

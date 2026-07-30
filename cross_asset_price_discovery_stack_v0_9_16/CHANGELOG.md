@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.9.16 -- the three defects v0.9.15 left open
+
+All three are closed. Two were real estimator bugs, one was a portability defect; none of them
+changed a published number, but the first two meant two modules did not do what they claimed.
+
+### 1. state_space_efficient_price: the MLE optimizer never optimized
+
+The self-test had been red: the Kalman smoother lost to a naive average of the two quotes
+(RMSE 0.366 vs 0.096). Splitting estimation from filtering settled where the fault was -- run the
+SAME smoother at the TRUE parameters and it scores 0.0929, beating the average. The filter and the
+RTS smoother were correct all along. The fit was not: it converged 493 log-likelihood units below
+the truth. Two independent causes.
+
+  * **Every start seeded lambda_i = +1.** The likelihood is not concave in lambda and L-BFGS-B
+    cannot cross a sign change, so a start with the wrong sign stays there. The module's headline
+    use case is precisely where the sign is negative -- feed it [bid, ask] of one instrument and
+    the bounce loads +1 on the ask, -1 on the bid. The canonical application was seeded into a bad
+    local optimum. lambda is now estimated from the data: cross-sectionally demeaning kills m_t and
+    leaves y_i - ybar = (lambda_i - lambdabar) c_t, so the first principal component of the demeaned
+    panel IS the loading vector; both signs are also always in the start grid.
+  * **L-BFGS-B stalled silently.** This likelihood comes from a Kalman recursion under a 1e6 diffuse
+    prior, so at the default finite-difference step the numerical gradient is rounding noise:
+    L-BFGS-B stopped after ONE iteration with success=False and a perfectly finite objective that
+    the old "did it blow up" guard waved straight through. The tell was in the output all along --
+    phi reported exactly its 0.3 starting value and q == sigma_v2 exactly. Replaced with Powell
+    (derivative-free), preceded by a cheap likelihood screen of the candidate starts so the wider
+    lambda grid costs little.
+
+  Result: the fitted likelihood is now within ~1 unit of the true-parameter likelihood (was 493),
+  parameters are recovered (q 0.371 vs 0.400, phi 0.50 vs 0.50, |lambda| 0.99 vs 1.00), and the
+  oracle-vs-fit gap replaces the old pass criterion.
+
+  **The self-test's assertion was also wrong**, and is fixed alongside. It required the smoother to
+  beat the naive average on a fixture with lambda = [+1, -1] -- exactly the configuration where
+  (y1+y2)/2 cancels the transitory term outright and is itself near-efficient. The oracle beats it
+  by only ~3%, less than finite-sample estimation error, so that assertion was a coin flip. It now
+  tests against the ORACLE (same smoother, true parameters) and keeps a beats-the-average check at
+  lambda = [1, 0.30], where the average does not cancel the bounce and the comparison is
+  informative: RMSE 0.291 vs 0.587.
+
+### 2. dcc_garch: 2x2 LAPACK dispatch in the hot loop -- 14x faster, bit-identical
+
+`mean_variance.py` could not finish. The cause was not the model but per-bar numpy dispatch inside
+`dcc_garch`: profiling one fit showed **1.3M `np.outer` calls and 643k each of `np.linalg.solve`
+and `slogdet`, all on 2x2 matrices**. The filter is re-run inside every likelihood evaluation and
+every targeting iteration, so the per-bar constant is multiplied by hundreds of thousands.
+
+At k=2 the state is three scalars and the Gaussian kernel is closed form -- log|R| = log(1-r^2),
+z'R^-1 z = (z1^2 - 2 r z1 z2 + z2^2)/(1-r^2). Added scalar fast paths to `_dcc_filter`/`dcc_fit`
+and to `_cdcc_filter`/`_cdcc_nll` (the cDCC path is the DEFAULT and was the actual bottleneck).
+Verified algebraically exact, not approximate: correlation paths agree to 1.7e-16, z* to 8.9e-16,
+and the likelihoods to the printed digit.
+
+  dcc_garch_x(T=1300)   25.3 s -> 1.8 s
+  dcc_garch self-test    133 s -> 15 s
+  mean_variance         >600 s (timeout) -> 105 s, checks: True
+
+### 3. paper_tables: hard-coded output directory
+
+`_selftest()` wrote to an absolute `/mnt/user-data/outputs` and raised FileNotFoundError anywhere
+else, so the reporting layer could not be smoke-tested on an ordinary checkout. The default is now
+a repo-relative `output/` (still overridable with `OUT_DIR`), and `write_report` creates the
+destination directory. 17/17 tables, exit 0.
+
+### Verified
+
+The four touched modules pass their self-tests, and so do every consumer of the changed code:
+`copula_garch`, `correlation_svar`, `liquidity_stress`, `efficient_price`, `cross_flow`,
+`noise_robust_cov`, `test_cdcc`, `test_basis_state`, `test_crossing_qc`, plus the v0.9.15
+regression guards (`test_hy_correlation`, `test_tandem_null`, `test_crossed_root_cause`).
+
 ## v0.9.15 -- correctness pass on the paper pipeline: reconstruction, nulls, and the Epps dependent variable
 
 Five defects, every one of them SILENT in the output tables. Grouped by what they broke.
