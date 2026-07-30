@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.9.22 -- the sample is checked against the exchange calendar before it costs three hours
+
+The 2022-2026 re-sample (chosen to make the paper current) is now the driver's default; the
+published 2014-2017 universe is `--paper-sample`. Validating it turned up two dates:
+
+* **2026-01-19 is Martin Luther King Jr. Day.** NYSE closed. This is precisely why that session
+  extracted to `median SPY=nan ES=6913.75` -- no equity session, while CME Globex ran its
+  abbreviated holiday session, so the futures leg looked healthy and only SPY was missing. A
+  cross-asset study cannot use a day with one leg, and the frame is full length either way.
+* **Pair 8 breaks the matching rule.** 2025-01-07 (Tue) is matched to 2024-01-29 (Mon), 344 days
+  apart; every other pair is same-weekday at 350-371 days. The rule-consistent match is 2024-01-09.
+
+`validate_sample.py` checks a universe in milliseconds: weekends, exchange holidays, one-off
+closures (Sandy, the Bush/Ford/Carter funerals), duplicates and future dates are errors; 13:00 ET
+half days and broken volatile/baseline pairs are warnings. STAGE 0 runs it for `--source extract`
+and refuses to start otherwise, since a bad date costs 10-25 minutes of vendor I/O to return an
+empty frame. `--allow-bad-dates` overrides deliberately. Pinned by `test_validate_sample.py`.
+
+`SAMPLE_UNIVERSE.md` documents the new sample, the pairing table, and what Appendix A.1 and the
+text now have to say -- including that the March-2020 MWCB days are now ~6 years *before* the rest
+of the sample rather than ~4 years after it, which is a different market-structure era and needs a
+sentence.
+
 ## v0.9.21 -- extraction survives a bad day, and refuses to ship a book it invented
 
 From the first real `--source extract` run: 24 sessions, 2h50m, **zero output**. The log contains

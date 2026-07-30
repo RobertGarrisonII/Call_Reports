@@ -64,6 +64,8 @@
 #   ./run_paper_replication.sh --n-lags bic --pmax 20   # data-driven lag (default), wider search
 #   ./run_paper_replication.sh --source extract --qc-action drop   # exclude crossed sessions
 #   ./run_paper_replication.sh --source extract --extract-cache /scratch/sessions
+#   ./run_paper_replication.sh --paper-sample           # the published 2014-2017 universe
+#   ./run_paper_replication.sh --volatile D,D,... --baseline D,D,...   # your own sample
 #
 # Environment
 #   PYTHON=python3            interpreter (default: python3)
@@ -95,13 +97,28 @@ CACHE_DIR="${EXTRACT_CACHE:-${OUT_ROOT}/extract_cache}"
 RESUME=1
 QC_ACTION="warn"      # warn | drop | raise -- what to do with a session whose book crosses
 
-# ── the paper's sample, Appendix Table A.1 ────────────────────────────────────
-# Volatile: the ten largest intraday-range days 2014-2017 (E = scheduled
-# macro announcement, U = unexpected). Baseline: the matched day-of-week
-# roughly one year prior to each. MWCB: the four March-2020 halt days.
-VOLATILE="2015-03-18,2015-10-02,2016-01-08,2016-01-27,2016-06-24,2015-08-21,2015-08-24,2015-09-01,2016-01-13,2016-01-20"
-BASELINE="2014-03-26,2014-10-10,2015-01-09,2015-02-04,2015-06-26,2014-08-22,2014-08-25,2014-09-02,2015-01-14,2015-01-21"
+# ── the sample ────────────────────────────────────────────────────────────────
+# RE-SAMPLED onto 2022-2026 so the paper speaks to the current market. The
+# construction rule is unchanged from Appendix A.1: volatile = the largest
+# intraday-range days in the window, baseline = the same weekday roughly one
+# year prior to each (paired POSITIONALLY, list against list), MWCB = the four
+# March-2020 halt days, which are fixed by history and do not move.
+#
+# Appendix A.1, and every "2014-2017" / "N days" statement in the text, has to
+# change with this. STAGE 0 validates the universe before anything is extracted:
+# a weekend, an exchange holiday or a half day costs 10-25 minutes of vendor I/O
+# each to return an empty or one-legged frame. That is not hypothetical -- the
+# first real run included 2026-01-19, which is MLK Day (NYSE closed, CME Globex
+# on an abbreviated session), and it extracted to `median SPY=nan ES=6913.75`.
+#
+# Pass --paper-sample to restore the published 2014-2017 universe verbatim.
+VOLATILE="2024-12-18,2026-06-05,2025-10-10,2024-09-03,2025-04-03,2024-08-05,2024-07-24,2025-01-07,2023-03-09,2026-01-19"
+BASELINE="2023-12-20,2025-06-13,2024-10-18,2023-09-05,2024-04-04,2023-08-07,2023-07-19,2024-01-29,2022-03-24,2025-01-13"
 MWCB="2020-03-09,2020-03-12,2020-03-16,2020-03-18"
+# the published sample, Appendix Table A.1 (--paper-sample)
+PAPER_VOLATILE="2015-03-18,2015-10-02,2016-01-08,2016-01-27,2016-06-24,2015-08-21,2015-08-24,2015-09-01,2016-01-13,2016-01-20"
+PAPER_BASELINE="2014-03-26,2014-10-10,2015-01-09,2015-02-04,2015-06-26,2014-08-22,2014-08-25,2014-09-02,2015-01-14,2015-01-21"
+ALLOW_BAD_DATES=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -122,6 +139,8 @@ while [ "$#" -gt 0 ]; do
     --no-cache)      CACHE_DIR=""; shift ;;
     --no-resume)     RESUME=0; shift ;;
     --qc-action)     QC_ACTION="$2"; shift 2 ;;
+    --paper-sample)  VOLATILE="$PAPER_VOLATILE"; BASELINE="$PAPER_BASELINE"; shift ;;
+    --allow-bad-dates) ALLOW_BAD_DATES=1; shift ;;
     --dry-run)       DRY=1; shift ;;
     --quick)         QUICK=1; N_BOOT=49; shift ;;
     -h|--help)       sed -n '2,45p' "$0"; exit 0 ;;
@@ -207,6 +226,27 @@ EOF
     info "  (PEAK_GB_GUESS), not by cores. STAGE 2 measures the real peak and prints the value"
     info "  to export -- that guess is the one number here that is not measured."
   fi
+
+  # ── the sample is checked BEFORE anything is extracted ──────────────────────
+  # A weekend, an exchange holiday or a 13:00 half day costs 10-25 minutes of vendor I/O each and
+  # returns an empty or one-legged frame. Checking the calendar takes milliseconds and has to happen
+  # here, not after three hours: the first real run carried 2026-01-19 (MLK Day, NYSE closed, CME
+  # Globex on an abbreviated session) all the way to `median SPY=nan ES=6913.75`.
+  if [ "$SOURCE" = "extract" ]; then
+    VS_FLAGS=""; [ "$ALLOW_BAD_DATES" -eq 1 ] && VS_FLAGS="--allow-bad-dates"
+    # shellcheck disable=SC2086
+    if run_show $PY validate_sample.py --volatile "$VOLATILE" --baseline "$BASELINE" \
+         --mwcb "$MWCB" $VS_FLAGS --out "${OUT}/sample_validation.txt"; then
+      :
+    else
+      echo "" | tee -a "$LOG"
+      echo "SAMPLE REJECTED — see ${OUT}/sample_validation.txt" | tee -a "$LOG"
+      echo "Replace the flagged date(s) with tradable sessions, or pass --allow-bad-dates" | tee -a "$LOG"
+      echo "if you intend to extract them anyway. Whichever date replaces one must keep the" | tee -a "$LOG"
+      echo "matching rule: same weekday, roughly one year prior to its volatile partner." | tee -a "$LOG"
+      exit 1
+    fi
+  fi
   info "OK"
 fi
 
@@ -227,7 +267,8 @@ if have_stage 1; then
            test_debug_crossing.py \
            test_tandem_null.py \
            test_hy_correlation.py \
-           test_extract_resilience.py ; do
+           test_extract_resilience.py \
+           test_validate_sample.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
   done

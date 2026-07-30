@@ -134,14 +134,20 @@ mstwx-lakequery --date 20200309 -s futures -p ESH0 -m mt_add_order --print-heade
 If the lake wants a different symbol form for 2020, `get_front_month_contract` needs the mapping.
 Until this resolves, the MWCB panel has one leg.
 
-### 3. The date universe is not Appendix A.1
+### 3. The date universe — RESOLVED, with two dates to fix
 
-The run used 2022–2026 volatile/baseline dates; the script's baked-in defaults are the paper's
-2014–2017 sample (plus the same four March-2020 MWCB days). If the new universe is intentional —
-a re-sample onto the modern period — Appendix A.1 and every "N days" statement in the paper need to
-change with it, and the volatile/baseline matching rule (same day-of-week, ~one year prior) should
-be re-stated for the new dates. If it was a convenience sample for a plumbing test, note that none
-of these numbers are the paper's.
+Confirmed intentional: a re-sample onto 2022–2026 to make the paper current. It is now the driver's
+default (`--paper-sample` restores the published 2014–2017 universe). Checking it against the NYSE
+calendar surfaced two problems, both in `SAMPLE_UNIVERSE.md`:
+
+* **2026-01-19 is MLK Day** — NYSE closed. This is the direct cause of that session's
+  `median SPY=nan ES=6913.75`: no equity session, while CME Globex ran its abbreviated holiday
+  session, so the futures leg looked healthy and only SPY was missing. It cannot be a volatile day.
+* **Pair 8 breaks the matching rule** — 2025-01-07 (Tue) is matched to 2024-01-29 (Mon), 344 days.
+  Every other pair is same-weekday at 350–371 days. The rule-consistent match is 2024-01-09 (Tue).
+
+`validate_sample.py` now runs in STAGE 0 for `--source extract` and rejects the universe before any
+extraction begins, so a closed day costs milliseconds instead of three hours.
 
 ---
 
