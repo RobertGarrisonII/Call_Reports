@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.9.18 -- per-session process pool + the GARCH recursion off numpy; mean_variance 115s -> 36s
+
+Two changes, both bit-identical in output. The measurements below drove the design, and one of
+them overturned my own recommendation.
+
+### 1. `run_mean_variance.run_panel` runs sessions in a process pool
+
+Sessions are independent -- each is its own GARCH marginal pair plus a cDCC fit, sharing no state.
+PROCESSES not threads: the cost is the GARCH and cDCC recursions, which are Python-level loops
+holding the GIL, so a thread pool would serialize them.
+
+`n_jobs=None` (default) sizes the pool from the machine; `n_jobs=1` forces the original serial
+loop for debugging or where a worker cannot be forked; a process pool that fails to start falls
+back to serial with a warning. Output is order- and value-identical either way -- the panel is
+reassembled by original index, and the per-session keep-going-on-error behaviour is preserved.
+
+**`autoscale.panel_workers(n_items)`** is the new sizing function, a THIRD budget alongside
+`extraction_workers` and `cpu_jobs`, because neither fits: `cpu_jobs` ignores memory (fine when
+data is resident and shared, wrong when each worker gets its own pickled frame), and
+`extraction_workers` is calibrated for a worker holding a full day of raw MESSAGES (32 GB/worker
+against a >=16 GB reserve) -- borrowing it collapses to ONE worker on any node under ~48 GB, i.e.
+it would silently serialize the loop being parallelised. An aggregated 1-second frame is ~7.5 MB.
+Size = min(cores, n_items, RAM-derived at ~1 GB/worker leaving 30% headroom). Overrides:
+`PANEL_WORKERS`, `PANEL_PEAK_GB`. CLI: `python autoscale.py panel --sessions 24`.
+
+### 2. `_garch_filter` runs on Python floats -- 4.7x, and it is the bigger lever
+
+I recommended parallelism over this rewrite. Measurement said the opposite, and the reason is the
+interesting part. On a box that scales 106% on a sustained pure-CPU benchmark, per-fit time inside
+the pool degraded almost linearly with worker count:
+
+    1 fit alone 18.3 s  |  2 workers 29.2 s each  |  4 workers 57.7 s each
+
+That is a saturated SHARED resource, and since CPU scaled fine it is memory/allocator traffic:
+indexing a numpy array element-wise boxes a fresh Python float per access, and `_garch_filter` --
+65% of a `mean_variance` run, ~2,200 calls per fit from the L-BFGS numerical gradients -- did that
+in its inner loop. So the pool was fighting the very thing that made the loop slow. Hoisting the
+square out as one vectorised op and running the recursion on lists removes the boxing, which
+speeds up the serial path AND unblocks the parallel one. Arithmetic and its ordering are
+unchanged: `np.array_equal` holds exactly, with and without the X covariates.
+
+### Measured
+
+    _garch_filter (T=20k)      14.1 ms -> 3.0 ms          (4.7x, bit-identical)
+    mean_variance self-test        115 s -> 36 s
+    run_panel, 8 sessions serial   185.7 s -> 72.8 s
+    run_panel, 8 sessions pooled   123.6 s -> 58.2 s      (4 cores)
+
+Every comparison max|diff| = 0.00e+00 against the serial pre-change path.
+
+Parallelism alone was 1.50x on this 4-core box -- worth keeping, and it should do better on a
+machine with more memory channels, but it was never the 8-16x I first estimated. The honest split
+is that the loop rewrite did most of the work.
+
+### Known open (pre-existing, found not caused)
+
+`run_mean_variance` self-test reports `checks: False` on `vol_link`: the liquidity->variance LR
+test is not significant on the synthetic fixture (min p ~0.51). Verified pre-existing by swapping
+the old `_garch_filter` back in -- identical `lr_p=0.5136` and `CS_ES=0.582196` either way, so it
+is a property of the fixture or the test, not the recursion. Every other check in that module
+passes. It now exits non-zero rather than printing False and returning 0 (the same
+invisible-to-the-smoke-loop defect fixed in `robust_prices` at v0.9.16).
+
 ## v0.9.17 -- scalar Kalman likelihood: state_space_efficient_price fits ~10x faster
 
 The v0.9.16 optimizer fix made `state_space_efficient_price` correct but slow: ~12-29 s per fit,
