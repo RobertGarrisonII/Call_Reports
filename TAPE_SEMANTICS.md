@@ -144,7 +144,91 @@ matching the extraction.
 
 ## Still unfetched, deliberately
 
-`mt_retail_price_improvement`, `mt_product_statistics`, `mt_index_update`. None affect the book.
-`mt_product_statistics` carries the official open/close/previous-close per venue and would be a
-cheap independent check on the reconstructed opening print — worth adding if a referee asks how the
-replay's 09:30 state was validated.
+`mt_retail_price_improvement` and `mt_index_update`. Neither affects the book.
+
+---
+
+# The ES side (ESZ4, same date)
+
+The futures tape is a different shape, and it settles the ES leg's design.
+
+## 6. CME publishes **no** price-level types — the MBO-only path is necessary, not a choice
+
+`mt_price_level_update`, `mt_modify_price_level`, `mt_delete_price_level` all return **header only**
+for ESZ4. So does `mt_bbo_quote`, `mt_nbbo_quote` and `mt_order_imbalance`. The stack already
+assumed this (`_extract_one_session` passes an MBO-only message list for ES and the docstring says
+the price-level types are empty for futures) — it is now verified rather than asserted, and
+`test_validate_aggregated.py` pins that an ES replay still builds correctly with every price-level
+frame empty.
+
+Two consequences worth stating in the paper: the ES book has no MBP supplement to fall back on if
+the MBO stream is incomplete, and **any auction-imbalance feature is equity-only** — `auction_imbalance`
+will silently produce nothing for ES because the venue sends no imbalance messages.
+
+## 7. `mt_aggregated_price_update` **is** populated for ES — a benchmark with no clock confound
+
+```
+mt_aggregated_price_update,1734475500134856451,...,cme_globex30_cme,...,ESZ4,One,None,One,false,true,
+  605175,9,4, 605150,12,5, 605125,11,2, ...   |  605225,2,1, 605250,11,4, ...
+```
+
+CME's own 10-level ladder — price, quantity **and order count** per level — delivered through the
+same lake, on the same capture clock as the add/cancel/modify/trade messages the replay consumes.
+Single feed (`cme_globex30_cme`), fully populated from the pre-open onward.
+
+This matters because "how do you know the reconstruction is right?" previously had a weak answer.
+`validate_against_snapshot` compares against `mstbook-query`, which was demoted *precisely* because
+it sits on a different clock — so any disagreement is confounded and neither direction proves
+anything. This benchmark has no such defect: disagreement localizes to the replay.
+
+`validate_aggregated.py` runs the comparison level by level (as-of aligning the event-stamped venue
+ladder onto the reconstruction's grid), and STAGE 3 runs it automatically on the first volatile
+session of an extract run. **This is the robustness table the paper needs**, and it is now a
+one-line command:
+
+```bash
+python validate_aggregated.py --date 20241218 --product ESH5 --product-type futures --price-scale 0.01
+```
+
+Note the contract: `get_front_month_contract` returns **ESH5** for 2024-12-18, not the ESZ4 you
+queried, because the December contract expires 2024-12-20 and the 8-day rollover has already moved
+the front month to March. That is the right choice for a liquidity-based price-discovery study — but
+validate the contract the pipeline actually uses, or the comparison is against a book nobody built.
+
+Prices confirm the scale convention: `605175` = 6051.75 index points, so `price_scale=0.01`, and
+6051.75 × 10 ≈ the SPY level of ~604.87 that morning.
+
+## 8. `mt_product_statistics` — a second validation axis, with a trap
+
+For ES it is rich: `openingprice`, `highprice`, `lowprice`, `lasttrade`,
+`volumeweightedaverageprice`, `volume`, `openinterest`, `settlementprice`,
+`previousdaysettlementprice`, `indicativeopeningprice`. A replay can match the ladder tick for tick
+and still have the wrong session boundaries; these catch that.
+
+**The trap:** the rows are a running stream and the early ones carry the **previous** session. The
+17:38 ET row on 2024-12-18 reports `settlementprice=608050` stamped `2024-12-15 19:00 ET`, and a
+`highprice`/`lowprice` (6079.25 / 6040.75) that are last session's, not the FOMC day's. A reader
+that takes the first value reports last week's numbers. `session_statistics()` takes the last
+non-null value of each field, and `test_validate_aggregated.py` pins it.
+
+## 9. The ES trade date starts at 18:00 ET the **previous calendar day**
+
+The ESZ4 stream opens at 17:38–17:45 ET on Dec 17 (the Globex pre-open), with a
+`mt_product_statistics` row at exactly 18:00:00.002 ET marking the session open. The replay ingests
+all of it and only the snapshot **grid** is 09:30–16:00, which is what you want — the book is warm
+at the open rather than being rebuilt from scratch at 09:30.
+
+It also means the venue's session statistics span a window the RTH grid is a strict subset of, so
+containment — not equality — is the correct check against a 09:30–16:00 reconstruction.
+`validate_aggregated.py` says so in its output rather than leaving it to be misread.
+
+## 10. Clean capture on both legs
+
+`mt_missing_product_messages`, `mt_error`, `mt_clear_orders` and `mt_clear_price_levels` are all
+**empty for ESZ4** on 2024-12-18 — no packet loss, no decoder errors, no Globex resets. Combined
+with the same result on the SPY side, 2024-12-18 is a clean capture on both legs, which makes it a
+good control day for the MWCB comparison.
+
+The clear types exist in the futures schema even though they are empty here, so ES now fetches them
+too: a Globex reset on a crash day would otherwise be invisible, and an empty query costs nothing
+against a 10–25 minute session.

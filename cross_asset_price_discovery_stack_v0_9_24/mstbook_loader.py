@@ -357,8 +357,12 @@ MESSAGE_TYPES = ("mt_add_order", "mt_cancel_order", "mt_modify_order", "mt_trade
 # Aurora I (PCAP tap next to the CME engine) each feed is hardware GPS-stamped at its origin colo,
 # so receipt is one uniform UTC methodology across venues -> the defensible default. Exchange time
 # carries heterogeneous per-venue publication semantics and is offered only as a robustness lens.
-_CLOCK_COLS = {"receipt": ("receipttimestamp",),
-               "exchange": ("exchangetimestamp", "exchange_timestamp", "sourcetimestamp")}
+# mt_aggregated_price_update names its clocks last{receipt,exchange}timestamp -- it is a SNAPSHOT of
+# the whole ladder after a burst, not a single event, so the column says "as of". Without these
+# aliases that type cannot be fetched at all (no recognized clock column -> ValueError).
+_CLOCK_COLS = {"receipt": ("receipttimestamp", "lastreceipttimestamp"),
+               "exchange": ("exchangetimestamp", "exchange_timestamp", "sourcetimestamp",
+                            "lastexchangetimestamp")}
 _MSG_QTY_COL = {"mt_add_order": "quantity", "mt_cancel_order": "previousquantity",
                 "mt_modify_order": "quantity", "mt_trade": "quantity",
                 # MBP (price-level) feeds, for the hybrid book reconstruction (e.g. IEX):
@@ -371,6 +375,12 @@ _MSG_QTY_COL = {"mt_add_order": "quantity", "mt_cancel_order": "previousquantity
                 # data-quality oracles: gaps in the venue's own sequence, and feed decode errors. Not
                 # replayed -- read by the diagnostics to tell DATA loss from a CODE fault.
                 "mt_missing_product_messages": "quantity", "mt_error": "quantity",
+                # INDEPENDENT VALIDATION of the replay, not inputs to it. mt_aggregated_price_update is
+                # the venue's own 10-level ladder (quantity AND order count per level) and
+                # mt_product_statistics its session high/low/volume/VWAP/settlement -- both from the same
+                # lake, on the same capture clock as the messages we replay, which is exactly the
+                # objection that retired mstbook-query as a benchmark. See validate_aggregated.py.
+                "mt_aggregated_price_update": "bidquantity_1", "mt_product_statistics": "volume",
                 # trade-tape hygiene (busted / corrected prints), scrubbed before aggregation:
                 "mt_trade_break": "quantity", "mt_trade_correction": "newquantity",
                 # auction (opening/closing cross) imbalance -- feature input (auction_imbalance.py):
@@ -941,8 +951,14 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                                  session=(cfg["start_time"], cfg["end_time"]), tz=cfg["tz"],
                                  data_source=cfg["data_source"], clock=cfg["clock"],
                                  price_scale=cfg["futures_scale"], progress_cb=progress_cb,
+                                 # CME publishes NO price-level types for ES (mt_price_level_update /
+                                 # mt_modify_price_level / mt_delete_price_level all return header-only),
+                                 # so the futures leg is MBO by necessity, not by choice. The clear
+                                 # types ARE in the futures schema -- empty on a normal day, but a
+                                 # Globex reset on a crash day would otherwise be invisible, and an
+                                 # empty query costs nothing next to a 10-25 minute session.
                                  message_types=("mt_add_order", "mt_cancel_order", "mt_modify_order",
-                                                "mt_trade"))
+                                                "mt_trade", "mt_clear_orders", "mt_clear_price_levels"))
     df = spy.join(es, how="outer").sort_index()
     if cfg["with_flow"]:
         if progress_cb is not None:

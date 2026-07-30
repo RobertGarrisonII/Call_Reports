@@ -73,8 +73,12 @@ _QTY = {"mt_add_order": "quantity", "mt_cancel_order": "previousquantity",
 # CME engine (CyrusOne Aurora I) each feed is hardware GPS-stamped at its origin colo, so "receipt"
 # is one uniform UTC methodology across venues -> the default. "exchange" is per-venue engine time
 # (heterogeneous publication semantics) and is a robustness lens only.
-_CLOCK_COLS = {"receipt": ("receipttimestamp",),
-               "exchange": ("exchangetimestamp", "exchange_timestamp", "sourcetimestamp")}
+# mt_aggregated_price_update names its clocks last{receipt,exchange}timestamp -- it is a SNAPSHOT of
+# the whole ladder after a burst, not a single event, so the column says "as of". Without these
+# aliases that type cannot be fetched at all (no recognized clock column -> ValueError).
+_CLOCK_COLS = {"receipt": ("receipttimestamp", "lastreceipttimestamp"),
+               "exchange": ("exchangetimestamp", "exchange_timestamp", "sourcetimestamp",
+                            "lastexchangetimestamp")}
 # MBO (order-by-order) events vs MBP (price-level) events. Order-based venues (bats_edgx,
 # xdp_arca_integrated, total_view, ...) publish add/cancel/modify/trade and are replayed per order;
 # price-level venues (iex_deep, and the CME MBP modify/delete) publish the NEW aggregate size at a

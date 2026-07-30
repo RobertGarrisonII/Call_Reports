@@ -269,7 +269,8 @@ if have_stage 1; then
            test_hy_correlation.py \
            test_extract_resilience.py \
            test_validate_sample.py \
-           test_feed_reset.py ; do
+           test_feed_reset.py \
+           test_validate_aggregated.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
   done
@@ -362,6 +363,23 @@ if have_stage 3 && [ "$SOURCE" != "demo" ]; then
     if run_show $PY qc_frames.py --pickle "$FRAMES" --crossed-tol 0.005 \
          --out "${OUT}/qc_frames.txt"; then
       info "every session satisfies the invariant"
+      # The invariant says the book is SELF-consistent. It does not say the book is RIGHT. CME
+      # publishes its own 10-level ladder (mt_aggregated_price_update) through the same lake on the
+      # same capture clock, so the ES replay can be checked against the venue itself with none of
+      # the clock confound that retired mstbook-query as a benchmark. One session is enough for the
+      # robustness table; --stages 3 re-runs it on another day.
+      if [ "$SOURCE" = "extract" ]; then
+        VDATE="$(echo "$VOLATILE" | cut -d, -f1 | tr -d -)"
+        VCON="$($PY -c "import mstbook_loader as ml,datetime;print(ml.get_front_month_contract('ES', as_of_date=ml._parse_yyyymmdd('$VDATE')))" 2>/dev/null || true)"
+        if [ -n "$VCON" ]; then
+          info "validating the ES replay against CME's own ladder on ${VDATE} (${VCON})"
+          run_rc $PY validate_aggregated.py --date "$VDATE" --product "$VCON" \
+                 --product-type futures --price-scale 0.01 --interval "$INTERVAL" \
+                 --out "${OUT}/validate_${VCON}_${VDATE}.txt" \
+            && info "  ES replay matches the venue ladder (${OUT}/validate_${VCON}_${VDATE}.txt)" \
+            || info "  DISAGREEMENT vs the venue ladder -- see ${OUT}/validate_${VCON}_${VDATE}.txt"
+        fi
+      fi
     else
       BAD="$(sed -n 's/^BAD \([0-9-]*\).*/\1/p' "${OUT}/qc_frames.txt" | tr '\n' ' ')"
       if [ -n "$BAD" ] && [ "$SOURCE" = "extract" ]; then

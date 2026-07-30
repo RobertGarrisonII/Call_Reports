@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.9.24 -- the ES tape carries its own benchmark, and the paper needs it
+
+The ESZ4 sample for 2024-12-18 settles the futures leg's design and hands over the robustness
+result the paper was missing. Detail in `TAPE_SEMANTICS.md` sections 6-10.
+
+**CME publishes no price-level types for ES.** `mt_price_level_update`, `mt_modify_price_level`,
+`mt_delete_price_level`, `mt_bbo_quote`, `mt_nbbo_quote` and `mt_order_imbalance` are all
+header-only for ESZ4. The MBO-only path was already assumed; it is now verified, and
+`test_validate_aggregated.py` pins that an ES replay builds correctly with every price-level frame
+empty. Two things follow for the text: the ES book has no MBP fallback if its MBO stream is
+incomplete, and **any auction-imbalance feature is equity-only** -- `auction_imbalance` silently
+produces nothing for ES because the venue sends no imbalance messages.
+
+**`mt_aggregated_price_update` IS populated for ES, and it is a benchmark with no clock confound.**
+CME's own 10-level ladder -- price, quantity and order count per level -- from the same lake, on the
+same capture clock as the messages the replay consumes. "How do you know the reconstruction is
+right?" previously had only `validate_against_snapshot` against `mstbook-query`, which was demoted
+*precisely* because it sits on a different clock, so disagreement there is confounded and proves
+nothing in either direction. This one localizes disagreement to the replay.
+
+* `validate_aggregated.py` -- level-by-level comparison, as-of aligning the event-stamped venue
+  ladder onto the reconstruction's grid (comparing without that would score a timing difference as
+  an error), plus the venue's session statistics as a second axis.
+* STAGE 3 runs it on the first volatile session of an extract run, after the invariant gate. The
+  invariant says the book is self-CONSISTENT; this says it is RIGHT.
+* Fetching it at all required two fixes: `mt_aggregated_price_update` names its clocks
+  `last{receipt,exchange}timestamp` (it is a ladder snapshot after a burst, not one event), so
+  without the `_CLOCK_COLS` aliases the type raised `ValueError`; and it plus
+  `mt_product_statistics` were absent from `_MSG_QTY_COL`.
+
+**`mt_product_statistics` has a recency trap.** The rows are a running stream and the early ones
+carry the PREVIOUS session -- the 17:38 ET row on 2024-12-18 still reports the 2024-12-15
+settlement and last session's high/low. `session_statistics()` takes the last non-null value of each
+field, never the first.
+
+**ES fetches the clear types too.** Empty for ESZ4 on this date, but they exist in the futures
+schema, and a Globex reset on a crash day would otherwise be invisible. An empty query costs nothing
+against a 10-25 minute session.
+
+Also recorded: the ES trade date opens at 18:00 ET the PREVIOUS calendar day (the stream starts
+17:38 ET Dec 17), so the venue's session statistics span a window the 09:30-16:00 grid is a strict
+subset of -- containment, not equality, is the correct check. And 2024-12-18 is a clean capture on
+BOTH legs (no gaps, no decoder errors, no resets), which makes it a good control day against the
+MWCB sessions.
+
 ## v0.9.23 -- the replay now reads the rest of the tape
 
 A sample pull of every `mt_*` type for SPY on 2024-12-18 showed the reconstruction was consuming
