@@ -268,7 +268,8 @@ if have_stage 1; then
            test_tandem_null.py \
            test_hy_correlation.py \
            test_extract_resilience.py \
-           test_validate_sample.py ; do
+           test_validate_sample.py \
+           test_feed_reset.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
   done
@@ -364,12 +365,21 @@ if have_stage 3 && [ "$SOURCE" != "demo" ]; then
     else
       BAD="$(sed -n 's/^BAD \([0-9-]*\).*/\1/p' "${OUT}/qc_frames.txt" | tr '\n' ' ')"
       if [ -n "$BAD" ] && [ "$SOURCE" = "extract" ]; then
-        info "root-causing the flagged session(s) with debug_crossing (re-fetches raw messages)"
+        info "root-causing the flagged session(s) -- both tools re-fetch that day's raw messages"
         for d in $BAD; do
           ymd="${d//-/}"
+          # FIRST: is the capture even complete? A venue gap report or a decoder error means the
+          # adds never arrived, so the removals referencing them are orphans and the book crosses
+          # through no fault of the replay. No amount of reconstruction work fixes a lost packet.
+          run_rc $PY feed_health.py --date "$ymd" --product SPY \
+                 --out "${OUT}/feed_health_${ymd}.txt" || true
+          # THEN the replay-side root cause. --clock must MATCH the extraction (receipt): diagnosing
+          # a book built on the other clock answers a question about a book you did not save, and
+          # some feeds stamp a whole burst with one exchange timestamp, which makes that ordering
+          # degenerate for them.
           run_rc $PY debug_crossing.py --date "$ymd" --product SPY \
-                 --clock exchange --ab-ordering --out "${OUT}/crossing_${ymd}.txt" || true
-          info "  report: ${OUT}/crossing_${ymd}.txt"
+                 --clock receipt --ab-ordering --out "${OUT}/crossing_${ymd}.txt" || true
+          info "  reports: ${OUT}/feed_health_${ymd}.txt, ${OUT}/crossing_${ymd}.txt"
         done
       fi
       echo "" | tee -a "$LOG"

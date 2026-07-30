@@ -364,6 +364,13 @@ _MSG_QTY_COL = {"mt_add_order": "quantity", "mt_cancel_order": "previousquantity
                 # MBP (price-level) feeds, for the hybrid book reconstruction (e.g. IEX):
                 "mt_price_level_update": "quantity", "mt_modify_price_level": "quantity",
                 "mt_delete_price_level": "quantity",
+                # feed resets (mt_clear_orders / mt_clear_price_levels) carry no quantity at all -- they
+                # void everything the venue has published so far. Tiny and read in FULL (not in
+                # _BOOK_MSG_TYPES), so no column pruning can drop what they do carry.
+                "mt_clear_orders": "quantity", "mt_clear_price_levels": "quantity",
+                # data-quality oracles: gaps in the venue's own sequence, and feed decode errors. Not
+                # replayed -- read by the diagnostics to tell DATA loss from a CODE fault.
+                "mt_missing_product_messages": "quantity", "mt_error": "quantity",
                 # trade-tape hygiene (busted / corrected prints), scrubbed before aggregation:
                 "mt_trade_break": "quantity", "mt_trade_correction": "newquantity",
                 # auction (opening/closing cross) imbalance -- feature input (auction_imbalance.py):
@@ -415,6 +422,16 @@ _MSG_NEEDED_COLS = frozenset({
     "orderreferencenumber", "previousorderreferencenumber",                             # book keys
     "maintainpriority", "admindelete", "aggressorside", "printable",                    # modify/trade hygiene
     "matchid", "tradereferencenumber",                                                  # trade-bust matching (mt_trade)
+    # mt_trade only, and both were being pruned away exactly like `sequencenumber` was:
+    #   leavesquantity     -- the venue's OWN remaining size on the resting order AFTER this execution.
+    #                         Authoritative where a decrement is only arithmetic, and leaves=0 removes a
+    #                         fully filled order deterministically (an unremoved one rests forever and
+    #                         pins the top). Verified on tape: ref ...546706 prints 1198 -> 1194 -> 1192
+    #                         on trades of 2, 4, 2.
+    #   executionattribute -- 'Hidden' marks an execution against NON-DISPLAYED liquidity. Those prints
+    #                         carry no orderreferencenumber by construction, so they are not evidence of
+    #                         a broken replay and must not consume displayed size that is still resting.
+    "leavesquantity", "executionattribute",
 })
 # Prune `usecols` ONLY for the high-volume book/trade message types (millions of rows on crash days).
 # The low-volume auxiliary types -- trade-break/correction and auction order-imbalance -- carry

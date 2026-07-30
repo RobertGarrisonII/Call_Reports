@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.9.23 -- the replay now reads the rest of the tape
+
+A sample pull of every `mt_*` type for SPY on 2024-12-18 showed the reconstruction was consuming
+five message types and taking its semantics for two of them from assumptions the tape contradicts.
+Three of the omissions change the book. Full detail in `TAPE_SEMANTICS.md`.
+
+**Feed resets were never fetched.** `mt_clear_orders` / `mt_clear_price_levels` are the venue saying
+*discard everything I have sent and rebuild from my next message* -- a line failover or gap
+recovery. Not applying one is unrecoverable: the venue never cancels the orders it just disowned, so
+every one rests in the consolidated ladder to the close while the venue rebuilds under fresh
+reference numbers. The 2024-12-18 tape carries one at 05:25:44 ET on `miax_pearl_equities_dom`, 85
+minutes into the pre-market, with the replay already holding that feed's state (the replay starts
+from the first message of the day; only the snapshot GRID is 09:30-16:00). `test_feed_reset.py`
+shows the mechanism: reset ignored -> a stale 605.50 bid pins the top against a 604.90 ask, 100%
+crossed; reset applied -> a clean 604.80/604.90, other venues untouched. Within a sequence tie a
+reset ranks FIRST, not last, or it would wipe the re-adds it exists to make room for.
+
+**`mt_trade.leavesquantity` was being pruned away** -- the same `_MSG_NEEDED_COLS` failure mode as
+the original `sequencenumber` bug, in the same function. It is the venue's own remaining size on the
+resting order after the execution (the tape proves it: ref ...546706 prints 1198 -> 1194 -> 1192 on
+trades of 2, 4, 2), so it is authoritative where a decrement is only arithmetic, and `leaves=0`
+removes a filled order deterministically instead of leaving it to pin the top. Now assigned rather
+than decremented, with drift counted in `lob_stats["trade_leaves_corrected"]`.
+
+**Refless trades are mostly hidden liquidity, and were treated as faults.** An execution against
+non-displayed liquidity has no `orderreferencenumber` by construction; the tape marks it
+`executionattribute='Hidden'` / `printable='NonPrintable'`. The old code counted these in
+`trade_no_ref` -- so the "11-17% of trades have no reference" figure on the MWCB days conflated a
+property of the SPY tape with a reference-matching fault -- and consumed displayed size at their
+price, deleting liquidity that was still resting. Now `executionattribute` is read (also previously
+pruned), undisplayed prints consume nothing, and the displayed vs undisplayed rates are reported
+separately.
+
+**`feed_health.py`** asks the question every crossed-book diagnostic had been inferring from
+symptoms: `mt_missing_product_messages` is the venue's own packet-gap report, and missing packets
+mean missing adds, hence orphaned removals and a crossed book that no code change can fix. With
+`mt_error` and the reset inventory it returns a verdict -- capture incomplete (DATA) or capture
+complete (the replay's fault, fixable). Empty for 2024-12-18. This is the decisive test for the
+residual ~3.9% crossing on the four MWCB days, at one query per day. STAGE 3 runs it on any flagged
+session before `debug_crossing`.
+
+**STAGE 3 was diagnosing a different book than it saved.** `debug_crossing` ran with
+`--clock exchange` while extraction runs on `receipt`; the tape also shows many consecutive
+`bats_edgx` messages sharing one `exchangetimestamp` while receipt times differ, which makes that
+ordering degenerate for those bursts. Now `--clock receipt`, matching the extraction.
+
+Confirmed correct and unchanged: blank `aggressorside` for equities (tick-rule fallback), per-feed
+sequence namespaces, `total_view` re-IDing on modify, MBP levels keyed on price rather than the
+empty `level` field, and building the NBBO from messages rather than the empty `mt_nbbo_quote`.
+
 ## v0.9.22 -- the sample is checked against the exchange calendar before it costs three hours
 
 The 2022-2026 re-sample (chosen to make the paper current) is now the driver's default; the

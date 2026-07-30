@@ -57,14 +57,18 @@ _NA_TOKENS = ("", "nan", "<NA>", "None", "NaN", "null", "NULL")
 # a supplement to the MBO stream -- they are empty for CME futures by construction and only add depth
 # for the venues that publish them, so losing them degrades the ladder. Losing any MBO type
 # (add/cancel/modify/trade) does not degrade the book, it fabricates one: see reconstruct_session.
+# The clear types are optional for a different reason: they were not fetched at all until v0.9.23, so
+# a venue that does not publish them must not now fail the session.
 _OPTIONAL_MSG_TYPES = frozenset({"mt_price_level_update", "mt_modify_price_level",
-                                 "mt_delete_price_level"})
+                                 "mt_delete_price_level", "mt_clear_orders", "mt_clear_price_levels"})
 
 # message-type -> the column carrying the quantity that the event acts on
 _QTY = {"mt_add_order": "quantity", "mt_cancel_order": "previousquantity",
         "mt_modify_order": "quantity", "mt_trade": "quantity",
         "mt_price_level_update": "quantity", "mt_modify_price_level": "quantity",
-        "mt_delete_price_level": "quantity"}
+        "mt_delete_price_level": "quantity",
+        # the clear types carry no quantity: they wipe a whole feed's state
+        "mt_clear_orders": "quantity", "mt_clear_price_levels": "quantity"}
 # which timestamp column drives event ordering + the snapshot grid. Under source capture next to the
 # CME engine (CyrusOne Aurora I) each feed is hardware GPS-stamped at its origin colo, so "receipt"
 # is one uniform UTC methodology across venues -> the default. "exchange" is per-venue engine time
@@ -77,10 +81,22 @@ _CLOCK_COLS = {"receipt": ("receipttimestamp",),
 # price and are applied directly to the level. Both feed the same per-venue consolidation layer -- a
 # level is a level however it was built. This is the fix for MBP-only venues (notably IEX) being
 # absent from the "consolidated" book under an MBO-only engine.
-_ADD, _CANCEL, _MODIFY, _TRADE, _LEVEL_SET, _LEVEL_DEL = 0, 1, 2, 3, 4, 5
+#
+# mt_clear_orders / mt_clear_price_levels are FEED RESETS: the venue is telling you to discard
+# everything it has told you so far and rebuild from the next message. They are issued on a line
+# failover, a gap recovery, or a session-state transition, and they carry no price or quantity --
+# the whole point is that the previous state is void. Not applying one is unrecoverable: the venue
+# never cancels the orders it just disowned, so every one of them rests in the consolidated ladder
+# for the remainder of the session while the venue re-adds its book under fresh reference numbers.
+# A stale pre-market bid pinned that way sits above the current ask for hours, which is exactly the
+# "resting orders that should have left are pinning the top" signature. The 2024-12-18 SPY tape
+# carries one at 05:25:44 ET on miax_pearl_equities_dom, mid-pre-market, with the replay already
+# holding that feed's state -- and until v0.9.23 these types were never even fetched.
+_ADD, _CANCEL, _MODIFY, _TRADE, _LEVEL_SET, _LEVEL_DEL, _CLEAR = 0, 1, 2, 3, 4, 5, 6
 _CODE = {"mt_add_order": _ADD, "mt_cancel_order": _CANCEL, "mt_modify_order": _MODIFY, "mt_trade": _TRADE,
          "mt_price_level_update": _LEVEL_SET, "mt_modify_price_level": _LEVEL_SET,
-         "mt_delete_price_level": _LEVEL_DEL}
+         "mt_delete_price_level": _LEVEL_DEL,
+         "mt_clear_orders": _CLEAR, "mt_clear_price_levels": _CLEAR}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -150,6 +166,53 @@ class _Book:
             lv[price] -= qty
             o[2] = size - qty
         return True
+
+    def set_remaining(self, feed, ref, leaves):
+        """Trade against a referenced resting order, using the venue's OWN post-trade remaining size.
+
+        ``mt_trade.leavesquantity`` is what is left on the resting order after this execution, so it
+        is authoritative where a decrement is merely arithmetic: it is immune to a missed earlier
+        partial fill, to a duplicate print, and to a size we mis-parsed on the add. ``leaves = 0``
+        removes the order outright, which is the case that matters -- a fully filled order that is
+        not removed rests forever and pins the top. Verified against the tape: order
+        3189381831070546706 prints leaves 1198 -> 1194 -> 1192 on trades of 2, 4 and 2.
+
+        Returns False when the reference is unknown (caller falls back), True otherwise."""
+        o = self.orders.get((feed, ref))
+        if o is None:
+            return False
+        side, price, size = o
+        lv = self._lv(feed, side)
+        if not np.isfinite(leaves) or leaves <= EPS:
+            lv[price] -= size
+            if lv[price] <= EPS:
+                lv.pop(price, None)
+            self.orders.pop((feed, ref), None)
+        else:
+            lv[price] += (leaves - size)              # assign the venue's figure, keep the level in step
+            if lv[price] <= EPS:
+                lv.pop(price, None)
+            o[2] = leaves
+            if abs(leaves - size) > EPS:
+                self.stats["trade_leaves_corrected"] += 1
+        return True
+
+    def clear_feed(self, feed):
+        """Feed reset (mt_clear_orders / mt_clear_price_levels): discard EVERYTHING this venue has
+        published. Orders are dropped by key and both price maps for the feed are emptied, so nothing
+        it disowned can rest in the consolidated ladder afterwards. Other venues are untouched --
+        a reset is per feed, and treating it as global would blank a book that is perfectly good."""
+        n = 0
+        for key in [k for k in self.orders if k[0] == feed]:
+            del self.orders[key]
+            n += 1
+        n_lv = len(self.bid.get(feed, ())) + len(self.ask.get(feed, ()))
+        self.bid.pop(feed, None)
+        self.ask.pop(feed, None)
+        self.stats["feed_clears"] += 1
+        self.stats["orders_cleared"] += n
+        self.stats["levels_cleared"] += n_lv
+        return n, n_lv
 
     def reduce_level(self, feed, side, price, qty):  # SUPERSEDED on the trade path by reduce_at_price
         # Kept for callers that genuinely know the book side. NOT used for trade consumption any more:
@@ -228,7 +291,16 @@ def _col(df, name, default=None):
     return pd.Series([default] * len(df), index=df.index)
 
 
-_Events = namedtuple("_Events", "ts code feed side price size pprice psize ref pref maintain feed_names")
+_Events = namedtuple("_Events", "ts code feed side price size pprice psize ref pref maintain "
+                                "leaves undisplayed feed_names")
+
+# An execution against NON-DISPLAYED liquidity carries no orderreferencenumber, because there is no
+# displayed resting order to reference. The tape marks it: executionattribute='Hidden' (and/or
+# printable='NonPrintable'). Those prints are legitimately reference-less -- they are not evidence of
+# a broken replay, and consuming displayed size at their price REMOVES liquidity that is still
+# resting. On 2024-12-18 SPY they are a large share of the odd-lot tape.
+_UNDISPLAYED_EXEC = ("hidden",)
+_UNDISPLAYED_PRINT = ("nonprintable",)
 
 
 def _event_arrays(messages: dict, tz: str, clock: str = "exchange", price_scale: float = 1.0,
@@ -248,6 +320,7 @@ def _event_arrays(messages: dict, tz: str, clock: str = "exchange", price_scale:
     cands = _CLOCK_COLS.get(clock, _CLOCK_COLS["receipt"])
     ts_p, code_p, feed_p, side_p, price_p, size_p = [], [], [], [], [], []
     pprice_p, psize_p, ref_p, pref_p, maint_p, seq_p = [], [], [], [], [], []
+    leaves_p, undisp_p = [], []
     for mtype in list(messages.keys()):
         df = messages.pop(mtype) if consume else messages.get(mtype)
         if df is None or len(df) == 0:
@@ -287,6 +360,16 @@ def _event_arrays(messages: dict, tz: str, clock: str = "exchange", price_scale:
             price = price * price_scale
             pprice = pprice * price_scale
         psize = pd.to_numeric(_col(df, "previousquantity"), errors="coerce").to_numpy(float)
+        if _CODE[mtype] == _TRADE:
+            # the venue's own post-trade remaining size on the resting order (authoritative), and the
+            # markers that say this print had no displayed order to reference in the first place
+            leaves = pd.to_numeric(_col(df, "leavesquantity"), errors="coerce").to_numpy(float)
+            _ea = _col(df, "executionattribute", "").astype(str).str.strip().str.lower().to_numpy()
+            _pr = _col(df, "printable", "").astype(str).str.strip().str.lower().to_numpy()
+            undisp = np.isin(_ea, _UNDISPLAYED_EXEC) | np.isin(_pr, _UNDISPLAYED_PRINT)
+        else:
+            leaves = np.full(n, np.nan)
+            undisp = np.zeros(n, bool)
         ref = _col(df, "orderreferencenumber", "").astype(str).to_numpy()
         pref = _col(df, "previousorderreferencenumber", "").astype(str).to_numpy()
         pref = np.where(np.isin(pref, _NA_TOKENS), ref, pref)        # missing prev-ref -> the ref (legacy)
@@ -298,6 +381,7 @@ def _event_arrays(messages: dict, tz: str, clock: str = "exchange", price_scale:
         feed_p.append(feed); side_p.append(side); price_p.append(price); size_p.append(size)
         pprice_p.append(pprice); psize_p.append(psize)
         ref_p.append(ref); pref_p.append(pref); maint_p.append(maintain != "false")
+        leaves_p.append(leaves); undisp_p.append(undisp)
         del df                                          # in consume mode this was the last reference
     if not ts_p:
         return None
@@ -307,7 +391,9 @@ def _event_arrays(messages: dict, tz: str, clock: str = "exchange", price_scale:
     pprice = np.concatenate(pprice_p); psize = np.concatenate(psize_p)
     ref_s = np.concatenate(ref_p); pref_s = np.concatenate(pref_p)
     maintain = np.concatenate(maint_p)
+    leaves = np.concatenate(leaves_p); undisp = np.concatenate(undisp_p)
     del ts_p, seq_p, code_p, feed_p, side_p, price_p, size_p, pprice_p, psize_p, ref_p, pref_p, maint_p
+    del leaves_p, undisp_p
 
     feed_code, feed_names = pd.factorize(feed_s, sort=False)        # feed -> int32 + names for attrs
     feed_code = feed_code.astype(np.int32); del feed_s
@@ -338,7 +424,12 @@ def _event_arrays(messages: dict, tz: str, clock: str = "exchange", price_scale:
     # last makes the cancel/trade the final word within its packet/instant, so a resurrecting modify
     # cannot survive it. No-op wherever sequencenumber is strictly increasing per feed (equities: SPY
     # 0% -> 0%) -- it only bites on genuine ties, which is exactly the CME packet case.
-    elim_rank = np.isin(code, (_CANCEL, _TRADE, _LEVEL_DEL)).astype(np.int8)   # 0=add/modify/level-set, 1=removal
+    # Within-tie rank: 0 = feed reset, 1 = add/modify/level-set, 2 = removal.
+    # A reset ranks FIRST, not last, even though it removes more than any cancel does. The venue clears
+    # and then rebuilds, so a clear tied with adds in the same packet must precede them -- ranking it
+    # with the removals would wipe the very re-adds it exists to make room for.
+    elim_rank = np.where(np.isin(code, (_CANCEL, _TRADE, _LEVEL_DEL)), 2, 1).astype(np.int8)
+    elim_rank[code == _CLEAR] = 0
     if order_by == "sequence":
         if not np.isfinite(seq_s).any():
             # This branch is a DEGRADED MODE, not a supported configuration: it is the legacy clock-only
@@ -378,7 +469,8 @@ def _event_arrays(messages: dict, tz: str, clock: str = "exchange", price_scale:
     else:                                                        # legacy: clock-only (pre-fix; reproduces the bug)
         order = np.argsort(ts, kind="stable")
     return _Events(ts[order], code[order], feed_code[order], side[order], price[order], size[order],
-                   pprice[order], psize[order], ref[order], pref[order], maintain[order], list(feed_names))
+                   pprice[order], psize[order], ref[order], pref[order], maintain[order],
+                   leaves[order], undisp[order], list(feed_names))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -448,6 +540,7 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
     tsa, codea, feeda, sidea = ev.ts, ev.code, ev.feed, ev.side
     pricea, sizea, ppricea, psizea = ev.price, ev.size, ev.pprice, ev.psize
     refa, prefa, mainta = ev.ref, ev.pref, ev.maintain
+    leavesa, undispa = ev.leaves, ev.undisplayed
     for j in range(len(tsa)):
         ts = tsa[j]
         while gi < ng and grid_ns[gi] < ts:         # as-of: snapshot reflects all events with ts <= grid
@@ -464,16 +557,39 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
             book.set_level(feed, sidea[j], pricea[j], sizea[j])
         elif code == _LEVEL_DEL:                     # MBP explicit level delete
             book.set_level(feed, sidea[j], pricea[j], 0.0)
+        elif code == _CLEAR:                         # feed reset: this venue disowns everything it sent
+            n_o, n_l = book.clear_feed(feed)
+            if n_o or n_l:                           # a reset onto an empty book is routine session init
+                log.info("feed reset (%s) at %s: dropped %d resting order(s) and %d price level(s) "
+                         "for that venue -- they would otherwise rest for the remainder of the "
+                         "session", ev.feed_names[feed],
+                         pd.Timestamp(int(ts), tz="UTC").tz_convert(tz), n_o, n_l)
         elif code == _TRADE:
-            if not book.reduce(feed, refa[j], sizea[j]):     # decrement the referenced resting order
+            # Prefer the venue's OWN post-trade remaining size (leavesquantity) over a decrement:
+            # it is exact, self-correcting, and leaves=0 removes a fully filled order deterministically.
+            lq = leavesa[j]
+            hit = (book.set_remaining(feed, refa[j], lq) if np.isfinite(lq)
+                   else book.reduce(feed, refa[j], sizea[j]))
+            if not hit:
                 if feed in book.mbp_feeds:           # MBP feed: a level update will reflect the new size
                     book.stats["trade_on_mbp_skipped"] += 1
-                else:
-                    # No matching resting ref: a refless (hidden/odd-lot) print, OR -- the crash-day
-                    # case -- a print referencing a resting order our reconstruction never saw. Consume
-                    # by PRICE rather than the aggressor-coded `side` field, which would decrement the
-                    # wrong side, leave the consumed order resting, and cross the book.
+                elif undispa[j]:
+                    # An execution against NON-DISPLAYED liquidity (executionattribute='Hidden' /
+                    # printable='NonPrintable'). It has no orderreferencenumber BY CONSTRUCTION -- there
+                    # was no displayed order -- so this is not evidence of a broken replay, and it must
+                    # NOT consume displayed size: that size is still resting, and removing it deletes
+                    # liquidity the venue never traded. Counted separately so the crossed-book
+                    # diagnostic reports the rate that actually means something.
                     book.stats["trade_no_ref"] += 1
+                    book.stats["trade_undisplayed"] += 1
+                else:
+                    # A displayed print referencing a resting order our reconstruction never saw --
+                    # the crash-day case. Consume by PRICE rather than the `side` field: on these feeds
+                    # `side` is the RESTING order's side where it is populated at all, and is blank on
+                    # exactly the prints that reach this branch. Price identifies the side unambiguously
+                    # in a non-crossed book.
+                    book.stats["trade_no_ref"] += 1
+                    book.stats["trade_no_ref_displayed"] += 1
                     if book.reduce_at_price(feed, pricea[j], sizea[j]) < 0:
                         book.stats["trade_no_ref_undisplayed"] += 1   # print at a non-displayed price: no-op
         book.stats["events"] += 1
@@ -489,10 +605,17 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
                     "expected each venue to publish one or the other", _names(dual))
     nx = book.stats.get("consolidated_crossed", 0)   # hard invariant: a matching engine cannot cross
     if nx and ng and nx > 0.005 * ng:
+        # Report the DISPLAYED refless rate, not the raw one. Executions against non-displayed
+        # liquidity have no order reference by construction, so folding them in inflates the figure
+        # (SPY runs 10-15% undisplayed on the odd-lot tape) and makes a healthy replay look broken.
+        n_tr = book.stats.get("n_trade", 0)
         log.warning("INVARIANT VIOLATED: %s consolidated top is CROSSED (best_bid > best_ask) on %.1f%% of "
                     "%d snapshots -- a real book never crosses, so resting orders that should have left are "
-                    "pinning the top; suspect trade/cancel reference matching (trade_no_ref=%d of %d trades).",
-                    asset, 100.0 * nx / ng, ng, book.stats.get("trade_no_ref", 0), book.stats.get("n_trade", 0))
+                    "pinning the top. Refless DISPLAYED prints (the ones that indicate a reference-matching "
+                    "fault): %d of %d trades; a further %d were undisplayed (Hidden/NonPrintable), which is "
+                    "expected and consumes nothing. Feed resets applied: %d.",
+                    asset, 100.0 * nx / ng, ng, book.stats.get("trade_no_ref_displayed", 0), n_tr,
+                    book.stats.get("trade_undisplayed", 0), book.stats.get("feed_clears", 0))
 
     out = pd.DataFrame(rows, index=grid)
     out.index.name = "time"
@@ -510,7 +633,8 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
                         tz: str = "America/New_York", data_source: str = "apu", clock: str = "exchange",
                         price_scale: float = 1.0,
                         message_types=("mt_add_order", "mt_cancel_order", "mt_modify_order", "mt_trade",
-                                       "mt_price_level_update"),
+                                       "mt_price_level_update", "mt_clear_orders",
+                                       "mt_clear_price_levels"),
                         progress_cb=None, strict: bool = True):
     """Live entry point: fetch the message types via mstbook_loader and reconstruct the book on one
     GPS-disciplined capture clock. Multi-venue equities (SPY) come back as the consolidated NBBO/ladder

@@ -95,6 +95,25 @@ This is **not** the `sequencenumber` bug — that one crossed 99.9% of snapshots
 test for it passes. It is a much smaller, very stable residual, on the four March-2020 sessions,
 with 11–17% of trades unable to find the resting order they executed against.
 
+**Update (v0.9.23):** the SPY tape sample resolved most of this — see `TAPE_SEMANTICS.md`.
+
+* The `trade_no_ref` figure was **overstated**. Executions against non-displayed liquidity carry no
+  order reference by construction (`executionattribute='Hidden'` / `printable='NonPrintable'`), and
+  they were being counted as reference-matching failures. The rate that indicates a fault is the
+  *displayed* refless rate, which the diagnostic now reports separately. Expect the 11–17% figure to
+  drop sharply on a re-run.
+* A concrete crossing mechanism was found and fixed: **`mt_clear_orders` was never fetched.** A feed
+  reset the replay ignores leaves that venue's entire disowned book resting to the close. The
+  2024-12-18 tape carries one at 05:25:44 ET on `miax_pearl_equities_dom`.
+* `feed_health.py` now answers the DATA-vs-CODE question directly instead of by inference.
+
+The two candidate explanations below are still worth distinguishing on a re-run, but the first test
+is now cheaper and sharper than `debug_crossing`:
+
+```bash
+python feed_health.py --date 20200309 --product SPY     # gaps? errors? a reset inside the session?
+```
+
 Two candidate explanations, and they call for different responses:
 
 * **Real.** A consolidated multi-venue top legitimately crosses at sub-second scale (venue A's bid
@@ -154,8 +173,12 @@ extraction begins, so a closed day costs milliseconds instead of three hours.
 ## What to run next
 
 ```bash
-# 1. root-cause the residual crossing on one MWCB day (minutes, one session)
-python debug_crossing.py --date 20200309 --product SPY --clock exchange --ab-ordering
+# 1. is the capture even complete on the MWCB days? (seconds — settles DATA vs CODE outright)
+python feed_health.py --date 20200309 --product SPY
+
+# 1b. if the capture is clean, root-cause the replay on that day (minutes, one session).
+#     --clock receipt, matching the extraction: the exchange clock diagnoses a book you did not save.
+python debug_crossing.py --date 20200309 --product SPY --clock receipt --ab-ordering
 
 # 2. confirm the 2020 ES contracts exist under the symbol the loader asks for
 mstwx-lakequery --date 20200309 -s futures -p ESH0 -m mt_add_order --print-headers --format csv | head
