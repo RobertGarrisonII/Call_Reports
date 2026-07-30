@@ -43,6 +43,17 @@
 #      on ~23k-bar intraday samples runs away (the paper's own 60); the log(T)
 #      penalty is what keeps it finite. Pass --n-lags 6 to reproduce the paper.
 #
+#   6. Extraction is the longest and least reliable stage (hours of vendor I/O),
+#      and it used to be all-or-nothing in both directions: one un-retried
+#      lakequery rc=1 aborted the batch and discarded every finished day, while a
+#      FAILED fetch of a single message type was swallowed into an empty frame
+#      and the resulting fabricated book -- crossed on up to 100% of snapshots --
+#      went into the dataset with only a warning that did not name the date. Now
+#      a vendor error is retried, a failed critical fetch refuses that session, a
+#      failed session cannot take the batch down, every session is QC'd against
+#      the no-crossing invariant before it is saved, and each good day is cached
+#      so a re-run pays only for the days that are missing (--extract-cache).
+#
 # Usage
 #   ./run_paper_replication.sh                          # demo: runs anywhere, no data needed
 #   ./run_paper_replication.sh --source extract         # full paper sample via MayStreet
@@ -51,10 +62,14 @@
 #   ./run_paper_replication.sh --dry-run                # print the commands only
 #   ./run_paper_replication.sh --n-lags 6               # the paper's fixed lag, for comparison
 #   ./run_paper_replication.sh --n-lags bic --pmax 20   # data-driven lag (default), wider search
+#   ./run_paper_replication.sh --source extract --qc-action drop   # exclude crossed sessions
+#   ./run_paper_replication.sh --source extract --extract-cache /scratch/sessions
 #
 # Environment
-#   PYTHON=python3   interpreter (default: python3)
-#   N_JOBS=8         bootstrap/extraction workers (default: all cores)
+#   PYTHON=python3            interpreter (default: python3)
+#   N_JOBS=8                  bootstrap/extraction workers (default: all cores)
+#   MST_LAKEQUERY_RETRIES=3   vendor-query attempts before a fetch is believed to have failed
+#   MST_LAKEQUERY_BACKOFF=5   seconds before the first retry (doubles each attempt)
 # ==============================================================================
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -74,6 +89,11 @@ STAGES="0,1,2,3,4,5,6,7"
 DRY=0
 QUICK=0
 NJ="${N_JOBS:-}"
+# Cache extracted sessions OUTSIDE the per-run output folder: the point is that a re-run (new
+# RUN_ID) reuses days a previous run already paid for. One day is 10-25 minutes of vendor I/O.
+CACHE_DIR="${EXTRACT_CACHE:-${OUT_ROOT}/extract_cache}"
+RESUME=1
+QC_ACTION="warn"      # warn | drop | raise -- what to do with a session whose book crosses
 
 # ── the paper's sample, Appendix Table A.1 ────────────────────────────────────
 # Volatile: the ten largest intraday-range days 2014-2017 (E = scheduled
@@ -98,6 +118,10 @@ while [ "$#" -gt 0 ]; do
     --baseline)      BASELINE="$2"; shift 2 ;;
     --mwcb)          MWCB="$2"; shift 2 ;;
     --stages)        STAGES="$2"; shift 2 ;;
+    --extract-cache) CACHE_DIR="$2"; shift 2 ;;
+    --no-cache)      CACHE_DIR=""; shift ;;
+    --no-resume)     RESUME=0; shift ;;
+    --qc-action)     QC_ACTION="$2"; shift 2 ;;
     --dry-run)       DRY=1; shift ;;
     --quick)         QUICK=1; N_BOOT=49; shift ;;
     -h|--help)       sed -n '2,45p' "$0"; exit 0 ;;
@@ -202,7 +226,8 @@ if have_stage 1; then
            test_crossed_regression.py \
            test_debug_crossing.py \
            test_tandem_null.py \
-           test_hy_correlation.py ; do
+           test_hy_correlation.py \
+           test_extract_resilience.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
   done
@@ -237,11 +262,28 @@ if have_stage 2; then
       ;;
     extract)
       info "extracting ${INTERVAL} books for $(echo "$VOLATILE,$BASELINE,$MWCB" | tr ',' '\n' | wc -l) sessions"
+      CACHE_FLAGS=""
+      if [ -n "$CACHE_DIR" ]; then
+        CACHE_FLAGS="--extract-cache $CACHE_DIR"
+        [ "$RESUME" -eq 0 ] && CACHE_FLAGS="$CACHE_FLAGS --no-resume"
+        info "session cache: ${CACHE_DIR} (resume=$([ "$RESUME" -eq 1 ] && echo yes || echo no))"
+        info "  a day already extracted there is reused, not re-fetched -- so a run that dies"
+        info "  partway costs only the missing days on the retry. --no-cache disables it."
+      fi
+      # shellcheck disable=SC2086
       run_show $PY autoscale.py measure -- $PY run_analysis.py --source extract \
           --dates "${VOLATILE},${BASELINE},${MWCB}" \
           --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
           --interval "$INTERVAL" --n-levels 10 --max-workers "$AS_EXTRACT" \
+          --qc-action "$QC_ACTION" $CACHE_FLAGS \
           --output-dir "$OUT" --save-dataset --save-objects --only extract
+      # A session that failed or that violates the book invariant is named here, not only in the
+      # scrollback of a multi-hour log -- the SAMPLE is a result, and a universe that quietly
+      # shrank from 24 days to 22 produces tables indistinguishable from a clean run's.
+      if [ -s "${OUT}/extract_report.txt" ]; then
+        info "EXTRACTION WAS NOT CLEAN -- ${OUT}/extract_report.txt:"
+        sed 's/^/     /' "${OUT}/extract_report.txt" | tee -a "$LOG"
+      fi
       # run_analysis writes the extracted frames into its run folder; point at them
       FOUND="$(ls -1t "${OUT}"/*aggregated*.pkl 2>/dev/null | head -1 || true)"
       [ -n "$FOUND" ] && FRAMES="$FOUND"
@@ -256,37 +298,50 @@ fi
 #
 # A matching engine cannot cross. A crossed reconstructed top therefore always
 # means the replay is wrong, and the original failure produced a FULL-LENGTH
-# frame of garbage with no error. debug_crossing exits 0 clean / 2 DATA / 3 CODE.
-# Sessions that fail are listed and the run stops: re-fetch or drop them, do not
-# estimate on them.
+# frame of garbage with no error.
+#
+# Two steps, cheap one first:
+#   3a  qc_frames gates the SAVED frames -- the exact objects the tables will be
+#       estimated on -- in seconds, with no vendor I/O. This is the gate.
+#   3b  debug_crossing runs ONLY on the sessions 3a flags, for the root cause
+#       (sequencenumber present? orphaned cancels inside the window? a Modify
+#       resurrecting a Cancelled order?). It re-pulls the raw messages, which is
+#       why it cannot be the gate: gating that way meant a SECOND multi-hour pass
+#       over the whole sample, and it judged a freshly fetched book rather than
+#       the one on disk -- so a session could pass the gate and still be estimated
+#       from a broken frame. debug_crossing exits 0 clean / 2 DATA / 3 CODE.
 # ══════════════════════════════════════════════════════════════════════════════
-if have_stage 3 && [ "$SOURCE" = "extract" ]; then
-  say "STAGE 3  data-integrity gate (crossed-book invariant per session)"
-  BAD=""
-  for d in $(echo "${VOLATILE},${BASELINE},${MWCB}" | tr ',' ' '); do
-    ymd="${d//-/}"
-    if [ "$DRY" -eq 1 ]; then
-      info "(dry-run) would gate $d"
-      printf '   + %s\n' "$PY debug_crossing.py --date $ymd --product SPY --clock exchange --ab-ordering" >>"$LOG"
-      continue
-    fi
-    if run_rc $PY debug_crossing.py --date "$ymd" --product SPY \
-         --clock exchange --ab-ordering --out "${OUT}/crossing_${ymd}.txt"; then
-      info "clean  $d"
+if have_stage 3 && [ "$SOURCE" != "demo" ]; then
+  say "STAGE 3  data-integrity gate (crossed-book invariant on the saved frames)"
+  if [ "$DRY" -eq 1 ]; then
+    printf '   + %s\n' "$PY qc_frames.py --pickle $FRAMES --crossed-tol 0.005 --out ${OUT}/qc_frames.txt" | tee -a "$LOG"
+    info "(dry-run) would then run debug_crossing.py on any flagged session"
+  else
+    if run_show $PY qc_frames.py --pickle "$FRAMES" --crossed-tol 0.005 \
+         --out "${OUT}/qc_frames.txt"; then
+      info "every session satisfies the invariant"
     else
-      info "FAULT  $d  (see ${OUT}/crossing_${ymd}.txt)"; BAD="$BAD $d"
+      BAD="$(sed -n 's/^BAD \([0-9-]*\).*/\1/p' "${OUT}/qc_frames.txt" | tr '\n' ' ')"
+      if [ -n "$BAD" ] && [ "$SOURCE" = "extract" ]; then
+        info "root-causing the flagged session(s) with debug_crossing (re-fetches raw messages)"
+        for d in $BAD; do
+          ymd="${d//-/}"
+          run_rc $PY debug_crossing.py --date "$ymd" --product SPY \
+                 --clock exchange --ab-ordering --out "${OUT}/crossing_${ymd}.txt" || true
+          info "  report: ${OUT}/crossing_${ymd}.txt"
+        done
+      fi
+      echo "" | tee -a "$LOG"
+      echo "GATE FAILED — crossed/incomplete books:${BAD:- (see ${OUT}/qc_frames.txt)}" | tee -a "$LOG"
+      echo "CHECK 4/4b/8 in the per-session reports name the cause. Re-extract these" | tee -a "$LOG"
+      echo "days (the session cache means the clean ones are not re-fetched) or drop" | tee -a "$LOG"
+      echo "them with --qc-action drop; do not estimate on a book that violates its" | tee -a "$LOG"
+      echo "own invariant." | tee -a "$LOG"
+      exit 1
     fi
-  done
-  if [ -n "$BAD" ] && [ "$DRY" -eq 0 ]; then
-    echo "" | tee -a "$LOG"
-    echo "GATE FAILED — crossed/incomplete books:$BAD" | tee -a "$LOG"
-    echo "CHECK 4/4b/8 in the per-session reports name the cause. Re-fetch or drop" | tee -a "$LOG"
-    echo "these sessions; do not estimate on a book that violates the invariant." | tee -a "$LOG"
-    exit 1
   fi
-  info "every session satisfies the invariant"
 elif have_stage 3; then
-  say "STAGE 3  data-integrity gate — SKIPPED (only meaningful for --source extract)"
+  say "STAGE 3  data-integrity gate — SKIPPED (--source demo has no reconstructed book)"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════

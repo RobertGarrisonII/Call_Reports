@@ -1,0 +1,5 @@
+date,category,time_et,note
+YYYY-MM-DD,JOLTS,10:00,REPLACE OR DELETE -- example row. JOLTS release dates: bls.gov schedule of releases.
+YYYY-MM-DD,NEW_HOME,10:00,REPLACE OR DELETE -- example row. New Residential Sales: census.gov economic indicator calendar.
+YYYY-MM-DD,UMICH,10:00,REPLACE OR DELETE -- example row. UMich Consumer Sentiment has TWO releases per month (preliminary and final); list both.
+YYYY-MM-DD,ISM_MFG,10:00,REPLACE OR DELETE -- optional. Only needed to CORRECT a rule-generated date; an ingested date overrides generation for that month.

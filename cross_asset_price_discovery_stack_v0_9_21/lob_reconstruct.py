@@ -53,6 +53,13 @@ EPS = 1e-9
 # nulls the moment the reader switched dtypes -- so match all of them.
 _NA_TOKENS = ("", "nan", "<NA>", "None", "NaN", "null", "NULL")
 
+# Message types whose FETCH may fail without invalidating the replay. The MBP (price-level) types are
+# a supplement to the MBO stream -- they are empty for CME futures by construction and only add depth
+# for the venues that publish them, so losing them degrades the ladder. Losing any MBO type
+# (add/cancel/modify/trade) does not degrade the book, it fabricates one: see reconstruct_session.
+_OPTIONAL_MSG_TYPES = frozenset({"mt_price_level_update", "mt_modify_price_level",
+                                 "mt_delete_price_level"})
+
 # message-type -> the column carrying the quantity that the event acts on
 _QTY = {"mt_add_order": "quantity", "mt_cancel_order": "previousquantity",
         "mt_modify_order": "quantity", "mt_trade": "quantity",
@@ -504,7 +511,7 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
                         price_scale: float = 1.0,
                         message_types=("mt_add_order", "mt_cancel_order", "mt_modify_order", "mt_trade",
                                        "mt_price_level_update"),
-                        progress_cb=None):
+                        progress_cb=None, strict: bool = True):
     """Live entry point: fetch the message types via mstbook_loader and reconstruct the book on one
     GPS-disciplined capture clock. Multi-venue equities (SPY) come back as the consolidated NBBO/ladder
     (hybrid MBO+MBP); a single-venue future (ES) is a CME order-by-order (MBO) replay -- pass the MBO
@@ -512,21 +519,45 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
     extraction path for both legs, so SPY and ES share one clock (the vendor snapshot tool sits on a
     different clock, which would corrupt the cross-asset lead-lag). ``clock`` selects which timestamp
     drives both the fetch index and the event ordering. ``progress_cb(msg)``, if given, is called before
-    each message fetch (a liveness heartbeat for the per-session progress display)."""
+    each message fetch (a liveness heartbeat for the per-session progress display).
+
+    ``strict`` (default) makes a FAILED fetch of a book-critical message type an error instead of an
+    empty frame. The two are not interchangeable: an empty mt_add_order stream is a claim about the
+    day, a failed one is a claim about the query, and the book that comes back from the second is not
+    thin -- it is fabricated. Dropping the adds leaves cancels and trades referencing orders that were
+    never inserted, so nothing ever leaves the ladder and the top crosses on most snapshots; dropping
+    the trades leaves executed size resting forever, with the same signature. Both used to produce a
+    full-length frame with plausible column names and one WARNING line that did not even name the
+    date, which is how a 100%-crossed session reached the dataset. ``mt_price_level_update`` and the
+    other MBP types are OPTIONAL (empty for futures by construction), so their failure only warns.
+    Pass ``strict=False`` for a forensic replay of a known-partial day."""
     import mstbook_loader as ml
-    msgs = {}
+    msgs, failed = {}, {}
     for mt in message_types:
         if progress_cb is not None:
             progress_cb(f"{product} {mt}")
         try:
             msgs[mt] = ml._fetch_messages(date_str, product, product_type, mt, data_source, tz=tz, clock=clock)
         except Exception as exc:
-            log.warning("fetch %s failed for %s: %s", mt, product, exc)
+            failed[mt] = str(exc).splitlines()[0][:200]
+            log.warning("%s %s: fetch %s FAILED: %s", date_str, product, mt, failed[mt])
             msgs[mt] = pd.DataFrame()
-    return reconstruct_book(msgs, asset=ml.canonical_root(product, product_type), levels=levels,
-                            interval=interval, round_lot=round_lot, odd_lot_inclusive=odd_lot_inclusive,
-                            session=session, tz=tz, date_str=date_str, clock=clock, price_scale=price_scale,
-                            consume=True)
+    critical = sorted(mt for mt in failed if mt not in _OPTIONAL_MSG_TYPES)
+    if critical and strict:
+        raise ml.MessageFetchError(
+            "%s %s: fetch failed for %s -- replaying the book without %s would invent a book that "
+            "never existed (missing adds leave dangling references; missing trades/cancels leave "
+            "executed size resting forever), so the session is refused rather than returned crossed. "
+            "Details: %s" % (date_str, product, ", ".join(critical),
+                             "them" if len(critical) > 1 else "it",
+                             "; ".join(f"{k}: {v}" for k, v in sorted(failed.items()))))
+    out = reconstruct_book(msgs, asset=ml.canonical_root(product, product_type), levels=levels,
+                           interval=interval, round_lot=round_lot, odd_lot_inclusive=odd_lot_inclusive,
+                           session=session, tz=tz, date_str=date_str, clock=clock, price_scale=price_scale,
+                           consume=True)
+    if failed:
+        out.attrs["fetch_failed"] = dict(failed)
+    return out
 
 
 # ════════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.9.21 -- extraction survives a bad day, and refuses to ship a book it invented
+
+From the first real `--source extract` run: 24 sessions, 2h50m, **zero output**. The log contains
+three distinct defects with one shared signature, all in the extraction path.
+
+**1. One transient vendor error aborted the batch.** `mstwx-lakequery` exited 1 on the 23rd
+session. joblib's default is fail-fast, so the exception came out of the generator and every one of
+the 22 finished days was discarded. A day failing is a fact about that day, not a reason to lose
+the others.
+
+* `_run_mstwx_lakequery_to_file` retries a non-zero exit (`MST_LAKEQUERY_RETRIES=3`,
+  `MST_LAKEQUERY_BACKOFF=5`, doubling). Vendor rc=1 is usually throttling or a dropped connection,
+  and the same query typically succeeds on a retry.
+* `_guarded_session` wraps each session: a failure returns `df=None` with the exception text
+  instead of propagating. `extract_sessions` reports and drops it, and raises only if EVERY session
+  fails (an empty universe downstream is indistinguishable from a small one).
+* `--extract-cache DIR` memoizes each good session; `resume` (default) reuses it. A day is 10-25
+  minutes of vendor I/O, so a re-run after a partial failure now pays only for the days it is
+  missing. Degraded sessions are deliberately NOT cached -- they are worth retrying, not memoizing.
+
+**2. A failed fetch was swallowed into an empty frame, and the fabricated book was saved.**
+`reconstruct_session` logged `fetch mt_trade failed for SPY` -- without the date, so under 4-way
+parallelism you cannot even tell which session it belongs to -- and carried on with an empty frame.
+An *empty* mt_add_order stream is a claim about the day; a *failed* one is a claim about the query.
+Replaying without the adds leaves cancels and trades referencing orders that were never inserted;
+replaying without the trades leaves executed size resting forever. Both produce a full-length frame
+with the right columns whose top crosses on up to 100% of snapshots. The run's log has exactly
+that: `CROSSED on 100.0% of 23401 snapshots (trade_no_ref=0 of 0 trades)` immediately after a
+swallowed SPY `mt_trade` failure, and `ES ... CROSSED on 43.8% (trade_no_ref=119383 of 119383)`.
+
+* A failed fetch of a **critical** (MBO) type now raises `MessageFetchError` naming the date,
+  product and type. The MBP price-level types stay optional (they are empty for futures by
+  construction) and only warn, recorded in `df.attrs["fetch_failed"]`. `strict=False` for forensic
+  replays of a known-partial day.
+* `attach_flow` attributes a trade-tape failure to its date and product rather than surfacing a
+  bare `RuntimeError` from three frames down.
+
+**3. Nothing checked the frame that was about to be written.** Four sessions were saved with
+`median ES=nan` -- no ES leg at all -- and went on toward a cross-asset lead-lag estimate.
+
+* `mstbook_loader.session_qc(df)` runs at extraction time on the frame about to be saved: is each
+  leg present, and does its top violate the no-crossing invariant (`crossed_tol=0.5%` -- consolidated
+  multi-venue books do cross briefly at sub-second scale, so the tolerance is not zero). Stored in
+  `df.attrs["qc"]`.
+* `--qc-action warn|drop|raise` decides what happens to a session that fails it.
+* `run_analysis` writes `extract_report.txt` next to the results: requested vs usable sessions,
+  what failed, what is degraded. The sample is a result; a universe that quietly shrank from 24 days
+  to 22 produces tables indistinguishable from a clean run's.
+
+**STAGE 3 now gates on the saved frames, not on a re-fetch.** `qc_frames.py` checks the pickle in
+seconds. `debug_crossing.py` re-pulls raw messages, so gating with it meant a SECOND multi-hour pass
+over the whole sample -- and it judged a freshly fetched book rather than the one on disk, so a
+session could pass the gate and still be estimated from a broken frame. It now runs only on the
+sessions `qc_frames` flags, which is what it is good at: root cause.
+
+`test_extract_resilience.py` pins all of it (retry / batch isolation / strict fetch / QC / cache),
+and is part of the STAGE 1 gate.
+
 ## v0.9.20 -- the replication driver sizes itself from the machine, and the memory guess is measurable
 
 Concurrency was already system-detected in `autoscale.py` -- but `run_paper_replication.sh` never

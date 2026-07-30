@@ -39,6 +39,7 @@ import re
 import subprocess as sp
 import sys
 import tempfile
+import time
 from datetime import date, datetime, timedelta
 from io import StringIO
 from typing import Literal, Optional, Sequence
@@ -439,16 +440,52 @@ _MSG_STR_COLS = frozenset({
 _MST_TMPDIR = os.environ.get("MST_TMPDIR") or os.getcwd()
 
 
-def _run_mstwx_lakequery_to_file(cmd: list, path: str) -> None:
+class MessageFetchError(RuntimeError):
+    """A message-type fetch failed outright (the vendor query errored), as opposed to returning
+    an empty result. The distinction matters: an EMPTY mt_add_order stream is a statement about
+    the day, a FAILED one is a statement about the query, and a book replayed without its adds
+    (or without its trades/cancels) is not an incomplete book -- it is a fabricated one. Raised
+    with the date and product attached so a parallel session log can attribute it."""
+
+
+# A vendor query that exits non-zero is usually transient (lake throttling, a dropped connection,
+# a worker OOM under N-way parallel extraction) rather than a statement that the data is absent --
+# the same date/product/type combination typically succeeds on a retry. One un-retried rc=1 used to
+# abort an entire multi-hour extraction, so failures are retried with exponential backoff before
+# they are believed. Tune with MST_LAKEQUERY_RETRIES / MST_LAKEQUERY_BACKOFF (seconds).
+_LAKEQUERY_RETRIES = max(1, int(os.environ.get("MST_LAKEQUERY_RETRIES", "3")))
+_LAKEQUERY_BACKOFF = max(0.0, float(os.environ.get("MST_LAKEQUERY_BACKOFF", "5")))
+
+
+def _run_mstwx_lakequery_to_file(cmd: list, path: str, retries: Optional[int] = None,
+                                 backoff: Optional[float] = None) -> None:
     """Run mstwx-lakequery and stream stdout straight to ``path`` (raises on non-zero exit).
     Unlike :func:`_run_mstwx_lakequery`, the full CSV is never materialized as a Python string --
     on a crash day that string (+ its StringIO copy) is several GB, so writing to a file the parser
-    can mmap removes the largest transient at the read spike."""
-    with open(path, "w") as fh:
-        res = sp.run(cmd, stdout=fh, stderr=sp.PIPE, text=True, check=False)
-    if res.returncode != 0:
-        raise RuntimeError(f"mstwx-lakequery failed (rc={res.returncode}): "
-                           f"{(res.stderr or '').strip()[:300]}")
+    can mmap removes the largest transient at the read spike.
+
+    A non-zero exit is retried ``retries`` times with exponential backoff (``backoff``,
+    2x``backoff``, ...); only the last failure raises. Each attempt truncates ``path``, so a
+    partial CSV from a failed attempt is never parsed."""
+    n = _LAKEQUERY_RETRIES if retries is None else max(1, int(retries))
+    b = _LAKEQUERY_BACKOFF if backoff is None else max(0.0, float(backoff))
+    err = ""
+    for attempt in range(1, n + 1):
+        with open(path, "w") as fh:                       # "w" truncates: no partial-attempt residue
+            res = sp.run(cmd, stdout=fh, stderr=sp.PIPE, text=True, check=False)
+        if res.returncode == 0:
+            if attempt > 1:
+                log.info("mstwx-lakequery succeeded on attempt %d/%d: %s", attempt, n, " ".join(cmd[:8]))
+            return
+        err = (res.stderr or "").strip()[:300]
+        if attempt < n:
+            wait = b * (2 ** (attempt - 1))
+            log.warning("mstwx-lakequery rc=%d on attempt %d/%d (%s); retrying in %.0fs: %s",
+                        res.returncode, attempt, n, " ".join(cmd[:8]), wait, err.splitlines()[0][:160]
+                        if err else "(no stderr)")
+            if wait:
+                time.sleep(wait)
+    raise RuntimeError(f"mstwx-lakequery failed (rc={res.returncode}) after {n} attempt(s): {err}")
 
 
 def _csv_header(path: str) -> list:
@@ -751,8 +788,13 @@ def attach_flow(book: pd.DataFrame, date_str: str, spy_product: str, es_product:
     ``futures_scale`` is applied to the ES trade prices (see trade_flow.price_scale)."""
     out = book.copy()
     for prod, ptype, scale in ((spy_product, "direct", 1.0), (es_product, "futures", futures_scale)):
-        f = trade_flow(date_str, prod, ptype, interval=interval, tz=tz, classify=classify,
-                       side_buy_label=side_buy_label, price_scale=scale, **kw)
+        try:
+            f = trade_flow(date_str, prod, ptype, interval=interval, tz=tz, classify=classify,
+                           side_buy_label=side_buy_label, price_scale=scale, **kw)
+        except Exception as exc:                    # attribute it: parallel logs interleave sessions
+            raise MessageFetchError("%s %s: trade-tape fetch failed, so the signed order-flow "
+                                    "counts (Tables 5/7) would be silently absent for this leg: %s"
+                                    % (date_str, prod, str(exc).splitlines()[0][:200])) from exc
         if f.empty:
             continue
         f = f.reindex(book.index)
@@ -792,15 +834,83 @@ def has_trade_flow(sessions, assets=("SPY", "ES")) -> bool:
     return all(f"{a}_trade_buy" in df.columns for a in assets)
 
 
+def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
+               crossed_tol: float = 0.005) -> dict:
+    """Cheap per-session integrity check run at EXTRACTION time, on the frame that is about to be
+    written to the dataset. It answers the two questions a full-length frame cannot answer by its
+    shape: is each leg actually there, and does its top violate the no-crossing invariant?
+
+    A matching engine cannot cross, so a crossed reconstructed top is always a replay fault -- and
+    the failure mode that motivated this is a frame of the right length (23,401 rows), with the
+    right column names, whose book is garbage because a message-type fetch failed and left the
+    replay without its adds (phantom levels) or without its trades/cancels (levels that never
+    leave). ``crossed_tol`` is the fraction of finite snapshots allowed to cross before the session
+    is called degraded; consolidated multi-venue books DO legitimately cross for brief moments at
+    sub-second scale, so it is a small positive number, not zero.
+
+    -> {'ok': bool, 'reasons': [str], '<ASSET>': {'n': int, 'n_finite': int, 'crossed_frac': float,
+        'median_bid': float}}"""
+    rep: dict = {"ok": True, "reasons": [], "n_rows": int(len(df))}
+    for a in assets:
+        bid = pd.to_numeric(df.get(f"{a}_bidprice_1", pd.Series(dtype=float)), errors="coerce").to_numpy(float)
+        ask = pd.to_numeric(df.get(f"{a}_askprice_1", pd.Series(dtype=float)), errors="coerce").to_numpy(float)
+        both = np.isfinite(bid) & np.isfinite(ask) if bid.size and ask.size else np.zeros(0, bool)
+        n_fin = int(both.sum())
+        frac = float((bid[both] > ask[both] + EPS).mean()) if n_fin else float("nan")
+        rep[a] = {"n": int(len(df)), "n_finite": n_fin,
+                  "crossed_frac": frac,
+                  "median_bid": float(np.nanmedian(bid)) if bid.size and np.isfinite(bid).any() else float("nan")}
+        if n_fin == 0:
+            rep["ok"] = False
+            rep["reasons"].append(f"{a}: no usable top of book (0 of {len(df)} snapshots have a "
+                                  f"finite bid AND ask) -- the leg is missing, not thin")
+        elif frac > crossed_tol:
+            rep["ok"] = False
+            rep["reasons"].append(f"{a}: top is CROSSED on {frac:.1%} of {n_fin} snapshots "
+                                  f"(tolerance {crossed_tol:.1%}) -- the replay is dropping "
+                                  f"removals or inventing levels")
+    return rep
+
+
+def _spec_parts(spec) -> tuple:
+    """(label, regime) from a date spec that may be 'YYYY-MM-DD' or ('YYYY-MM-DD', regime)."""
+    if isinstance(spec, (tuple, list)):
+        return spec[0], (spec[1] if len(spec) > 1 else "auto")
+    return spec, "auto"
+
+
+def _cache_path(cache_dir: str, label: str, interval: str, levels: int, clock: str) -> str:
+    """Cache filename for one extracted session. The interval / level count / clock are part of the
+    name because they change the frame: a cache hit must not silently hand back a 1s book to a run
+    that asked for 10ms."""
+    ymd = str(label).replace("-", "")
+    return os.path.join(cache_dir, f"session_{ymd}_{interval}_L{int(levels)}_{clock}.pkl")
+
+
 def _extract_one_session(spec, cfg: dict, progress_cb=None):
     """Picklable per-session worker (one trading day): reconstruct SPY + front-month ES books on one
-    GPS clock, attach the trade tape, and return ``(label, regime, df, diag_msg, warn_msg)``. ``cfg`` is
-    a dict of primitives only (so it pickles to loky/process workers); ``progress_cb`` is used only on
-    the serial path (None under parallelism, where per-fetch heartbeats can't stream cleanly)."""
+    GPS clock, attach the trade tape, and return ``(label, regime, df, diag_msg, warn_msg, qc)``.
+    ``cfg`` is a dict of primitives only (so it pickles to loky/process workers); ``progress_cb`` is
+    used only on the serial path (None under parallelism, where per-fetch heartbeats can't stream
+    cleanly).
+
+    When ``cfg['cache_dir']`` is set the finished frame is written there and, if ``cfg['resume']``,
+    a previous run's frame is reused instead of re-fetching -- a session costs 10-25 minutes of
+    vendor I/O, so a run that dies on day 23 of 24 should not repeat the first 22. Only sessions
+    that PASS ``session_qc`` are cached: a degraded day is worth retrying, not memoizing."""
     import lob_reconstruct as lob                          # sole extraction path: both legs from messages
-    label, regime = ((spec[0], spec[1] if len(spec) > 1 else "auto")
-                     if isinstance(spec, (tuple, list)) else (spec, "auto"))
+    label, regime = _spec_parts(spec)
     ymd = label.replace("-", "")
+    cache_dir = cfg.get("cache_dir") or ""
+    cpath = (_cache_path(cache_dir, label, cfg["interval"], cfg["levels"], cfg["clock"])
+             if cache_dir else "")
+    if cpath and cfg.get("resume") and os.path.exists(cpath):
+        try:
+            df = pd.read_pickle(cpath)
+            qc = session_qc(df)
+            return (label, regime, df, "reused cached %s: %d rows (%s)" % (label, len(df), cpath), None, qc)
+        except Exception as exc:                           # a corrupt/partial cache must never win
+            log.warning("%s: cache read failed (%s); re-extracting", label, exc)
     contract = get_front_month_contract(cfg["es_symbol"], as_of_date=_parse_yyyymmdd(ymd),
                                         rollover_days=cfg["rollover_days"])
     # SPY: consolidated multi-venue hybrid MBO+MBP. ES: single-venue CME order-by-order (MBO) — the
@@ -825,15 +935,50 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                          futures_scale=cfg["futures_scale"], start_time=cfg["start_time"],
                          end_time=cfg["end_time"], data_source=cfg["data_source"])
     df.attrs["es_contract"] = contract
-    med_spy = float(np.nanmedian(df.get("SPY_bidprice_1", pd.Series(np.nan)).to_numpy(float)))
-    med_es = float(np.nanmedian(df.get("ES_bidprice_1", pd.Series(np.nan)).to_numpy(float)))
-    ratio = med_es / med_spy if med_spy else float("nan")
+    qc = session_qc(df, crossed_tol=float(cfg.get("crossed_tol", 0.005)))
+    df.attrs["qc"] = qc
+    med_spy = qc["SPY"]["median_bid"]
+    med_es = qc["ES"]["median_bid"]
+    ratio = med_es / med_spy if np.isfinite(med_spy) and med_spy else float("nan")
     diag = ("extracted %s (ES=%s, book=reconstruct): %d rows, flow=%s | median SPY=%.2f ES=%.2f "
             "(ES/SPY=%.1f)" % (label, contract, len(df), cfg["with_flow"], med_spy, med_es, ratio))
-    warn = (("ES/SPY median ratio %.0f looks scaled (CME raw integers); pass futures_scale=0.01 for "
-             "index-point units (log/bps results are unaffected)." % ratio)
-            if (np.isfinite(ratio) and ratio > 100) else None)
-    return (label, regime, df, diag, warn)
+    warns = []
+    if np.isfinite(ratio) and ratio > 100:
+        warns.append("ES/SPY median ratio %.0f looks scaled (CME raw integers); pass "
+                     "futures_scale=0.01 for index-point units (log/bps results are unaffected)."
+                     % ratio)
+    if not qc["ok"]:
+        warns.append("%s DEGRADED -- %s" % (label, "; ".join(qc["reasons"])))
+    if qc["ok"] and cpath:                                 # only memoize a session worth reusing
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            tmp = cpath + f".tmp{os.getpid()}"
+            df.to_pickle(tmp)
+            os.replace(tmp, cpath)                         # atomic: a reader never sees a partial file
+        except Exception as exc:
+            log.warning("%s: could not cache session to %s (%s)", label, cpath, exc)
+    return (label, regime, df, diag, ("\n".join(warns) if warns else None), qc)
+
+
+def _guarded_session(spec, cfg: dict, progress_cb=None):
+    """``_extract_one_session`` that CANNOT take the batch down with it.
+
+    joblib's default is fail-fast: the first worker exception is re-raised out of the generator and
+    every completed result is discarded. On a 24-day extract that means one transient vendor error
+    on the 23rd day throws away ~3 hours of finished work. A single day failing is a fact about
+    that day; it is not a reason to lose the other 23. The failure is returned (df=None) with the
+    exception text, and ``extract_sessions`` reports and drops it."""
+    label, regime = _spec_parts(spec)
+    try:
+        return _extract_one_session(spec, cfg, progress_cb=progress_cb)
+    except Exception as exc:
+        msg = "%s: EXTRACTION FAILED (%s: %s)" % (label, type(exc).__name__,
+                                                  str(exc).splitlines()[0][:300])
+        # logged by extract_sessions' _on_done in the PARENT process (a worker-side log record may
+        # never reach the parent's handlers, and logging it in both places double-prints it)
+        return (label, regime, None, msg, None,
+                {"ok": False, "reasons": [f"extraction raised {type(exc).__name__}"],
+                 "error": str(exc)[:2000]})
 
 
 def _idx_call(i, func, item):
@@ -883,7 +1028,9 @@ def extract_sessions(date_specs: Sequence, es_symbol: str = "ES", levels: int = 
                      book_source: str = "reconstruct", round_lot: int = 100,
                      odd_lot_inclusive: bool = True, clock: str = "receipt",
                      progress: Optional[bool] = None, max_workers: int = 1,
-                     backend: Optional[str] = None) -> list:
+                     backend: Optional[str] = None, cache_dir: str = "", resume: bool = True,
+                     qc_action: str = "warn", crossed_tol: float = 0.005,
+                     report: Optional[dict] = None) -> list:
     """CLI replacement for the Athena extract: for each date pull SPY + front-month ES books
     (canonical schema, hygiene applied) and -- when ``with_flow`` -- attach the trade-tape counts
     (signed via ``classify``; see _trade_sign), returning ``[(date_label, regime, df)]`` exactly
@@ -913,7 +1060,16 @@ def extract_sessions(date_specs: Sequence, es_symbol: str = "ES", levels: int = 
 
     ``progress`` controls the per-session progress display: ``None`` (default) shows a tqdm bar when
     stderr is a TTY and tqdm is installed, else falls back to per-session/per-fetch INFO logging (so a
-    redirected log still shows liveness); ``True``/``False`` force it on/off."""
+    redirected log still shows liveness); ``True``/``False`` force it on/off.
+
+    **Failure handling.** No single day can abort the batch: a session that raises is logged, dropped,
+    and named in the closing summary (``_guarded_session``). Every returned session is checked by
+    ``session_qc`` -- ``qc_action`` is ``'warn'`` (default: keep it, but say so loudly), ``'drop'``
+    (exclude it from the returned list) or ``'raise'`` (stop the run). If EVERY session fails the
+    call raises, because an empty universe downstream is indistinguishable from a small one.
+    ``cache_dir`` memoizes each good session to disk and ``resume`` reuses it, so a re-run after a
+    partial failure costs only the missing days. Pass a dict as ``report`` to receive
+    ``{'ok': [...], 'failed': [(label, msg)], 'degraded': [(label, reasons)]}``."""
     specs = [s for s in date_specs]
     show_bar = _HAS_TQDM and (sys.stderr.isatty() if progress is None else bool(progress))
     bar = _tqdm(total=len(specs), desc="extract", unit="session") if show_bar else None
@@ -921,17 +1077,26 @@ def extract_sessions(date_specs: Sequence, es_symbol: str = "ES", levels: int = 
         log.warning("book_source='snapshot' is retired: mstbook-query sits on a different clock from the "
                     "message lake (which corrupts the SPY<->ES lead-lag) and is being sunset. "
                     "Reconstructing both legs from mstwx-lakequery instead.")
+    if qc_action not in ("warn", "drop", "raise"):
+        raise ValueError(f"qc_action must be warn|drop|raise, got {qc_action!r}")
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        log.info("session cache: %s (resume=%s) -- a completed day is reused instead of re-fetched",
+                 cache_dir, resume)
     cfg = {"es_symbol": es_symbol, "levels": levels, "interval": interval, "start_time": start_time,
            "end_time": end_time, "data_source": data_source, "tz": tz, "with_flow": with_flow,
            "classify": classify, "side_buy_label": side_buy_label, "futures_scale": futures_scale,
            "rollover_days": rollover_days, "round_lot": round_lot, "odd_lot_inclusive": odd_lot_inclusive,
-           "clock": clock}
+           "clock": clock, "cache_dir": cache_dir, "resume": bool(resume), "crossed_tol": crossed_tol}
 
     def _emit(msg):                                         # per-session summary line
         _tqdm.write(msg) if bar is not None else log.info("%s", msg)
 
     def _on_done(res):
-        _emit(res[3])
+        if res[2] is None:
+            log.error("%s", res[3])
+        else:
+            _emit(res[3])
         if res[4]:
             log.warning("%s", res[4])
         if bar is not None:
@@ -942,22 +1107,57 @@ def extract_sessions(date_specs: Sequence, es_symbol: str = "ES", levels: int = 
     if parallel:
         log.info("extracting %d sessions in parallel (backend=%s, max_workers=%d); per-fetch heartbeats "
                  "are suppressed -- a completion line prints as each day lands", len(specs), be, max_workers)
-        triples = _parallel_sessions(functools.partial(_extract_one_session, cfg=cfg),
+        triples = _parallel_sessions(functools.partial(_guarded_session, cfg=cfg),
                                      specs, max_workers, be, _on_done)
-        out = [(t[0], t[1], t[2]) for t in triples]
     else:
         def _hb(msg):                                       # serial: per-fetch heartbeat (liveness)
             if bar is not None:
                 bar.set_postfix_str(msg)
             elif progress is not False:
                 log.info("    ... %s", msg)
-        out = []
+        triples = []
         for spec in specs:
-            res = _extract_one_session(spec, cfg, progress_cb=_hb)
+            res = _guarded_session(spec, cfg, progress_cb=_hb)
             _on_done(res)
-            out.append((res[0], res[1], res[2]))
+            triples.append(res)
     if bar is not None:
         bar.close()
+
+    # ── closing summary: what landed, what died, what landed but is not usable ────────────────
+    out, failed, degraded = [], [], []
+    for t in triples:
+        if t is None:                                       # defensive: a backend that lost a result
+            continue
+        qc = t[5] if len(t) > 5 else None
+        if t[2] is None:
+            failed.append((t[0], t[3]))
+            continue
+        if qc is not None and not qc.get("ok", True):
+            degraded.append((t[0], list(qc.get("reasons", []))))
+            if qc_action == "drop":
+                continue
+        out.append((t[0], t[1], t[2]))
+    if report is not None:
+        report.clear()
+        report.update({"ok": [o[0] for o in out], "failed": failed, "degraded": degraded,
+                       "requested": [_spec_parts(s)[0] for s in specs]})
+    if failed:
+        log.error("EXTRACTION SUMMARY: %d of %d session(s) FAILED and were dropped: %s",
+                  len(failed), len(specs), "; ".join(f"{d} ({m.split('(', 1)[-1].rstrip(')')[:120]})"
+                                                     for d, m in failed))
+    if degraded:
+        log.warning("EXTRACTION SUMMARY: %d session(s) violate the book invariant (%s): %s",
+                    len(degraded), "dropped" if qc_action == "drop" else "KEPT -- estimate on them "
+                    "only if you can explain why", "; ".join(f"{d}: {' | '.join(r)}" for d, r in degraded))
+        if qc_action == "raise":
+            raise RuntimeError("qc_action='raise': %d degraded session(s): %s"
+                               % (len(degraded), ", ".join(d for d, _ in degraded)))
+    if not out:
+        raise RuntimeError("extract_sessions: no usable session out of %d requested (%d failed, "
+                           "%d degraded). Re-run with the vendor query fixed; do NOT estimate on an "
+                           "empty universe." % (len(specs), len(failed), len(degraded)))
+    if failed or degraded:
+        log.info("EXTRACTION SUMMARY: returning %d usable session(s) of %d requested", len(out), len(specs))
     return out
 
 
