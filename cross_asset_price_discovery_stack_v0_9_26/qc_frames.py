@@ -57,12 +57,13 @@ def qc_sessions(sessions, assets=("SPY", "ES"), crossed_tol: float = 0.005) -> p
     """-> one row per session: rows, per-asset finite-snapshot count and crossed fraction, ok."""
     rows = []
     for date, regime, df in sessions:
-        rep = ml.session_qc(df, assets=assets, crossed_tol=crossed_tol)
+        rep = ml.session_qc(df, assets=assets, crossed_tol=crossed_tol, date=date)
         row = {"date": str(date), "regime": regime, "rows": rep["n_rows"], "ok": rep["ok"],
-               "reasons": " | ".join(rep["reasons"])}
+               "halt": rep.get("halt_snapshots", 0), "reasons": " | ".join(rep["reasons"])}
         for a in assets:
             row[f"{a}_finite"] = rep[a]["n_finite"]
             row[f"{a}_crossed"] = rep[a]["crossed_frac"]
+            row[f"{a}_crossed_open"] = rep[a].get("crossed_frac_ex_halt", float("nan"))
             row[f"{a}_med_bid"] = rep[a]["median_bid"]
         # a fetch failure recorded at reconstruction time is the usual cause; surface it here too
         ff = df.attrs.get("fetch_failed") if hasattr(df, "attrs") else None
@@ -88,7 +89,9 @@ def main(argv=None) -> int:
     pd.set_option("display.width", 200)
     show = tbl.drop(columns=["reasons"]).copy()
     for a_ in assets:
-        show[f"{a_}_crossed"] = show[f"{a_}_crossed"].map(lambda v: "n/a" if not np.isfinite(v) else f"{v:.2%}")
+        for c in (f"{a_}_crossed", f"{a_}_crossed_open"):
+            if c in show.columns:
+                show[c] = show[c].map(lambda v: "n/a" if not np.isfinite(v) else f"{v:.2%}")
     body = ["crossed-book gate on the SAVED frames (tolerance %.2f%%)" % (100 * a.crossed_tol),
             "%d session(s) from %s" % (len(tbl), a.pickle), "", show.to_string(), ""]
     bad = tbl[~tbl["ok"]]
@@ -98,10 +101,19 @@ def main(argv=None) -> int:
             body.append(f"BAD {d}: {r['reasons']}"
                         + (f"  [fetch failed: {r['fetch_failed']}]" if r["fetch_failed"] else ""))
         body += ["",
-                 "A matching engine cannot cross, so this is a replay fault, not a market state.",
+                 "OUTSIDE a halt a matching engine cannot cross, so this is a replay fault, not a",
+                 "market state -- the crossed_open column already excludes MWCB halt snapshots.",
                  "Run debug_crossing.py on each date above for the root cause (it re-fetches the",
                  "raw messages, which is why it is not the gate), then re-extract or drop the day.",
                  "Do NOT estimate on a session that violates its own invariant."]
+    halted = tbl[tbl["halt"] > 0] if "halt" in tbl.columns else tbl.iloc[:0]
+    if len(halted):
+        body += ["",
+                 "MWCB halt sessions (%s):" % ", ".join(str(d) for d in halted.index),
+                 "  Exchanges stop matching during a halt but resting orders stay, so a crossed book",
+                 "  there is CORRECT -- crossed_open is the column that judges the replay. Those",
+                 "  snapshots must still be excluded from every estimate: a halted market has no",
+                 "  valid midpoint, and including it adds mechanical comovement, not price discovery."]
     else:
         body.append("every session satisfies the invariant")
     text = "\n".join(body)

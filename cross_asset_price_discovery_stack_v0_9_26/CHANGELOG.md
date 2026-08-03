@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.9.26 -- the residual crossing on the MWCB days is the halt, and three findings were false positives
+
+The 2020-03-09 diagnostic is a clean read, and it settles the "residual ~3.9% crossing" that had
+survived three rounds of investigation as an open defect. It is the circuit breaker.
+
+    crossed overall                3.88% of 23,401 snapshots      =  908 snapshots
+    MWCB Level 1 halt 09:34:13-09:49:13 ET, at 1s                 =  901 snapshots
+    crossed rate by session sixth  23.1% 0.0% 0.0% 0.0% 0.1% 0.1%
+    23.1% of the first sixth (3,900)                              =  901 snapshots
+
+Exchanges stop matching during a halt but do NOT cancel resting orders, and new orders keep
+arriving, so a limit order priced through the last trade sits unmatched for the full fifteen
+minutes. **A correctly reconstructed book is crossed during a halt.** The invariant is what was
+wrong: it assumes a market that is always matching, and on the four sessions the paper cares most
+about it flagged the paper's own subject matter as a data fault.
+
+* `market_halts.py` -- the four MWCB Level 1 halt windows, `halt_mask()`, and the reasoning. A
+  table rather than a heuristic because 2020-03-16 halted AT the open and 2020-03-18 in the
+  afternoon, so no "skip the first N minutes" rule covers both.
+* `session_qc` and `qc_frames` now report `crossed_frac` AND `crossed_frac_ex_halt`, and judge on
+  the second. A session crossed only during its halt passes with a note; one crossed outside it
+  still fails. `debug_crossing` CHECK 6 splits the rate inside/outside the halt.
+* **For the paper, not just the code:** halt snapshots must be excluded from every lead-lag,
+  correlation and information-share estimate. A halted market has no valid midpoint, and two legs
+  of stale quotes that cannot trade against each other produce mechanical comovement, not price
+  discovery. Including them does not add noise, it adds a spurious result.
+
+### Three diagnostic findings were false positives, and they outvoted the truth
+
+The session returned `VERDICT: DATA (14 DATA findings, 1 CODE finding)` -- telling you to re-fetch
+or drop 13 feeds -- on a session whose capture the venue itself reports as complete.
+
+* **CHECK 4 inferred packet loss from sequence gaps.** 13 FATAL findings, up to "missing 98.8%".
+  But the sequence is a FEED-level counter covering every symbol on the multicast line, while the
+  fetch is per PRODUCT (`-p SPY`), so the gaps are the other symbols and near-100% is normal on a
+  busy consolidated feed. `mt_missing_product_messages` -- the venue's own gap report, which
+  `feed_health.py` reads -- was empty. The column is now labelled `not-ours`, explained, and raises
+  nothing; genuine loss is reported by the venue, not inferred here.
+* **CHECK 5 counted hidden executions as missing messages.** "350,275 orphaned removals, 100% add
+  ABSENT -> DATA" is exactly the 6 displayed + 350,269 undisplayed prints the replay counted that
+  day. Executions against non-displayed liquidity carry no order reference BY CONSTRUCTION. Now
+  excluded and reported separately, the same fix the replay got in v0.9.23.
+* **The single-venue crossing finding was the halt** -- CHECK 7's 3.85% single-venue vs 3.88%
+  consolidated is one venue's book crossing because matching stopped, not because its replay is
+  wrong.
+
+What the session actually shows, with those removed: capture complete, reference matching exact,
+replay correct, and the book crossed for precisely the fifteen minutes the market was halted.
+
 ## v0.9.25 -- the run reached the gate, and the gate had no file to read
 
 Second real extraction: **24 of 24 sessions landed, none failed, 85 minutes** (the previous attempt

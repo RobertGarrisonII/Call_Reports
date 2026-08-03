@@ -862,7 +862,7 @@ def has_trade_flow(sessions, assets=("SPY", "ES")) -> bool:
 
 
 def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
-               crossed_tol: float = 0.005) -> dict:
+               crossed_tol: float = 0.005, date=None) -> dict:
     """Cheap per-session integrity check run at EXTRACTION time, on the frame that is about to be
     written to the dataset. It answers the two questions a full-length frame cannot answer by its
     shape: is each leg actually there, and does its top violate the no-crossing invariant?
@@ -875,27 +875,53 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
     is called degraded; consolidated multi-venue books DO legitimately cross for brief moments at
     sub-second scale, so it is a small positive number, not zero.
 
-    -> {'ok': bool, 'reasons': [str], '<ASSET>': {'n': int, 'n_finite': int, 'crossed_frac': float,
-        'median_bid': float}}"""
+    **Halt snapshots are excluded from the crossed fraction.** During an MWCB Level 1 halt the
+    exchanges stop matching but do not cancel resting orders, so a limit order priced through the
+    last trade sits unmatched for the full fifteen minutes: a CORRECTLY reconstructed book is
+    crossed for those 900 seconds. Judging a March-2020 session on the raw fraction flags the very
+    phenomenon the paper studies as a data fault -- on 2020-03-09 the halt is 901 of 23,401
+    snapshots (3.85%) against an observed crossed rate of 3.88%. Both figures are reported;
+    ``ok`` is decided on the one outside the halt.
+
+    -> {'ok': bool, 'reasons': [str], 'halt_snapshots': int, '<ASSET>': {'n': int, 'n_finite': int,
+        'crossed_frac': float, 'crossed_frac_ex_halt': float, 'median_bid': float}}"""
     rep: dict = {"ok": True, "reasons": [], "n_rows": int(len(df))}
+    try:
+        import market_halts as mh
+        halt = mh.halt_mask(df.index, date=date) if len(df) else np.zeros(0, bool)
+    except Exception:                                    # never let the QC fail on the halt table
+        halt = np.zeros(len(df), bool)
+    rep["halt_snapshots"] = int(halt.sum())
     for a in assets:
         bid = pd.to_numeric(df.get(f"{a}_bidprice_1", pd.Series(dtype=float)), errors="coerce").to_numpy(float)
         ask = pd.to_numeric(df.get(f"{a}_askprice_1", pd.Series(dtype=float)), errors="coerce").to_numpy(float)
         both = np.isfinite(bid) & np.isfinite(ask) if bid.size and ask.size else np.zeros(0, bool)
         n_fin = int(both.sum())
-        frac = float((bid[both] > ask[both] + EPS).mean()) if n_fin else float("nan")
+        crossed = (bid > ask + EPS) & both
+        frac = float(crossed[both].mean()) if n_fin else float("nan")
+        open_mkt = both & ~halt if halt.size == both.size else both
+        n_open = int(open_mkt.sum())
+        frac_ex = float(crossed[open_mkt].mean()) if n_open else float("nan")
         rep[a] = {"n": int(len(df)), "n_finite": n_fin,
-                  "crossed_frac": frac,
+                  "crossed_frac": frac, "crossed_frac_ex_halt": frac_ex, "n_open": n_open,
                   "median_bid": float(np.nanmedian(bid)) if bid.size and np.isfinite(bid).any() else float("nan")}
         if n_fin == 0:
             rep["ok"] = False
             rep["reasons"].append(f"{a}: no usable top of book (0 of {len(df)} snapshots have a "
                                   f"finite bid AND ask) -- the leg is missing, not thin")
-        elif frac > crossed_tol:
+        elif np.isfinite(frac_ex) and frac_ex > crossed_tol:
             rep["ok"] = False
-            rep["reasons"].append(f"{a}: top is CROSSED on {frac:.1%} of {n_fin} snapshots "
-                                  f"(tolerance {crossed_tol:.1%}) -- the replay is dropping "
-                                  f"removals or inventing levels")
+            extra = (f" ({frac:.1%} including the {rep['halt_snapshots']} halt snapshot(s), which "
+                     f"are expected to cross)" if rep["halt_snapshots"] else "")
+            rep["reasons"].append(f"{a}: top is CROSSED on {frac_ex:.1%} of {n_open} snapshots "
+                                  f"OUTSIDE any halt{extra} (tolerance {crossed_tol:.1%}) -- the "
+                                  f"replay is dropping removals or inventing levels")
+        elif rep["halt_snapshots"] and np.isfinite(frac) and frac > crossed_tol:
+            rep["reasons"].append(f"{a}: {frac:.1%} crossed overall but only {frac_ex:.2%} outside "
+                                  f"the {rep['halt_snapshots']}-snapshot MWCB halt -- the crossing "
+                                  f"IS the halt (matching stops, resting orders do not), so the "
+                                  f"book is correct. Exclude halt snapshots from any estimate: a "
+                                  f"halted market has no valid midpoint")
     return rep
 
 

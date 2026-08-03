@@ -82,7 +82,28 @@ sessions it flags — root cause, which is what it is for.
 
 ## Still open — needs the data, not the code
 
-### 1. Residual SPY crossing of ~3.9–4.0% on the four MWCB days
+### 1. RESOLVED (v0.9.26): the residual ~3.9% crossing is the circuit-breaker halt
+
+The 2020-03-09 diagnostic settles it arithmetically. Crossed overall 3.88% of 23,401 snapshots =
+908; the MWCB Level 1 halt ran 09:34:13-09:49:13 ET = 901 snapshots at 1s; and the crossed rate by
+session sixth (23.1%, 0, 0, 0, 0.1%, 0.1%) puts 901 of them in the sixth containing the halt.
+
+Exchanges stop matching during a halt but do not cancel resting orders, so a limit order priced
+through the last trade sits unmatched for fifteen minutes. **The book is supposed to cross.** The
+invariant assumed a market that is always matching, which is exactly wrong on the four sessions
+the paper is about.
+
+`session_qc` / `qc_frames` now judge on the crossed fraction OUTSIDE the halt and report both;
+`market_halts.py` holds the windows. **Halt snapshots must be excluded from every estimate** -- a
+halted market has no valid midpoint, and two legs of stale quotes that cannot trade against each
+other produce mechanical comovement rather than price discovery.
+
+Three of that run's diagnostic findings were also false positives (CHECK 4's sequence-gap
+inference, CHECK 5 counting hidden executions as missing messages, and the single-venue crossing
+finding, which was the halt again). All three are fixed in v0.9.26; the original text below is
+kept for the record.
+
+### 1b. ORIGINAL (superseded): residual SPY crossing of ~3.9–4.0% on the four MWCB days
 
 ```
 SPY CROSSED on 3.9% of 23401 snapshots (trade_no_ref=350275 of 2463095 trades)   # 14.2% refless

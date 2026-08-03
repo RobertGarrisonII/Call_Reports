@@ -273,15 +273,24 @@ def check_sequence(msgs, L):
         bad, tot = inv_by_feed.get(name, (0, 0))
         inv = bad / tot if tot else 0.0
         worst_inv = max(worst_inv, inv)
-        L.append("    %-26s span=%12s present=%12s missing=%6.2f%%  clock_inversions=%5.2f%%"
+        L.append("    %-26s span=%12s present=%12s not-ours=%6.2f%%  clock_inversions=%5.2f%%"
                  % (name[:26], f"{int(span):,}", f"{present:,}", 100 * frac, 100 * inv))
-        if frac > 0.02:
-            findings.append(("DATA", "SEVERE" if frac < 0.2 else "FATAL",
-                             "feed '%s' is missing %.1f%% of its sequence range -- the capture dropped "
-                             "messages, so the book cannot be correct" % (name, 100 * frac)))
+    L.append("    not-ours = sequence numbers in the span that this fetch did not return. This is")
+    L.append("    NOT a loss rate. The sequence is a FEED-level counter covering every symbol on the")
+    L.append("    multicast line, and the fetch is per PRODUCT (-p SPY), so the gaps are the other")
+    L.append("    symbols and near-100%% is normal on a busy consolidated feed. Packet loss is")
+    L.append("    reported by the venue itself in mt_missing_product_messages -- run feed_health.py,")
+    L.append("    which reads it. Inferring loss from this column produced 13 FATAL findings on a")
+    L.append("    session whose venue gap report was empty.")
     if worst_inv > 0.0:
         L.append("    clock_inversions = adjacent events (in the venue's own sequence order) whose clock")
         L.append("    RUNS BACKWARDS. Every one is a pair that clock-only ordering applies in reverse.")
+    if worst_inv > 0.001:
+        findings.append(("CODE", "MINOR",
+                         "up to %.2f%% of adjacent same-feed events have a clock that runs backwards "
+                         "-- harmless under sequence ordering, but it is the margin the sequence path "
+                         "is buying: clock-only ordering would apply those pairs in reverse"
+                         % (100 * worst_inv)))
     return findings
 
 
@@ -395,6 +404,7 @@ def instrumented_replay(msgs, tz, clock, price_scale, session, date_str, interva
     book = lr._Book()
     orphan_add_present, orphan_add_absent, orphan_absent_ts = 0, 0, []
     orphan_other_feed = 0
+    undisplayed_trades = 0                 # refless BY CONSTRUCTION -- never an orphan
     orphan_by_feed = Counter()
     resting_trace, cross_trace, feedcross_trace, ts_trace = [], [], [], []
     # --- provenance for the ORDERS THAT PIN THE TOP (the mirror of the orphan analysis) --------------
@@ -474,7 +484,18 @@ def instrumented_replay(msgs, tz, clock, price_scale, session, date_str, interva
             book.set_level(feed, ev.side[j], ev.price[j], 0.0)
         elif code == lr._TRADE:
             if not book.reduce(feed, ev.ref[j], ev.size[j]):
-                if feed not in book.mbp_feeds:
+                if feed in book.mbp_feeds:
+                    pass
+                elif bool(ev.undisplayed[j]):
+                    # An execution against NON-DISPLAYED liquidity (executionattribute='Hidden' /
+                    # printable='NonPrintable'). It has no orderreferencenumber BY CONSTRUCTION, so
+                    # it is not a missing message and it must not consume displayed size. Counting
+                    # these as orphans is what produced "350,275 orphaned removals, 100% add ABSENT
+                    # -> DATA" on a session whose capture the venue itself reports as complete:
+                    # 350,275 is exactly the 6 displayed + 350,269 undisplayed prints the replay
+                    # counted that day.
+                    undisplayed_trades += 1
+                else:
                     orphan_by_feed[feed] += 1
                     if int(feed) * span + int(ev.ref[j]) in created:
                         orphan_add_present += 1
@@ -509,6 +530,7 @@ def instrumented_replay(msgs, tz, clock, price_scale, session, date_str, interva
                 orphan_add_present=orphan_add_present, orphan_add_absent=orphan_add_absent,
                 orphan_absent_ts=np.array(orphan_absent_ts, dtype="int64"),
                 orphan_by_feed=orphan_by_feed, orphan_other_feed=orphan_other_feed,
+                undisplayed_trades=undisplayed_trades,
                 resting=np.array(resting_trace), crossed=np.array(cross_trace),
                 feedcross=np.array(feedcross_trace), grid=grid, g0=g0,
                 n_removals=int(np.count_nonzero(np.isin(ev.code, (lr._CANCEL, lr._TRADE)))),
@@ -529,8 +551,16 @@ def report_replay(R, L):
     L.append("")
     L.append("CHECK 5  reference resolution (orphan provenance -- THE data/code discriminator)")
     tot = R["orphan_add_present"] + R["orphan_add_absent"]
+    nud = R.get("undisplayed_trades", 0)
+    if nud:
+        L.append("    excluded first: %s execution(s) against NON-DISPLAYED liquidity "
+                 "(executionattribute='Hidden' / printable='NonPrintable')." % f"{nud:,}")
+        L.append("      These carry no order reference BY CONSTRUCTION -- there is no displayed order")
+        L.append("      behind them -- so they are not missing messages and consume nothing. SPY runs")
+        L.append("      10-15%% undisplayed on the odd-lot tape; counting them here used to turn a")
+        L.append("      healthy session into a DATA verdict.")
     if tot == 0:
-        L.append("    no orphaned cancel/trade references -- every removal found its order")
+        L.append("    no orphaned cancel/trade references -- every DISPLAYED removal found its order")
     else:
         pres = 100.0 * R["orphan_add_present"] / tot
         L.append("    orphaned removals: %s" % f"{tot:,}")
@@ -616,6 +646,27 @@ def report_replay(R, L):
         sixth = [float(np.mean(R["crossed"][i * n // 6:(i + 1) * n // 6])) for i in range(6)]
         L.append("    crossed rate by session sixth  : %s" % "  ".join("%5.1f%%" % (100 * v) for v in sixth))
         L.append("    crossed overall                : %.2f%%" % (100 * cross_rate))
+        # An MWCB halt stops matching but does NOT cancel resting orders, so a correctly
+        # reconstructed book IS crossed for the full fifteen minutes. On these four sessions the
+        # invariant is supposed to be violated, and attributing that to the replay sent three
+        # rounds of diagnosis after a phenomenon that is the paper's own subject.
+        try:
+            import market_halts as mh
+            hm = mh.halt_mask(R["grid"])
+        except Exception:
+            hm = np.zeros(n, bool)
+        if hm.size == n and hm.any():
+            in_halt = float(np.mean(R["crossed"][hm]))
+            ex_halt = float(np.mean(R["crossed"][~hm])) if (~hm).any() else float("nan")
+            L.append("    MWCB HALT on this date: %s" % mh.describe(R["g0"].strftime("%Y-%m-%d")))
+            L.append("      crossed INSIDE  the halt (%d snapshots) : %.1f%%" % (int(hm.sum()), 100 * in_halt))
+            L.append("      crossed OUTSIDE the halt (%d snapshots) : %.2f%%" % (int((~hm).sum()), 100 * ex_halt))
+            L.append("      A halted market has no valid midpoint: exchanges stop matching but resting")
+            L.append("      orders stay, so a limit order priced through the last trade sits unmatched")
+            L.append("      for 15 minutes. Crossing inside the halt is CORRECT. Exclude those snapshots")
+            L.append("      from any lead-lag / correlation / information-share estimate -- they add a")
+            L.append("      mechanical comovement that is not price discovery.")
+            cross_rate = ex_halt if np.isfinite(ex_halt) else cross_rate     # judge on the open market
         # Structural faults (side/scale/column parsing) cross from the very FIRST snapshots with a
         # STABLE book. Accumulation faults also reach a high rate early when the leak is fast, so
         # "crossed early" alone cannot separate them -- the resting-order growth is what does.
