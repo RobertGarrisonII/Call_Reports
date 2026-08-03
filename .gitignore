@@ -1,2 +1,14 @@
 # Ignore output of scraper
 data.sqlite
+
+# Python build artifacts. The stack is run in place (its own directory is the
+# import path), so running any test or driver leaves .pyc files inside the
+# tracked package directory.
+__pycache__/
+*.py[cod]
+
+# Replication run output: run_paper_replication.sh writes per-run folders and
+# run_analysis writes datasets/frames under them. These are regenerable and
+# large (a single frames pickle is hundreds of MB).
+output/
+extract_cache/
