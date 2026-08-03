@@ -120,9 +120,55 @@ def check_missing_leg_still_fatal():
     return ok
 
 
+def check_opens_into_a_halt():
+    """A session that opens INTO a halt must not read as "wrong from the very first snapshots".
+
+    2020-03-16 is the only one of the four that halted at the opening bell (limit-down premarket,
+    Level 1 halt 09:30:00-09:45:00), so its first 234 snapshots are 100% halt. The diagnostic's
+    structural test -- "crossed on N% of the first 234 snapshots with a stable book => side/scale/
+    column parsing fault" -- therefore fired at 99.1%, a CODE/SEVERE on a session whose replay is
+    fine. The other three halted later in the day and showed 0.0% on the same test, which is why
+    this only ever surfaced on one date.
+    """
+    import debug_crossing as dc
+    day, n = "2020-03-16", 23401
+    idx = pd.date_range(f"{day} 09:30:00", f"{day} 16:00:00", freq="s", tz=TZ)
+    hm = mh.halt_mask(idx)
+    head = max(60, n // 100)
+    all_halt = bool(hm[:head].all())
+
+    # crossed ONLY during the halt -- a correct book on a day that opens into one
+    crossed = hm.astype(float)
+    R = {"resting": np.full(n, 30000.0), "crossed": crossed, "feedcross": crossed.copy(),
+         "grid": idx, "g0": idx[0], "orphan_add_present": 0, "orphan_add_absent": 0,
+         "orphan_absent_ts": np.zeros(0, "int64"), "orphan_by_feed": {}, "orphan_other_feed": 0,
+         "undisplayed_trades": 0, "n_removals": 1000, "resurrect_by_feed": {},
+         "n_resurrect_resting": 0, "feed_names": ["v"], "book": None, "wrong_side": {},
+         "pinned": [], "stats": {}}
+    L = []
+    try:
+        findings = dc.report_replay(R, L)
+    except Exception as exc:
+        print("(6) could not exercise report_replay directly (%s: %s)" % (type(exc).__name__, exc))
+        return False
+    txt = "\n".join(L)
+    structural = [f for f in findings if f[0] == "CODE" and "first" in f[2] and "structural" in f[2]]
+    single_venue = [f for f in findings if f[0] == "CODE" and "individual venue books" in f[2]]
+    skipped = "OPEN snapshots" in txt
+    ok = all_halt and not structural and not single_venue and skipped
+    print("(6) a session that opens into its halt (2020-03-16):")
+    print("    its first %d snapshots are 100%% halt=%s" % (head, all_halt))
+    print("    the structural 'wrong from the start' finding does NOT fire=%s" % (not structural))
+    print("    the single-venue-crossed finding does NOT fire=%s" % (not single_venue))
+    print("    the report says halt snapshots were skipped=%s" % skipped)
+    print("    -> %s" % ok)
+    return ok
+
+
 def main():
     checks = [check_halt_table, check_qc_passes_a_halt, check_qc_still_catches_a_fault,
-              check_non_halt_date_unaffected, check_missing_leg_still_fatal]
+              check_non_halt_date_unaffected, check_missing_leg_still_fatal,
+              check_opens_into_a_halt]
     res = []
     for fn in checks:
         try:

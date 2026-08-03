@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.9.28 -- 2020-03-16 opens INTO its halt, and two more checks were reading that as a fault
+
+The 2020-03-16 report (v0.9.25 build) is the same story as 2020-03-12, plus one failure mode unique
+to this date.
+
+**Same reset bug, already fixed in v0.9.27.** `debug_crossing` reports 4.01% crossed; the extraction
+reported 11.9%. `debug_crossing` did not fetch the clears, the extraction did -- and `feed_health`
+shows an out-of-band reset at **21:04:46 ET on xdp_american_integrated**, five hours after the
+close, exactly the shape that froze 2020-03-12. Re-measure on v0.9.27; both should now sit at the
+halt rate.
+
+**New: this is the only one of the four that halted at the OPENING BELL.** Limit-down premarket,
+Level 1 halt 09:30:00-09:45:00, so the session's first 234 snapshots are 100% halt. Two checks read
+that as a replay fault:
+
+* `crossed in first 234 snapshots: 99.1%` fed the structural test -- "crossed from the very first
+  snapshots with a stable book => side/scale/column parsing fault" -- which fired CODE/SEVERE. The
+  other three MWCB dates halted later in the day and show 0.0% on the same line, which is why this
+  surfaced on exactly one date. The test now runs on the first N **open** snapshots and says so.
+* CHECK 7's single-venue crossing rate was still raw while `cross_rate` had become halt-excluded in
+  v0.9.26, so the two were not comparable and the ratio test was meaningless. Both are now measured
+  outside the halt.
+
+That is the fourth and fifth false positive in this diagnostic. With all of them gone the 2020-03-16
+report reads: capture complete, 0 resurrections, 0 wrong-side orders at the close, 0 of 353,106
+orphans are CODE, sixth-profile 23.3% / 0.2 / 0.3 / 0.2 / 0.1 / 0.0 -- the halt, again.
+
 ## v0.9.27 -- the 97.3% was a reset ordered by its sequence number instead of its clock
 
 Two runs of 2020-03-12 disagreed, and the disagreement was the whole diagnosis:

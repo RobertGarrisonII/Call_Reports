@@ -629,6 +629,7 @@ def report_replay(R, L):
     rest = R["resting"]
     growth = 1.0
     head0 = max(60, n // 100)
+    halt_mask_all = np.zeros(n, bool)         # bound before use: CHECK 7 reads it too
     if rest.size > 10:
         q = [float(np.mean(rest[i * rest.size // 6:(i + 1) * rest.size // 6])) for i in range(6)]
         L.append("    resting orders by session sixth: %s" % "  ".join("%.0f" % v for v in q))
@@ -655,6 +656,7 @@ def report_replay(R, L):
             hm = mh.halt_mask(R["grid"])
         except Exception:
             hm = np.zeros(n, bool)
+        halt_mask_all = hm
         if hm.size == n and hm.any():
             in_halt = float(np.mean(R["crossed"][hm]))
             ex_halt = float(np.mean(R["crossed"][~hm])) if (~hm).any() else float("nan")
@@ -670,10 +672,21 @@ def report_replay(R, L):
         # Structural faults (side/scale/column parsing) cross from the very FIRST snapshots with a
         # STABLE book. Accumulation faults also reach a high rate early when the leak is fast, so
         # "crossed early" alone cannot separate them -- the resting-order growth is what does.
+        # The "wrong from the very first snapshots" test has to skip halt snapshots, or it fires on
+        # any session that opens INTO a halt. 2020-03-16 is exactly that: the market was limit-down
+        # at the bell and the Level 1 halt ran 09:30:00-09:45:00, so the first 234 snapshots are all
+        # halt and the raw figure is 99.1% -- which the check read as "structural parse fault".
         head = head0
-        early = float(np.mean(R["crossed"][:head]))
-        L.append("    crossed in first %d snapshots  : %.1f%%   (book growth %.1fx)" % (head, 100 * early, growth))
-        if early > 0.5 and growth < 2.0:
+        open_idx = np.flatnonzero(~halt_mask_all) if halt_mask_all.any() else np.arange(n)
+        head_idx = open_idx[:head]
+        early = float(np.mean(R["crossed"][head_idx])) if head_idx.size else float("nan")
+        if halt_mask_all.any():
+            L.append("    crossed in first %d OPEN snapshots : %.1f%%   (book growth %.1fx) -- halt "
+                     "snapshots skipped; this session opens into one" % (head_idx.size, 100 * early, growth))
+        else:
+            L.append("    crossed in first %d snapshots  : %.1f%%   (book growth %.1fx)"
+                     % (head, 100 * early, growth))
+        if np.isfinite(early) and early > 0.5 and growth < 2.0:
             findings.append(("CODE", "SEVERE",
                              "crossed on %.0f%% of the first %d snapshots while the resting-order count is "
                              "stable (%.1fx) -- the book is wrong from the start, which is structural "
@@ -685,8 +698,13 @@ def report_replay(R, L):
     L.append("")
     L.append("CHECK 7  per-venue vs consolidated crossing")
     fc = R["feedcross"]
-    any_feed = float(np.mean(fc > 0)) if fc.size else float("nan")
-    L.append("    snapshots where >=1 SINGLE venue's own book is crossed : %6.2f%%" % (100 * any_feed))
+    # Same exclusion as CHECK 6: during a halt a venue's own book crosses because matching stopped,
+    # not because its replay is wrong. Comparing a raw single-venue rate against a halt-excluded
+    # consolidated rate also makes the ratio test below meaningless.
+    fc_open = fc[~halt_mask_all] if (fc.size and halt_mask_all.size == fc.size) else fc
+    any_feed = float(np.mean(fc_open > 0)) if fc_open.size else float("nan")
+    L.append("    snapshots where >=1 SINGLE venue's own book is crossed : %6.2f%%%s"
+             % (100 * any_feed, "  (outside any halt)" if halt_mask_all.any() else ""))
     L.append("    snapshots where the CONSOLIDATED top is crossed        : %6.2f%%" % (100 * cross_rate))
     if cross_rate > 0.01 and any_feed < 0.1 * cross_rate:
         findings.append(("DATA", "SEVERE",
