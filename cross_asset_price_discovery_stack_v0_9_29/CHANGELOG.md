@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.9.29 -- STAGE 6 had never run, and a dry run could not have told you
+
+A clean v0.9.28 demo: STAGE 0 through STAGE 5 pass, all eleven gate tests pass, Tables 5/7/9 are
+produced. Then STAGE 6 dies.
+
+    + python3 run_analysis.py --source demo --legacy --output-dir ... --n-jobs 128
+    run_analysis.py: error: unrecognized arguments: --n-jobs 128
+
+`run_analysis.py` has no `--n-jobs`; it sizes its bootstrap from `autoscale.cpu_jobs()`, which reads
+the `BOOT_WORKERS` env var. **Both** STAGE 6 invocations passed the flag -- demo and non-demo -- so
+that stage had never completed on ANY source. It survived because every previous run failed earlier:
+the first extraction died in STAGE 2, the second in STAGE 3, and the partial runs used
+`--stages 0,1,4`.
+
+* Fixed: STAGE 6 no longer passes `--n-jobs` to `run_analysis`, and the driver exports
+  `BOOT_WORKERS="$NJ"` so the bootstrap width still comes from the same number.
+* A failing stage now prints the **last 15 lines of the log** to the console. "FAILED (see the log)"
+  made the reader open a file to discover it was an argparse error.
+
+**The general fix: `check_driver_flags.py`, run as a STAGE 0 gate.** It reads the shell script,
+extracts every `$PY <tool>.py ... --flag` it would run, asks each tool for its own `--help`, and
+fails if any flag is undefined. Neither existing safety net covers this class of bug: a dry run
+prints a command without parsing it, so a rejected flag looks identical to an accepted one, and a
+unit test exercises the Python while the mistake is in the shell. It costs one `--help` per tool
+(under a second) and it runs before anything expensive -- against three hours on the extract path.
+
+It correctly attributes a wrapped command's flags to the wrapped tool rather than the wrapper
+(`autoscale.py measure -- $PY run_analysis.py --flag`), joins backslash continuations, and reports
+flags hidden behind a shell variable as UNCHECKED rather than implying they passed. Pinned by
+`test_driver_flags.py`, which injects the exact mistake and requires a non-zero exit.
+
+The full demo now runs STAGE 0 through STAGE 7 to completion.
+
+Watch item, not a defect: STAGE 5's lag selection reported *12 of 13 candidate orders could not be
+scored (singular design at that p)*, so p=2 was the minimum over a single scorable candidate. That
+is expected on 6,000-bar synthetic frames and the output says so. If it appears on the REAL frames,
+"chosen by BIC" would be hollow -- the criterion would have picked the only order it could fit.
+
 ## v0.9.28 -- 2020-03-16 opens INTO its halt, and two more checks were reading that as a fault
 
 The 2020-03-16 report (v0.9.25 build) is the same story as 2020-03-12, plus one failure mode unique

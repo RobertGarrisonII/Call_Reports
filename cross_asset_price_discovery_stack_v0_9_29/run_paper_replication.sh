@@ -163,7 +163,12 @@ AS_CORES="$($PY autoscale.py cores 2>/dev/null || echo 1)"
 AS_RAM="$($PY autoscale.py ram 2>/dev/null || echo 0)"
 AS_EXTRACT="$($PY autoscale.py workers --sessions "$N_SESS" 2>/dev/null || echo 1)"
 [ -z "$NJ" ] && NJ="$($PY autoscale.py jobs 2>/dev/null || echo 1)"
+# --n-jobs is accepted by run_table9_both_ways.py ONLY. run_analysis.py sizes its bootstrap from
+# autoscale.cpu_jobs(), which honours BOOT_WORKERS, so the width is exported rather than passed as a
+# flag that argparse would reject. STAGE 6 passed --n-jobs to run_analysis and had therefore never
+# completed on ANY source; the earlier partial runs (--stages 0,1,4) simply never reached it.
 JOBS_FLAG=""; [ -n "$NJ" ] && JOBS_FLAG="--n-jobs $NJ"
+[ -n "$NJ" ] && export BOOT_WORKERS="$NJ"
 
 # Resolve the frames path HERE, not inside STAGE 2. Stages 4c/5/6 all read it, and --stages lets
 # any of them run without STAGE 2 -- in which case the old in-stage assignment left FRAMES pointing
@@ -183,7 +188,9 @@ run()  {
   [ "$DRY" -eq 1 ] && return 0
   # shellcheck disable=SC2068
   if ! "$@" >>"$LOG" 2>&1; then
-    printf '   \033[31mFAILED\033[0m (see %s)\n' "$LOG"; return 1
+    printf '   \033[31mFAILED\033[0m (see %s)\n' "$LOG"
+    printf '   --- last 15 lines ---\n'; tail -n 15 "$LOG" | sed 's/^/   | /'
+    return 1
   fi
 }
 # for the stages whose OUTPUT is the deliverable: show it on the console as well as the log
@@ -225,6 +232,17 @@ EOF
     info "  NOTE: extraction is capped at ${AS_EXTRACT} by the per-worker MEMORY budget"
     info "  (PEAK_GB_GUESS), not by cores. STAGE 2 measures the real peak and prints the value"
     info "  to export -- that guess is the one number here that is not measured."
+  fi
+
+  # Every flag this script passes must exist in the tool that receives it. argparse exits 2 on an
+  # unrecognized option, so a typo kills its stage the moment it is REACHED -- STAGE 6 passed
+  # --n-jobs to run_analysis.py (which has no such option) and had therefore never completed on any
+  # source. A dry run cannot catch it: printing a command does not parse it. One --help per tool.
+  if run_rc $PY check_driver_flags.py "$0" --quiet; then :; else
+    echo "" | tee -a "$LOG"
+    echo "DRIVER FLAG CHECK FAILED -- see the log. A stage would die on argparse the moment it ran." | tee -a "$LOG"
+    tail -n 20 "$LOG" | sed 's/^/   | /' | tee -a /dev/null
+    exit 1
   fi
 
   # ── the sample is checked BEFORE anything is extracted ──────────────────────
@@ -271,7 +289,8 @@ if have_stage 1; then
            test_validate_sample.py \
            test_feed_reset.py \
            test_validate_aggregated.py \
-           test_halt_aware_qc.py ; do
+           test_halt_aware_qc.py \
+           test_driver_flags.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
   done
@@ -574,12 +593,12 @@ if have_stage 6; then
   QFLAG=""; [ "$QUICK" -eq 1 ] && QFLAG="--quick"
   case "$SOURCE" in
     demo)  # shellcheck disable=SC2086
-           run $PY run_analysis.py --source demo $QFLAG --legacy --output-dir "$OUT" $JOBS_FLAG ;;
+           run $PY run_analysis.py --source demo $QFLAG --legacy --output-dir "$OUT" ;;
     *)     # shellcheck disable=SC2086
            run $PY run_analysis.py --source load --pickle "$FRAMES" \
                --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
                --interval "$INTERVAL" ${N_LAGS_INT:+--n-lags "$N_LAGS_INT"} --legacy \
-               --output-dir "$OUT" --save-dataset $QFLAG $JOBS_FLAG ;;
+               --output-dir "$OUT" --save-dataset $QFLAG ;;
   esac
 fi
 
