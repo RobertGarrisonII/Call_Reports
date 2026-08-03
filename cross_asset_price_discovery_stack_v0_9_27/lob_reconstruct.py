@@ -475,9 +475,22 @@ def _event_arrays(messages: dict, tz: str, clock: str = "exchange", price_scale:
             seqf = np.where(np.isfinite(seq_s), seq_s, np.inf)    # missing sequence -> last within its feed
             presort = np.lexsort((elim_rank, seqf, feed_code))    # feed-major, seq-ascending, removals last within a tied packet
             ck = ts[presort].astype(np.int64).copy(); fc = feed_code[presort]
+            # A FEED RESET IS PLACED BY ITS CLOCK, NOT BY ITS SEQUENCE. The whole meaning of a reset
+            # is that the venue's previous state -- including its sequence namespace -- is void, so a
+            # clear's sequence number is not comparable to the stream around it and must not be
+            # threaded into the per-feed cummax. Doing so put a 22:25:47 clear at a mid-day sequence
+            # position on 2020-03-12; the replay's grid pointer only moves forward, so on reaching an
+            # event stamped 22:25 it flushed EVERY remaining grid point at once and froze the whole
+            # consolidated book at 09:40:31 -- inside that day's 09:35:37-09:50:37 halt. 97.3% of the
+            # session then showed the frozen, correctly-crossed halt book. (100% - 97.3% = 632
+            # snapshots = 09:40:31 exactly.)
+            _cl = (code == _CLEAR)[presort]
             for _f in np.unique(fc):                              # clock made monotone in sequence, per feed
                 _m = fc == _f
-                ck[_m] = np.maximum.accumulate(ck[_m])
+                _sub, _subcl = ck[_m], _cl[_m]
+                _acc = np.where(_subcl, np.iinfo(np.int64).min, _sub)   # a reset never raises the running max
+                _acc = np.maximum.accumulate(_acc)
+                ck[_m] = np.where(_subcl, _sub, _acc)             # ... and keeps its own clock
             order = presort[np.argsort(ck, kind="stable")]        # stable: clock ties keep (seq, removal) order
     else:                                                        # legacy: clock-only (pre-fix; reproduces the bug)
         order = np.argsort(ts, kind="stable")
@@ -577,8 +590,21 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
     pricea, sizea, ppricea, psizea = ev.price, ev.size, ev.pprice, ev.psize
     refa, prefa, mainta = ev.ref, ev.pref, ev.maintain
     leavesa, undispa = ev.leaves, ev.undisplayed
+    # The grid pointer only moves FORWARD, so it silently trusts that ``tsa`` is non-decreasing. It
+    # is not guaranteed to be: sequence ordering deliberately places an event at its feed's running
+    # clock maximum rather than its own stamp, and any stray late timestamp that reaches the loop
+    # would flush EVERY remaining grid point in one step and freeze the book for the rest of the
+    # session -- a full-length frame, no error, the exact failure class this stack keeps hitting.
+    # Advance on the running maximum instead, which is identical when the input IS sorted and
+    # bounded when it is not. Inversions are counted rather than assumed away.
+    ts_hi = np.int64(-(2 ** 63))
     for j in range(len(tsa)):
         ts = tsa[j]
+        if ts < ts_hi:
+            book.stats["clock_inversions"] += 1
+            ts = ts_hi                              # never let one late stamp jump the grid
+        else:
+            ts_hi = ts
         while gi < ng and grid_ns[gi] < ts:         # as-of: snapshot reflects all events with ts <= grid
             rows.append(_snap()); gi += 1
         code = codea[j]; feed = feeda[j]

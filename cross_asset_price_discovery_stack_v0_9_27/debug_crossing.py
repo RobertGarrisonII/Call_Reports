@@ -926,7 +926,13 @@ def main(argv=None):
     ap.add_argument("--out", default=None, help="also write the report to this path")
     a = ap.parse_args(argv)
 
-    mtypes = ("mt_add_order", "mt_cancel_order", "mt_modify_order", "mt_trade", "mt_price_level_update")
+    # The SAME set the extraction replays. When this list was short by the two clear types, the
+    # diagnostic reported 3.90% crossed on 2020-03-12 while the extraction reported 97.3% -- same
+    # date, same clock, different message set -- and the disagreement was the only evidence that
+    # anything was wrong with the clears. A diagnostic that replays a different book than the
+    # pipeline cannot diagnose the pipeline.
+    mtypes = ("mt_add_order", "mt_cancel_order", "mt_modify_order", "mt_trade",
+              "mt_price_level_update", "mt_clear_orders", "mt_clear_price_levels")
     if a.messages_pickle:
         with open(a.messages_pickle, "rb") as fh:
             msgs = pickle.load(fh)

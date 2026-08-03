@@ -236,9 +236,61 @@ def check_rules_switchable():
     return ok
 
 
+def check_reset_placed_by_clock():
+    """A reset is placed by its CLOCK, never threaded into the feed's sequence stream.
+
+    This is the 2020-03-12 bug. That tape carries a mt_clear_orders at 22:25:47 ET on
+    xdp_nyse_integrated -- six hours after the close. A reset voids the venue's whole previous
+    state INCLUDING its sequence namespace, so the clear's sequence number is not comparable to the
+    stream around it. Threading it into the per-feed clock cummax placed it at a mid-day sequence
+    position, and because the replay's grid pointer only moves forward, reaching an event stamped
+    22:25 flushed EVERY remaining grid point in one step. The whole consolidated book froze at
+    09:40:31 -- inside that day's 09:35:37-09:50:37 halt -- so 97.3% of the session showed the
+    frozen, correctly-crossed halt book. The arithmetic is exact: 100% - 97.3% = 632 snapshots,
+    and 632s after 09:30 is 09:40:31.
+    """
+    # each minute the venue REPLACES its quote, so the top tracks the day rather than accumulating
+    t = pd.date_range("2020-03-12 09:30:00", "2020-03-12 15:59:00", freq="60s", tz=TZ)
+    px = np.linspace(265, 240, len(t))
+    adds = pd.DataFrame({"sequencenumber": np.arange(1000, 1000 + 2 * len(t), 2), "f": "venueA",
+                         "side": "Bid", "price": px, "quantity": 500,
+                         "orderreferencenumber": [f"R{i}" for i in range(len(t))]}, index=t)
+    cancels = pd.DataFrame({"sequencenumber": np.arange(1001, 1001 + 2 * len(t), 2)[:len(t) - 1],
+                            "f": "venueA", "side": "Bid", "price": px[:-1], "previousquantity": 500,
+                            "orderreferencenumber": [f"R{i}" for i in range(len(t) - 1)]},
+                           index=t[1:])
+    mid = int(adds["sequencenumber"].median())
+    clear = pd.DataFrame([[mid, "venueA"]], columns=["sequencenumber", "f"],
+                         index=[pd.Timestamp("2020-03-12 22:25:47", tz=TZ)])
+    ev = lob._event_arrays({"mt_add_order": adds.copy(), "mt_cancel_order": cancels.copy(),
+                            "mt_clear_orders": clear.copy()}, TZ, clock="receipt", consume=True)
+    mono = bool((np.diff(ev.ts) >= 0).all())
+    pos = int(np.argmax(ev.code == lob._CLEAR))
+    last = pos >= len(ev.code) - 2                  # at its true clock: after every 09:30-15:59 event
+
+    # and the consequence: the grid must not freeze
+    b = lob.reconstruct_book({"mt_add_order": adds.copy(), "mt_cancel_order": cancels.copy(),
+                              "mt_clear_orders": clear.copy()},
+                             asset="SPY", levels=1, interval="60s", session=("09:30", "16:00"),
+                             tz=TZ, date_str="20200312", clock="receipt")
+    got = b["SPY_bidprice_1"].to_numpy(float)
+    fin = np.isfinite(got)
+    tracks = fin.sum() > 300 and (got[fin][0] - got[fin][-1]) > 20   # the book follows the day down
+    frozen = fin.sum() > 300 and np.allclose(got[fin], got[fin][0])
+    ok = mono and last and tracks and not frozen
+    print("(6) a 22:25 reset with a mid-day sequence number:")
+    print("    event timestamps are monotone after ordering=%s; the reset sits at position %d of %d "
+          "(its true clock, last)=%s" % (mono, pos, len(ev.code), last))
+    print("    the book still tracks the session (%.2f -> %.2f over %d snapshots), not frozen=%s"
+          % (got[fin][0] if fin.any() else float("nan"),
+             got[fin][-1] if fin.any() else float("nan"), int(fin.sum()), tracks and not frozen))
+    print("    -> %s" % ok)
+    return ok
+
+
 def main():
     checks = [check_feed_reset, check_reset_then_readd, check_leaves_quantity,
-              check_undisplayed_trade, check_rules_switchable]
+              check_undisplayed_trade, check_rules_switchable, check_reset_placed_by_clock]
     res = []
     for fn in checks:
         try:

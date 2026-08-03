@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.9.27 -- the 97.3% was a reset ordered by its sequence number instead of its clock
+
+Two runs of 2020-03-12 disagreed, and the disagreement was the whole diagnosis:
+
+    debug_crossing.py, CHECK 9 sequence ordering   :  3.90% crossed
+    the extraction pipeline, same date, same clock : 97.30% crossed
+
+`debug_crossing` fetched five message types; the extraction fetched seven. The only difference was
+`mt_clear_orders`.
+
+**Root cause, and it is mine (v0.9.23).** That tape carries a reset at 22:25:47 ET on
+`xdp_nyse_integrated` -- six hours after the close. A reset voids the venue's entire previous state
+*including its sequence namespace*, so the clear's sequence number is not comparable to the stream
+around it. Threading it into the per-feed clock cummax placed it at a **mid-day sequence position**
+while it still carried a 22:25 timestamp. The replay's grid pointer only moves forward, so on
+reaching that event it flushed EVERY remaining grid point in one step, and the whole consolidated
+book froze at 09:40:31 -- **inside** that day's 09:35:37-09:50:37 halt. Every later snapshot then
+showed the frozen, correctly-crossed halt book. The arithmetic is exact: 100% - 97.3% = 632
+snapshots, and 632 seconds after 09:30 is 09:40:31.
+
+Three fixes, in increasing order of generality:
+
+* **A reset is placed by its CLOCK, never by its sequence.** It no longer contributes to the
+  per-feed running maximum and keeps its own timestamp, so the 22:25 clear now sorts last, where it
+  belongs. Event timestamps are monotone again.
+* **The grid pointer no longer trusts that timestamps are sorted.** It advances on the running
+  maximum, which is identical when the input is sorted and bounded when it is not, and counts
+  inversions in `lob_stats["clock_inversions"]`. One stray late stamp can no longer flush the
+  session -- this was a latent hazard independent of the clears, and it produces exactly the
+  failure this stack keeps hitting: a full-length frame, no error.
+* **`debug_crossing` now replays the same seven message types the extraction does.** A diagnostic
+  that replays a different book than the pipeline cannot diagnose the pipeline; the two-run
+  disagreement was luck, not design.
+
+The rest of the 2020-03-12 report reads clean once the v0.9.26 false positives are removed: capture
+complete (`mt_missing_product_messages` empty), 0 resurrections, 0 wrong-side orders at the close,
+0 of 404,473 orphans are CODE, and the sixth-profile (23.1%, 0.1, 0, 0.1, 0, 0.1) is the halt --
+23.1% of the first sixth is 901 snapshots, and the halt is 900. So 2020-03-12's true crossed rate
+is the same ~3.9% halt as 2020-03-09's, and 2020-03-16's 11.9% should be re-measured on this build.
+
 ## v0.9.26 -- the residual crossing on the MWCB days is the halt, and three findings were false positives
 
 The 2020-03-09 diagnostic is a clean read, and it settles the "residual ~3.9% crossing" that had
