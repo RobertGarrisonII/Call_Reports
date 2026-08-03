@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.9.25 -- the run reached the gate, and the gate had no file to read
+
+Second real extraction: **24 of 24 sessions landed, none failed, 85 minutes** (the previous attempt
+lost 22 finished days to one vendor error after 2h50m). The log shows the retry doing its job --
+`mstwx-lakequery rc=1 on attempt 1/3 ... retrying in 5s`, then `extracted 2024-12-18`. It also shows
+the refless-print reclassification was right: **6 displayed refless prints out of 2,463,095 trades**,
+where the old diagnostic reported 350,275. Reference matching is essentially exact; the rest was
+hidden liquidity all along.
+
+Then STAGE 3 died on `no pickle matched .../frames.pkl` and took the run with it.
+
+**`run_analysis --only extract` never wrote a session-frames pickle.** It writes
+`final_dataset.parquet` (flat) and `analysis_objects.pkl` (results, not frames) into a TIMESTAMPED
+SUBDIRECTORY, and the driver globbed `${OUT}/*aggregated*.pkl` -- a name from a legacy path, at the
+wrong level. Now `run_analysis` writes `frames_<interval>.pkl` in the `List[(date, regime, df)]`
+shape every downstream driver loads (`--save-frames`, on by default), and STAGE 2 searches
+recursively for it, failing loudly with an explanation rather than handing STAGE 3 a path to
+nothing. The flat dataset is not a substitute: it discards the per-session split.
+
+**Four sessions were emptied silently and still counted.** `_align_books` keeps only rows where
+EVERY asset has a quote, so the four March-2020 days -- whose ES leg is entirely absent -- were
+trimmed `23401 -> 0 rows` at INFO level, while the summary said "24 usable session(s)" and the
+dataset held 468,020 rows (= 20 x 23,401). Emptying a session is now an ERROR that names the leg
+responsible, with a closing summary. The MWCB panel currently contributes NOTHING, which is a
+sample-size fact the paper cannot state wrongly.
+
+**Two March-2020 sessions got WORSE when the v0.9.23 replay rules went in** (2020-03-16
+4.0% -> 11.9%, 2020-03-12 3.9% -> 97.3%; the other two unchanged). Three rules changed at once, so
+which one is responsible is an empirical question:
+
+* Each rule is now independently switchable via `reconstruct_book(rules=...)`:
+  `apply_clears`, `use_leaves`, `consume_undisplayed`.
+* `ab_book_rules.py` fetches a session ONCE and replays it under all eight combinations, prints the
+  crossed fraction for each, and names the rule that moves it -- with the interpretation, which is
+  not symmetric. If `consume_undisplayed=on` restores the old number, the pre-v0.9.23 behaviour was
+  **masking** the crossing rather than avoiding it: letting a hidden print delete displayed size is
+  wrong in principle, but it erased stale levels as a side effect. A lower crossed fraction from a
+  spurious deletion is not a better book.
+* `set_remaining` now refuses to GROW a resting order. A trade cannot add liquidity, so
+  `leavesquantity > tracked size` means either our size is wrong or that feed populates the field
+  from the aggressor (it is verified only on bats_edgx). Counted as `trade_leaves_gt_size` and
+  reported, instead of inflating a level -- an inflated bid level IS a crossed book.
+* The crossed-book warning now prints every deciding counter: resets applied, orders and levels
+  cleared, leaves corrections, leaves rejections, and which rules were active.
+
+Measured on the run: peak RSS of the largest extraction worker is **58.4 GiB**, so
+`PEAK_GB_GUESS=76` -> 5 workers on a 495 GiB node. The run used 13 and survived, because worker
+peaks do not coincide -- but 13 x 58 GiB is 759 GiB of exposure against 495 available. Treat 13 as
+lucky rather than sized.
+
 ## v0.9.24 -- the ES tape carries its own benchmark, and the paper needs it
 
 The ESZ4 sample for 2024-12-18 settles the futures leg's design and hands over the robustness

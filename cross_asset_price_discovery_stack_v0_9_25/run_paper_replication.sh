@@ -327,9 +327,23 @@ if have_stage 2; then
         info "EXTRACTION WAS NOT CLEAN -- ${OUT}/extract_report.txt:"
         sed 's/^/     /' "${OUT}/extract_report.txt" | tee -a "$LOG"
       fi
-      # run_analysis writes the extracted frames into its run folder; point at them
-      FOUND="$(ls -1t "${OUT}"/*aggregated*.pkl 2>/dev/null | head -1 || true)"
-      [ -n "$FOUND" ] && FRAMES="$FOUND"
+      # run_analysis writes the frames into a TIMESTAMPED SUBDIRECTORY of --output-dir, so a
+      # flat glob on ${OUT} finds nothing. That is not hypothetical: an 85-minute extraction
+      # completed, wrote its run folder, and STAGE 3 then died on "no pickle matched
+      # .../frames.pkl" with every downstream stage unable to start. Search RECURSIVELY, newest
+      # first, and accept either name.
+      FOUND="$(find "${OUT}" -name 'frames_*.pkl' -o -name '*aggregated*.pkl' 2>/dev/null \
+               | xargs -r ls -1t 2>/dev/null | head -1 || true)"
+      if [ -n "$FOUND" ]; then
+        FRAMES="$FOUND"
+      else
+        echo "" | tee -a "$LOG"
+        echo "STAGE 2 produced no session-frames pickle under ${OUT}." | tee -a "$LOG"
+        echo "Extraction may still have succeeded -- check for final_dataset.parquet -- but every" | tee -a "$LOG"
+        echo "downstream stage loads List[(date, regime, df)], which the flat dataset is not." | tee -a "$LOG"
+        echo "Re-run STAGE 2 with a run_analysis that supports --save-frames (v0.9.25+)." | tee -a "$LOG"
+        exit 1
+      fi
       info "frames: $FRAMES"
       ;;
     *) echo "unknown --source $SOURCE" >&2; exit 2 ;;

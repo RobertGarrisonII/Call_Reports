@@ -193,6 +193,15 @@ class _Book:
                 lv.pop(price, None)
             self.orders.pop((feed, ref), None)
         else:
+            if leaves > size + EPS:
+                # A trade cannot GROW the order it executed against. If the venue's figure exceeds
+                # what we hold, one of two things is true and neither justifies inflating a level:
+                # our size is already wrong, or leavesquantity does not mean the resting order's
+                # remainder on this feed (it is verified on bats_edgx; other venues may populate it
+                # from the aggressor). Keep our size, count it, and let the diagnostic report the
+                # rate -- a level silently inflated on the bid side is a crossed book.
+                self.stats["trade_leaves_gt_size"] += 1
+                return True
             lv[price] += (leaves - size)              # assign the venue's figure, keep the level in step
             if lv[price] <= EPS:
                 lv.pop(price, None)
@@ -484,7 +493,8 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
                      round_lot: int = 100, odd_lot_inclusive: bool = True,
                      session=("09:30", "16:00"), tz: str = "America/New_York",
                      date_str: Optional[str] = None, clock: str = "exchange",
-                     price_scale: float = 1.0, consume: bool = False, order_by: str = "sequence") -> pd.DataFrame:
+                     price_scale: float = 1.0, consume: bool = False, order_by: str = "sequence",
+                     rules: Optional[dict] = None) -> pd.DataFrame:
     """Replay the messages into per-venue books and sample the CONSOLIDATED book as-of each grid
     point. ``messages`` is a dict {message_type: DataFrame} (raw mstwx columns, tz-aware index).
 
@@ -512,7 +522,29 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
     grid = pd.date_range(g0, g1, freq=interval)
     grid_ns = grid.tz_convert("UTC").as_unit("ns").astype("int64").to_numpy()
 
+    # Each of the three v0.9.23 replay rules can be switched off INDEPENDENTLY. They were added
+    # together, and on two of the four March-2020 sessions the crossed fraction moved sharply when
+    # they went in (4.0% -> 11.9%, 3.9% -> 97.3%) -- which of them is responsible is an empirical
+    # question, and one that is answerable only by replaying the same messages under each setting.
+    # See ab_book_rules.py, which does exactly that from a single fetch.
+    #
+    #   apply_clears        replay mt_clear_orders / mt_clear_price_levels as feed resets
+    #   use_leaves          take the resting size from mt_trade.leavesquantity, not a decrement
+    #   consume_undisplayed  let a refless Hidden/NonPrintable print consume DISPLAYED size
+    #                       (pre-v0.9.23 behaviour: wrong in principle -- there is no displayed
+    #                        order behind such a print -- but it deleted stale levels as a side
+    #                        effect, which could have been masking crossing rather than avoiding it)
+    _R = {"apply_clears": True, "use_leaves": True, "consume_undisplayed": False}
+    if rules:
+        _bad = set(rules) - set(_R)
+        if _bad:
+            raise ValueError(f"unknown replay rule(s): {sorted(_bad)}; valid: {sorted(_R)}")
+        _R.update(rules)
+
     book = _Book()
+    book.stats["rule_apply_clears"] = int(_R["apply_clears"])
+    book.stats["rule_use_leaves"] = int(_R["use_leaves"])
+    book.stats["rule_consume_undisplayed"] = int(_R["consume_undisplayed"])
     for _c, _nm in ((_ADD, "n_add"), (_CANCEL, "n_cancel"), (_MODIFY, "n_modify"), (_TRADE, "n_trade"),
                     (_LEVEL_SET, "n_level_set"), (_LEVEL_DEL, "n_level_del")):
         book.stats[_nm] = int(np.count_nonzero(ev.code == _c))   # message-type counts (for no-ref RATES)
@@ -562,6 +594,10 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
         elif code == _LEVEL_DEL:                     # MBP explicit level delete
             book.set_level(feed, sidea[j], pricea[j], 0.0)
         elif code == _CLEAR:                         # feed reset: this venue disowns everything it sent
+            if not _R["apply_clears"]:
+                book.stats["feed_clears_ignored"] += 1
+                book.stats["events"] += 1
+                continue
             n_o, n_l = book.clear_feed(feed)
             if n_o or n_l:                           # a reset onto an empty book is routine session init
                 log.info("feed reset (%s) at %s: dropped %d resting order(s) and %d price level(s) "
@@ -571,13 +607,13 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
         elif code == _TRADE:
             # Prefer the venue's OWN post-trade remaining size (leavesquantity) over a decrement:
             # it is exact, self-correcting, and leaves=0 removes a fully filled order deterministically.
-            lq = leavesa[j]
+            lq = leavesa[j] if _R["use_leaves"] else np.nan
             hit = (book.set_remaining(feed, refa[j], lq) if np.isfinite(lq)
                    else book.reduce(feed, refa[j], sizea[j]))
             if not hit:
                 if feed in book.mbp_feeds:           # MBP feed: a level update will reflect the new size
                     book.stats["trade_on_mbp_skipped"] += 1
-                elif undispa[j]:
+                elif undispa[j] and not _R["consume_undisplayed"]:
                     # An execution against NON-DISPLAYED liquidity (executionattribute='Hidden' /
                     # printable='NonPrintable'). It has no orderreferencenumber BY CONSTRUCTION -- there
                     # was no displayed order -- so this is not evidence of a broken replay, and it must
@@ -617,9 +653,16 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
                     "%d snapshots -- a real book never crosses, so resting orders that should have left are "
                     "pinning the top. Refless DISPLAYED prints (the ones that indicate a reference-matching "
                     "fault): %d of %d trades; a further %d were undisplayed (Hidden/NonPrintable), which is "
-                    "expected and consumes nothing. Feed resets applied: %d.",
+                    "expected and consumes nothing. Feed resets applied: %d (orders %d, levels %d). "
+                    "leavesquantity: %d corrections, %d rejected as larger than the resting size. "
+                    "Rules: clears=%d leaves=%d consume_undisplayed=%d -- ab_book_rules.py replays "
+                    "one fetch under each combination if you need to attribute the crossing.",
                     asset, 100.0 * nx / ng, ng, book.stats.get("trade_no_ref_displayed", 0), n_tr,
-                    book.stats.get("trade_undisplayed", 0), book.stats.get("feed_clears", 0))
+                    book.stats.get("trade_undisplayed", 0), book.stats.get("feed_clears", 0),
+                    book.stats.get("orders_cleared", 0), book.stats.get("levels_cleared", 0),
+                    book.stats.get("trade_leaves_corrected", 0), book.stats.get("trade_leaves_gt_size", 0),
+                    book.stats.get("rule_apply_clears", 1), book.stats.get("rule_use_leaves", 1),
+                    book.stats.get("rule_consume_undisplayed", 0))
 
     out = pd.DataFrame(rows, index=grid)
     out.index.name = "time"
@@ -639,7 +682,7 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
                         message_types=("mt_add_order", "mt_cancel_order", "mt_modify_order", "mt_trade",
                                        "mt_price_level_update", "mt_clear_orders",
                                        "mt_clear_price_levels"),
-                        progress_cb=None, strict: bool = True):
+                        progress_cb=None, strict: bool = True, rules: Optional[dict] = None):
     """Live entry point: fetch the message types via mstbook_loader and reconstruct the book on one
     GPS-disciplined capture clock. Multi-venue equities (SPY) come back as the consolidated NBBO/ladder
     (hybrid MBO+MBP); a single-venue future (ES) is a CME order-by-order (MBO) replay -- pass the MBO
@@ -682,7 +725,7 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
     out = reconstruct_book(msgs, asset=ml.canonical_root(product, product_type), levels=levels,
                            interval=interval, round_lot=round_lot, odd_lot_inclusive=odd_lot_inclusive,
                            session=session, tz=tz, date_str=date_str, clock=clock, price_scale=price_scale,
-                           consume=True)
+                           consume=True, rules=rules)
     if failed:
         out.attrs["fetch_failed"] = dict(failed)
     return out

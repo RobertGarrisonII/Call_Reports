@@ -193,10 +193,26 @@ def _align_books(sessions, assets=("SPY", "ES"), enabled=True):
         if keycols:
             f = f.loc[f[keycols].notna().all(axis=1)]
         filled = before - int(f.isna().sum().sum()); trimmed = len(df) - len(f)
-        if filled or trimmed:
+        if len(f) == 0:
+            # Alignment keeps only rows where EVERY asset has a quote, so one leg that is entirely
+            # absent empties the session -- silently, at INFO, while the session count downstream
+            # still says it is there. That is how four MWCB days reached a "24 usable session(s)"
+            # summary and a dataset containing 20. Name the leg that did it, at ERROR.
+            dead = [a for a in assets if f"{a}_bidprice_1" in df.columns
+                    and not pd.to_numeric(df[f"{a}_bidprice_1"], errors="coerce").notna().any()]
+            LOG.error("session %s is EMPTY after alignment (%d -> 0 rows): %s never quotes, and "
+                      "alignment keeps only rows where every asset has a quote. This session "
+                      "contributes NOTHING to any table -- the sample is smaller than the session "
+                      "count says.", str(d), len(df),
+                      " and ".join(dead) if dead else "one of the assets")
+        elif filled or trimmed:
             LOG.info("session %s aligned: carried %d NaN book cells, trimmed %d leading warmup row(s) (%d -> %d rows)",
                      str(d), filled, trimmed, len(df), len(f))
         out.append((d, r, f))
+    n_empty = sum(1 for _d, _r, f in out if len(f) == 0)
+    if n_empty:
+        LOG.error("ALIGNMENT SUMMARY: %d of %d session(s) are empty and contribute no rows: %s",
+                  n_empty, len(out), ", ".join(str(d) for d, _r, f in out if len(f) == 0))
     return out
 
 
@@ -669,6 +685,10 @@ def parse_args(argv=None):
     p.add_argument("--dataset-format", choices=["auto", "parquet", "csv"], default="auto",
                    help="consolidated final-dataset format (auto: parquet if available, else csv.gz)")
     p.add_argument("--save-dataset", action="store_true", help="also write the dataset for --source demo")
+    p.add_argument("--save-frames", action="store_true", default=True,
+                   help="write frames_<interval>.pkl -- the List[(date, regime, df)] every "
+                        "downstream driver loads with --source load (on by default)")
+    p.add_argument("--no-save-frames", dest="save_frames", action="store_false")
     p.add_argument("--no-dataset", action="store_true", help="do not write the consolidated dataset")
     p.add_argument("--save-objects", action="store_true", help="also dump full Python objects as a pickle")
     p.add_argument("--legacy", action=argparse.BooleanOptionalAction, default=False,
@@ -751,6 +771,19 @@ def run_stages(sessions, args, ts=None, t0=None):
     if (not args.no_dataset) and (args.save_dataset or args.source != "demo"):
         ds_path, ds_shape = write_dataset(sessions, run_dir, fmt=args.dataset_format)
         LOG.info("Final dataset -> %s  (rows=%d, cols=%d)", ds_path, ds_shape[0], ds_shape[1])
+
+    # The SESSION FRAMES, as List[(date, regime, DataFrame)] -- the shape every downstream driver
+    # loads with --source load. The flat dataset is not a substitute: it discards the per-session
+    # split, and rebuilding it by grouping on a date column is exactly the kind of re-derivation
+    # that goes wrong quietly. An extract run that wrote only the parquet left the replication
+    # driver's STAGE 3 pointing at a pickle that was never created, and the run died there after
+    # 85 minutes of extraction with nothing downstream able to start.
+    if args.save_frames and sessions:
+        fpath = os.path.join(run_dir, f"frames_{args.interval}.pkl")
+        with open(fpath, "wb") as fh:
+            pickle.dump([(str(d), r, f) for d, r, f in sessions], fh, protocol=4)
+        LOG.info("Session frames -> %s  (%d session(s), the List[(date, regime, df)] shape "
+                 "--source load expects)", fpath, len(sessions))
 
     # the resulting tables — one CSV per analysis output
     table_files = export_tables(results, tables_dir)

@@ -175,8 +175,70 @@ def check_undisplayed_trade():
     return ok
 
 
+def check_rules_switchable():
+    """Each v0.9.23 rule must be independently switchable, and leavesquantity must never GROW an order.
+
+    The three rules went in together and two March-2020 sessions moved sharply (4.0%->11.9%,
+    3.9%->97.3%). Attribution needs the ability to replay the same messages with one rule flipped;
+    ab_book_rules.py does that, and this pins the mechanism it relies on."""
+    adds = _f("mt_add_order", [
+        ["09:00:00", 1, "venueA", "Bid", 300.50, 500, "S1"],
+        ["09:29:00", 2, "venueB", "Bid", 280.00, 500, "B1"],
+        ["09:29:01", 3, "venueB", "Ask", 280.10, 500, "B2"],
+    ], ["t", "sequencenumber", "f", "side", "price", "quantity", "orderreferencenumber"])
+    hidden = _f("mt_trade", [["09:29:30", 4, "venueA", 300.50, 500, "", np.nan, "Hidden",
+                              "NonPrintable"]],
+                ["t", "sequencenumber", "f", "price", "quantity", "orderreferencenumber",
+                 "leavesquantity", "executionattribute", "printable"])
+
+    def _crossed(rules):
+        b = lob.reconstruct_book({"mt_add_order": adds.copy(), "mt_trade": hidden.copy()},
+                                 asset="SPY", levels=2, interval="1s", session=("09:30", "09:31"),
+                                 tz=TZ, date_str="20241218", clock="receipt", rules=rules)
+        bid = b["SPY_bidprice_1"].to_numpy(float); ask = b["SPY_askprice_1"].to_numpy(float)
+        m = np.isfinite(bid) & np.isfinite(ask)
+        return float((bid[m] > ask[m] + lob.EPS).mean()) if m.any() else np.nan
+
+    default = _crossed(None)
+    consume_on = _crossed({"consume_undisplayed": True})
+    switchable = np.isclose(default, 1.0) and np.isclose(consume_on, 0.0)
+
+    try:
+        lob.reconstruct_book({"mt_add_order": adds.copy()}, asset="SPY", levels=2, interval="1s",
+                             session=("09:30", "09:31"), tz=TZ, date_str="20241218",
+                             rules={"no_such_rule": True})
+        typo_caught = False
+    except ValueError as exc:
+        typo_caught = "no_such_rule" in str(exc)
+
+    # leavesquantity must never GROW a resting order: a trade cannot add liquidity.
+    grow_adds = _f("mt_add_order", [["09:29:00", 1, "bats_edgx", "Bid", 280.00, 100, "G1"],
+                                    ["09:29:01", 2, "bats_edgx", "Ask", 280.10, 100, "G2"]],
+                   ["t", "sequencenumber", "f", "side", "price", "quantity", "orderreferencenumber"])
+    grow_tr = _f("mt_trade", [["09:29:30", 3, "bats_edgx", 280.00, 5, "G1", 9999, "Visible",
+                               "Printable"]],
+                 ["t", "sequencenumber", "f", "price", "quantity", "orderreferencenumber",
+                  "leavesquantity", "executionattribute", "printable"])
+    gb = lob.reconstruct_book({"mt_add_order": grow_adds, "mt_trade": grow_tr}, asset="SPY",
+                              levels=2, interval="1s", session=("09:30", "09:31"), tz=TZ,
+                              date_str="20241218", clock="receipt")
+    q = gb["SPY_bidquantity_1"].iloc[0]
+    no_grow = np.isclose(q, 100) and gb.attrs["lob_stats"].get("trade_leaves_gt_size", 0) == 1
+    not_crossed = gb["SPY_bidprice_1"].iloc[0] < gb["SPY_askprice_1"].iloc[0]
+
+    ok = switchable and typo_caught and no_grow and not_crossed
+    print("(5) rules are independently switchable (default %.0f%% crossed, consume_undisplayed=on "
+          "%.0f%%)=%s; an unknown rule name raises=%s" % (100 * default, 100 * consume_on,
+                                                          switchable, typo_caught))
+    print("    leavesquantity=9999 against a 100-lot order does NOT inflate the level (stayed %.0f, "
+          "counted as leaves_gt_size)=%s, and the book stays uncrossed=%s : %s"
+          % (q, no_grow, not_crossed, ok))
+    return ok
+
+
 def main():
-    checks = [check_feed_reset, check_reset_then_readd, check_leaves_quantity, check_undisplayed_trade]
+    checks = [check_feed_reset, check_reset_then_readd, check_leaves_quantity,
+              check_undisplayed_trade, check_rules_switchable]
     res = []
     for fn in checks:
         try:
