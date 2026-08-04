@@ -61,15 +61,30 @@ MWCB_HALTS = {
 _HALT_NULL = ("", "nan", "<NA>", "None", "NaN", "null", "NULL", "\\N")
 
 
-def windows_from_status(df, tz: str = TZ, min_seconds: float = 30.0) -> dict:
+def windows_from_status(df, tz: str = TZ, min_seconds: float = 30.0, min_venues: int = 2) -> dict:
     """Derive halt windows per feed from an ``mt_product_status`` frame (no I/O -- pass the frame).
 
     A halt OPENS on the first row for a feed whose ``haltreason`` is populated and CLOSES on that
-    feed's next row where it is not. Anything shorter than ``min_seconds`` is dropped: single-symbol
-    LULD pauses and status churn are not market-wide events and should not blank a session.
+    feed's next row where it is not.
 
-    -> {'windows': [(start, end)] consolidated, 'by_feed': {feed: [(start, end)]}, 'reasons': set}"""
-    out = {"windows": [], "by_feed": {}, "reasons": set()}
+    Two filters, both learned from real days:
+
+    ``min_seconds``  drops brief status churn -- a single-symbol LULD pause is not a market-wide
+                     event. It applies to an UNCLOSED span too: on 2024-12-18 `memoir_ltse_depth_l3`
+                     publishes `RegulatoryConcern` once, at 06:28:02, and never clears it, which
+                     produced a zero-length "halt" on an ordinary day.
+
+    ``min_venues``   is the one that matters. A MARKET-WIDE halt stops every venue at once -- on
+                     2020-03-09 six feeds report within 30 ms of each other. ONE venue reporting a
+                     halt reason is a venue-level event, and the consolidated book keeps matching on
+                     the other fifteen. Excusing crossing as "halt" on that basis would let a
+                     single venue's hour-long regulatory status hide a real replay fault for an
+                     hour. Spans that miss quorum are returned under ``venue_only`` rather than
+                     discarded, so nothing disappears silently.
+
+    -> {'windows': [(start, end)] market-wide, 'venue_only': [(feed, start, end)],
+        'by_feed': {feed: [(start, end)]}, 'reasons': set}"""
+    out = {"windows": [], "venue_only": [], "by_feed": {}, "reasons": set()}
     if df is None or len(df) == 0 or "haltreason" not in df.columns:
         return out
     idx = df.index
@@ -95,20 +110,26 @@ def windows_from_status(df, tz: str = TZ, min_seconds: float = 30.0) -> dict:
                     spans.append((start, t[k]))
                     out["reasons"].add(why)
                 start = None
-        if start is not None:                       # halted with no resume row in the fetch
-            spans.append((start, t[-1]))
+        if start is not None and (t[-1] - start).total_seconds() >= min_seconds:
+            spans.append((start, t[-1]))            # halted with no resume row in the fetch
             out["reasons"].add(why)
         if spans:
             out["by_feed"][feed] = spans
 
     # Consolidate: a market-wide halt stops every venue, so the union across feeds is the window the
     # book is unmatched over. Overlapping per-feed spans (they differ by microseconds) merge into one.
-    flat = sorted((a, b) for v in out["by_feed"].values() for a, b in v)
-    for a, b in flat:
-        if out["windows"] and a <= out["windows"][-1][1]:
-            out["windows"][-1] = (out["windows"][-1][0], max(out["windows"][-1][1], b))
+    flat = sorted((a, b, f) for f, v in out["by_feed"].items() for a, b in v)
+    merged = []
+    for a, b, f in flat:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b), merged[-1][2] | {f})
         else:
+            merged.append((a, b, {f}))
+    for a, b, feeds in merged:
+        if len(feeds) >= min_venues:
             out["windows"].append((a, b))
+        else:
+            out["venue_only"].append((sorted(feeds)[0], a, b))
     return out
 
 

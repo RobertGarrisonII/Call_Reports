@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.9.33 -- a clean day found a false halt, and a quorum rule the MWCB days could not have
+
+2024-12-18 is a volatile day with no circuit breaker -- exactly the control the halt code needed,
+and it failed two ways at once. The date carries a single halt row:
+
+    06:28:02  memoir_ltse_depth_l3  haltreason=RegulatoryConcern     (never cleared)
+
+* **A zero-length halt on a clean day.** The unclosed-span branch appended `(start, last_row)`
+  without the `min_seconds` filter the closed branch applies. With one row, start == last row, so
+  `feed_health` reported *"HALT on this date: 06:28:02 -> 06:28:02"* on a session that never halted.
+* **No venue quorum -- the one that would have mattered.** A market-wide halt stops every venue at
+  once: on 2020-03-09 six feeds report within 30 ms. ONE venue out of sixteen reporting a status is
+  a venue-level event, and the consolidated book keeps matching on the other fifteen. Without a
+  quorum, a single venue's hour-long regulatory status would have excused an hour of crossing as
+  "the halt" -- hiding a genuine replay fault behind a rule that does not apply to the book being
+  measured. The three MWCB days could never have surfaced this, because on all of them every venue
+  halts together.
+
+`windows_from_status` now takes `min_venues=2`, applies `min_seconds` to unclosed spans, and returns
+sub-quorum spans under `venue_only` rather than discarding them -- `feed_health` prints them with
+"NOT a market-wide halt -- the other venues kept matching, so crossing here is NOT excused."
+
+Verified against all four days now available:
+
+| date | market-wide window | venues | venue-only |
+|---|---|---|---|
+| 2024-12-18 | **none** | - | none (the LTSE row is sub-`min_seconds`) |
+| 2020-03-09 | 09:34:13-09:49:13 (900 s) | 6 | none |
+| 2020-03-12 | 09:35:44-09:50:44 (900 s) | 6 | none |
+| 2020-03-16 | 09:30:01-09:45:01 (900 s) | 6 | none |
+
+SSR on 2024-12-18: **not restricted** (27% coverage, all NotInEffect). LULD: 0% coverage again --
+four dates, four sources, no bands. That is now conclusively a property of the direct venue feeds.
+
+One thing NOT to build on: `marketsession` is unreliable as a session boundary. On 2024-12-18
+`bats_edgx` reports `CoreSession` at 01:42 ET, and `xdp_chicago_integrated` replays
+PreOpen -> EarlySession -> CoreSession -> LateSession -> Closed in **0.3 seconds** at 22:26 ET
+during its end-of-day symbol clear. It is fine as a descriptive summary, which is all it is used
+for; it is not a source for the 09:30-16:00 grid.
+
 ## v0.9.32 -- 2020-03-16 was short-sale restricted for the whole session
 
 The 2020-03-12 and 2020-03-16 status streams answer the question v0.9.31 raised, and they answer it

@@ -113,7 +113,12 @@ def report(date_str, product, ptype="direct", data_source="apu", tz="America/New
                 lines.append("    A halted market does not match, so a crossed book HERE is correct.")
                 lines.append("    Exclude these snapshots from every estimate: no valid midpoint.")
             else:
-                lines.append(f"{_STATUS:32s} {len(stat):>8,d} row(s)   no halt")
+                lines.append(f"{_STATUS:32s} {len(stat):>8,d} row(s)   no market-wide halt")
+            for f_, a, b in h.get("venue_only", []):
+                lines.append("    venue-level status only: %s halted %s-%s (%.0f s). NOT a market-wide"
+                             % (f_, a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S"),
+                                (b - a).total_seconds()))
+                lines.append("    halt -- the other venues kept matching, so crossing here is NOT excused.")
             # The two REGULATORY constraints on quoting, both confounds for this paper. Coverage is
             # reported, not assumed: a control that is silently all-NaN is worse than none, because
             # the regression still runs and the coefficient means nothing.

@@ -197,7 +197,10 @@ def check_halt_derived_from_tape():
     dur = (b - a).total_seconds() if one else -1
     tbl = mh.halt_windows("2020-03-09")[0]
     agrees = one and abs((a - tbl[0]).total_seconds()) < 1 and abs((b - tbl[1]).total_seconds()) < 1
-    venues = len(res["by_feed"]) == 6
+    # Only arca/nyse/iex carry a CLOSING row in this abbreviated fixture; the other three are
+    # unclosed and now correctly dropped by min_seconds. Quorum (>=2) is what matters here -- the
+    # full-day pull does close all six.
+    venues = len(res["by_feed"]) >= 2
     reasons = "MarketWideCircuitBreakerLevel1" in res["reasons"]
 
     # a short status blip is NOT a market-wide halt and must not blank a session
@@ -208,7 +211,7 @@ def check_halt_derived_from_tape():
     ignored = not mh.windows_from_status(blip)["windows"]
 
     ok = one and abs(dur - 900.0) < 0.5 and agrees and venues and reasons and ignored
-    print("(7) the halt derived FROM THE TAPE: %s -> %s (%.1f s across %d venues)"
+    print("(7) the halt derived FROM THE TAPE: %s -> %s (%.1f s across %d venues with a close)"
           % (a.strftime("%H:%M:%S.%f")[:-3] if one else "?",
              b.strftime("%H:%M:%S.%f")[:-3] if one else "?", dur, len(res["by_feed"])))
     print("    matches the hardcoded table to <1s=%s; 900.0s=%s; reason captured=%s" %
@@ -240,11 +243,50 @@ def check_frame_attrs_override_the_table():
     return ok
 
 
+def check_one_venue_is_not_a_market_halt():
+    """A single venue's halt reason is NOT a market-wide halt, and must not excuse crossing.
+
+    2024-12-18 -- an ordinary volatile day with no MWCB -- carries exactly one halt row:
+    `memoir_ltse_depth_l3` publishes `RegulatoryConcern` at 06:28:02 and never clears it. Two
+    separate faults followed. The unclosed span skipped the min_seconds filter and produced a
+    ZERO-LENGTH "halt" on a clean day. And with no venue quorum, a single venue's status would
+    excuse crossing for as long as it lasted -- fifteen other venues matching normally the whole
+    time. A long one would hide a real replay fault behind a rule that does not apply.
+    """
+    def _st(rows):
+        return pd.DataFrame({"f": [r[1] for r in rows], "haltreason": [r[2] for r in rows]},
+                            index=pd.DatetimeIndex([r[0] for r in rows]).tz_localize(TZ))
+
+    # the real 2024-12-18 row: one venue, one row, never cleared
+    real = mh.windows_from_status(_st([("2024-12-18 06:28:02", "memoir_ltse_depth_l3",
+                                        "RegulatoryConcern")]))
+    no_zero = not real["windows"]
+
+    # the dangerous version: one venue halted for a full hour
+    long_one = mh.windows_from_status(_st([("2024-12-18 10:00:00", "ltse", "RegulatoryConcern"),
+                                           ("2024-12-18 11:00:00", "ltse", "")]))
+    not_market = not long_one["windows"] and len(long_one["venue_only"]) == 1
+
+    # quorum met -> it IS market-wide
+    two = mh.windows_from_status(_st([("2024-12-18 10:00:00", "ltse", "RegulatoryConcern"),
+                                      ("2024-12-18 10:00:01", "arca", "MarketWideCircuitBreakerLevel1"),
+                                      ("2024-12-18 11:00:00", "ltse", ""),
+                                      ("2024-12-18 11:00:00", "arca", "")]))
+    quorum = len(two["windows"]) == 1 and not two["venue_only"]
+
+    ok = no_zero and not_market and quorum
+    print("(9) one venue is not the market:")
+    print("    the real 2024-12-18 LTSE row yields NO halt window (was a zero-length one)=%s" % no_zero)
+    print("    a venue halted for a FULL HOUR is venue_only, not market-wide=%s" % not_market)
+    print("    two venues together DO make it market-wide=%s : %s" % (quorum, ok))
+    return ok
+
+
 def main():
     checks = [check_halt_table, check_qc_passes_a_halt, check_qc_still_catches_a_fault,
               check_non_halt_date_unaffected, check_missing_leg_still_fatal,
               check_opens_into_a_halt, check_halt_derived_from_tape,
-              check_frame_attrs_override_the_table]
+              check_frame_attrs_override_the_table, check_one_venue_is_not_a_market_halt]
     res = []
     for fn in checks:
         try:
