@@ -203,8 +203,10 @@ def check_halt_derived_from_tape():
     venues = len(res["by_feed"]) >= 2
     reasons = "MarketWideCircuitBreakerLevel1" in res["reasons"]
 
-    # a short status blip is NOT a market-wide halt and must not blank a session
-    blip = pd.DataFrame({"f": ["v", "v"], "haltreason": ["LULD", ""]},
+    # a ROUTINE status row is not a halt, however long it lasts -- CME publishes GroupSchedule and
+    # MarketEvent constantly and they produced spans of 843 s, 5,914 s and 43,910 s on days ES never
+    # stopped trading. Filtering is by reason, not duration.
+    blip = pd.DataFrame({"f": ["v", "v"], "haltreason": ["GroupSchedule", ""]},
                         index=pd.to_datetime([1583760853078735515,
                                               1583760853078735515 + 5_000_000_000],
                                              utc=True).tz_convert(TZ))
@@ -216,7 +218,7 @@ def check_halt_derived_from_tape():
              b.strftime("%H:%M:%S.%f")[:-3] if one else "?", dur, len(res["by_feed"])))
     print("    matches the hardcoded table to <1s=%s; 900.0s=%s; reason captured=%s" %
           (agrees, abs(dur - 900.0) < 0.5, reasons))
-    print("    a 5-second status blip is NOT treated as a halt=%s : %s" % (ignored, ok))
+    print("    a routine GroupSchedule row is NOT treated as a halt=%s : %s" % (ignored, ok))
     return ok
 
 
@@ -252,33 +254,50 @@ def check_one_venue_is_not_a_market_halt():
     ZERO-LENGTH "halt" on a clean day. And with no venue quorum, a single venue's status would
     excuse crossing for as long as it lasted -- fifteen other venues matching normally the whole
     time. A long one would hide a real replay fault behind a rule that does not apply.
+
+    Quorum is capped at the number of venues that PUBLISH status in the frame, because CME is one
+    venue and a fixed minimum of two suppressed every real futures halt. So "one venue out of many"
+    and "the only venue there is" have to be distinguishable, and the equity fixtures below now
+    carry the other venues' rows -- which is what a real consolidated status stream looks like.
     """
     def _st(rows):
         return pd.DataFrame({"f": [r[1] for r in rows], "haltreason": [r[2] for r in rows]},
                             index=pd.DatetimeIndex([r[0] for r in rows]).tz_localize(TZ))
 
+    # the rest of the consolidated tape, publishing status and NOT halted
+    others = [("2024-12-18 09:30:00", v, "") for v in
+              ("xdp_arca_integrated", "xdp_nyse_integrated", "xdp_national_integrated", "iex_deep")]
+
     # the real 2024-12-18 row: one venue, one row, never cleared
     real = mh.windows_from_status(_st([("2024-12-18 06:28:02", "memoir_ltse_depth_l3",
-                                        "RegulatoryConcern")]))
+                                        "RegulatoryConcern")] + others))
     no_zero = not real["windows"]
 
-    # the dangerous version: one venue halted for a full hour
+    # the dangerous version: one venue of five halted for a full hour
     long_one = mh.windows_from_status(_st([("2024-12-18 10:00:00", "ltse", "RegulatoryConcern"),
-                                           ("2024-12-18 11:00:00", "ltse", "")]))
+                                           ("2024-12-18 11:00:00", "ltse", "")] + others))
     not_market = not long_one["windows"] and len(long_one["venue_only"]) == 1
 
     # quorum met -> it IS market-wide
     two = mh.windows_from_status(_st([("2024-12-18 10:00:00", "ltse", "RegulatoryConcern"),
                                       ("2024-12-18 10:00:01", "arca", "MarketWideCircuitBreakerLevel1"),
                                       ("2024-12-18 11:00:00", "ltse", ""),
-                                      ("2024-12-18 11:00:00", "arca", "")]))
+                                      ("2024-12-18 11:00:00", "arca", "")] + others))
     quorum = len(two["windows"]) == 1 and not two["venue_only"]
 
-    ok = no_zero and not_market and quorum
-    print("(9) one venue is not the market:")
+    # ...and the futures case the cap exists for: ONE venue is the whole market at CME
+    cme = mh.windows_from_status(_st([("2020-03-12 09:36:45.102", "cme_globex30_cme",
+                                       "SuspendedBySurveillance"),
+                                      ("2020-03-12 09:36:51.477", "cme_globex30_cme", "")]))
+    futures = len(cme["windows"]) == 1 and not cme["venue_only"]
+
+    ok = no_zero and not_market and quorum and futures
+    print("(9) one venue is not the market -- unless it is the only market:")
     print("    the real 2024-12-18 LTSE row yields NO halt window (was a zero-length one)=%s" % no_zero)
-    print("    a venue halted for a FULL HOUR is venue_only, not market-wide=%s" % not_market)
-    print("    two venues together DO make it market-wide=%s : %s" % (quorum, ok))
+    print("    one of five venues halted for a FULL HOUR is venue_only, not market-wide=%s" % not_market)
+    print("    two venues together DO make it market-wide=%s" % quorum)
+    print("    but a lone CME feed IS the futures market, so its 6.4 s pause is market-wide=%s : %s"
+          % (futures, ok))
     return ok
 
 

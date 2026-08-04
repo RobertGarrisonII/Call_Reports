@@ -1,5 +1,67 @@
 # Changelog
 
+## v0.9.34 -- the futures status stream, and a correction to v0.9.33
+
+The ES `mt_product_status` tables (ESZ4 2024-12-18, ESH0 2020-03-12) break three assumptions the
+halt and market-state code had absorbed from SPY. Each broke SILENTLY, producing a number rather
+than an error.
+
+**The correction first.** v0.9.33 concluded, from four SPY dates with empty band columns, that the
+absence of LULD was *"conclusively a property of the direct venue feeds."* That is true of the
+direct **equity** feeds and false as a general claim. **CME populates the price-limit columns for
+ES on every date checked** -- ESZ4 2024-12-18 carries `563025` / `647725`, i.e. 5630.25 / 6477.25
+index points after the same integer-hundredths scale the ES book uses. The futures leg has a usable
+price-band control today; the equity leg still does not.
+
+* **INT64_MAX is the "no limit this side" sentinel.** `9223372036.8547758070` is 2^63-1 scaled.
+  Parsed as a price it is finite, so nothing raised -- it turned the ES band width into
+  **1.5e+10 bps**: a plausible-looking column in a regression table that is pure sentinel. Anything
+  at or beyond 1e9 is now NaN. What it was hiding is the actual economics of the crash: on
+  2020-03-12 the ESH0 **lower** limit ratchets 2594.00 -> 2601.00 -> 2546.50 -> 2382.00 -> 2190.00
+  -> 2332.50 while the **upper** is unbounded. The contract is limit-DOWN constrained, one side
+  only, and that is now visible instead of averaged into a nonsense width.
+* **`haltreason` is a status-reason field, not a halt flag.** ESZ4 carries eighteen `GroupSchedule`
+  and nineteen `MarketEvent` rows -- routine session bookkeeping (`NoEvent`, `NoCancel`,
+  `ChangeOfTradingSessionResetStatistics`). Read as halts they produced spans of 843 s, 5,914 s,
+  43,910 s and 20,055 s on days the future never stopped trading. Halt reasons are now
+  **whitelisted**, and the direction is deliberate: a false halt EXCUSES crossing and can hide a
+  replay fault, while a missed halt merely flags a session that turns out to be fine. Unrecognized
+  values are returned in `unknown_reasons` and logged, so they get classified rather than assumed.
+* **CME is one venue.** The `min_venues=2` quorum added in v0.9.33 -- correct for a sixteen-venue
+  consolidated equity book -- suppressed **every** real futures halt, because there is no second
+  futures venue to agree. Quorum is now capped at the number of venues that publish status at all.
+* **The 30 s duration floor was discarding the events this paper is about.** CME Velocity Logic
+  pauses equity-index futures for 5-10 s by design. The floor is now 1 s; the reason whitelist, not
+  a duration threshold, does the filtering.
+
+What that recovers:
+
+    2020-03-12  SPY   09:35:44 -> 09:50:44   900.0 s   MarketWideCircuitBreakerLevel1
+    2020-03-12  ESH0  09:36:45 -> 09:36:51     6.4 s   SuspendedBySurveillance
+
+**The futures stopped matching 61 seconds into the equity circuit-breaker halt.** That is a
+cross-asset event, on a day in the volatile panel, and it was invisible three times over: the
+extractor never fetched the ES status stream, the quorum rejected it, and the duration floor
+discarded it.
+
+Also in this release:
+
+* `_extract_one_session` fetches `mt_product_status` for **both** legs and attaches
+  `{ES,SPY}_ssr`, `{ES,SPY}_luld_lower/_upper/_band_bps/_dist_*_bps/_luld_binding`. The futures
+  bands go through `price_scale` (0.01), the same scale as the ES book.
+* `df.attrs` gains `halt_windows_SPY` / `halt_windows_ES`; `halt_windows` is now their **union**.
+  `session_qc` judges each book against **its own** leg's windows and the pair against the union --
+  a CME pause must not excuse a crossed SPY top, and vice versa. An empty per-leg list is a positive
+  statement from the tape ("this leg did not halt") and no longer falls back to the built-in table.
+* The STAGE 3 root-cause loop in `run_paper_replication.sh` now runs `feed_health` on the ES
+  contract as well as SPY -- the gate fails on either leg, so diagnosing only SPY could answer the
+  wrong question.
+* `test_es_product_status.py` (7 checks) pins all of the above to the verbatim vendor rows.
+* The venue-quorum check in `test_halt_aware_qc.py` used a fixture containing one venue's rows and
+  called it "one venue out of sixteen". With quorum capped at what publishes, that fixture *is* a
+  single-venue market. It now carries the other venues' rows, which is what a real consolidated
+  status stream looks like, plus the CME case the cap exists for.
+
 ## v0.9.33 -- a clean day found a false halt, and a quorum rule the MWCB days could not have
 
 2024-12-18 is a volatile day with no circuit breaker -- exactly the control the halt code needed,

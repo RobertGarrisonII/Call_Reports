@@ -433,6 +433,15 @@ if have_stage 3 && [ "$SOURCE" != "demo" ]; then
           run_rc $PY debug_crossing.py --date "$ymd" --product SPY \
                  --clock receipt --ab-ordering --out "${OUT}/crossing_${ymd}.txt" || true
           info "  reports: ${OUT}/feed_health_${ymd}.txt, ${OUT}/crossing_${ymd}.txt"
+          # The gate fails on EITHER leg, so diagnosing only SPY can answer the wrong question.
+          # The futures leg has its own capture, its own resets and its own halts -- CME Velocity
+          # Logic pauses ES for 5-10 s on exactly these days.
+          ECON="$($PY -c "import mstbook_loader as ml;print(ml.get_front_month_contract('ES', as_of_date=ml._parse_yyyymmdd('$ymd')))" 2>/dev/null || true)"
+          if [ -n "$ECON" ]; then
+            run_rc $PY feed_health.py --date "$ymd" --product "$ECON" --product-type futures \
+                   --out "${OUT}/feed_health_${ymd}_${ECON}.txt" || true
+            info "  ES leg: ${OUT}/feed_health_${ymd}_${ECON}.txt"
+          fi
         done
       fi
       echo "" | tee -a "$LOG"

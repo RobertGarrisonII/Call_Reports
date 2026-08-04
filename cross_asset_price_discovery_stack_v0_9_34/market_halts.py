@@ -60,8 +60,29 @@ MWCB_HALTS = {
 # wrong the way a hand-entered time can.
 _HALT_NULL = ("", "nan", "<NA>", "None", "NaN", "null", "NULL", "\\N")
 
+# `haltreason` is NOT a halt flag -- it is a status-reason field, and on CME most of its values are
+# routine session bookkeeping. ESZ4 on 2024-12-18 carries eighteen `GroupSchedule` and nineteen
+# `MarketEvent` rows whose `tradingevent` is `NoEvent` / `NoCancel` /
+# `ChangeOfTradingSessionResetStatistics`; treating them as halts produced spans of 843 s, 5,914 s
+# and 43,910 s on days the future never stopped trading.
+#
+# So halts are WHITELISTED, not blacklisted, and the direction of that choice is deliberate. A false
+# halt EXCUSES crossing and can hide a replay fault; a missed halt merely flags a session that turns
+# out to be fine, which is visible and investigable. Unrecognized reasons are therefore treated as
+# NOT halts and returned in `unknown_reasons` so they can be classified rather than silently assumed.
+_HALT_TOKENS = ("circuitbreaker", "suspended", "halt", "regulatory", "limitstate", "limitup",
+                "limitdown", "pause", "reasonnotavailable")
+_SCHEDULE_TOKENS = ("groupschedule", "marketevent")
 
-def windows_from_status(df, tz: str = TZ, min_seconds: float = 30.0, min_venues: int = 2) -> dict:
+
+def _is_halt_reason(v: str) -> bool:
+    t = str(v).strip().lower().replace(" ", "").replace("_", "")
+    if not t or t in [x.lower() for x in _HALT_NULL]:
+        return False
+    return any(tok in t for tok in _HALT_TOKENS)
+
+
+def windows_from_status(df, tz: str = TZ, min_seconds: float = 1.0, min_venues: int = 2) -> dict:
     """Derive halt windows per feed from an ``mt_product_status`` frame (no I/O -- pass the frame).
 
     A halt OPENS on the first row for a feed whose ``haltreason`` is populated and CLOSES on that
@@ -69,10 +90,15 @@ def windows_from_status(df, tz: str = TZ, min_seconds: float = 30.0, min_venues:
 
     Two filters, both learned from real days:
 
-    ``min_seconds``  drops brief status churn -- a single-symbol LULD pause is not a market-wide
-                     event. It applies to an UNCLOSED span too: on 2024-12-18 `memoir_ltse_depth_l3`
-                     publishes `RegulatoryConcern` once, at 06:28:02, and never clears it, which
-                     produced a zero-length "halt" on an ordinary day.
+    ``min_seconds``  drops instantaneous status rows. It applies to an UNCLOSED span too: on
+                     2024-12-18 `memoir_ltse_depth_l3` publishes `RegulatoryConcern` once, at
+                     06:28:02, and never clears it, which produced a zero-length "halt" on an
+                     ordinary day. The floor is ONE SECOND, not thirty: CME Velocity Logic pauses
+                     equity-index futures for 5-10 s by design, and 2020-03-12 ESH0 carries a 6.38 s
+                     `SuspendedBySurveillance` at 09:36:45 -- inside the SPY circuit-breaker window,
+                     so the futures stopped matching while the equity leg was already halted. A
+                     30 s floor discarded exactly the cross-asset events this paper is about. The
+                     reason whitelist, not a duration threshold, is what filters routine churn.
 
     ``min_venues``   is the one that matters. A MARKET-WIDE halt stops every venue at once -- on
                      2020-03-09 six feeds report within 30 ms of each other. ONE venue reporting a
@@ -84,7 +110,7 @@ def windows_from_status(df, tz: str = TZ, min_seconds: float = 30.0, min_venues:
 
     -> {'windows': [(start, end)] market-wide, 'venue_only': [(feed, start, end)],
         'by_feed': {feed: [(start, end)]}, 'reasons': set}"""
-    out = {"windows": [], "venue_only": [], "by_feed": {}, "reasons": set()}
+    out = {"windows": [], "venue_only": [], "by_feed": {}, "reasons": set(), "unknown_reasons": set()}
     if df is None or len(df) == 0 or "haltreason" not in df.columns:
         return out
     idx = df.index
@@ -93,8 +119,18 @@ def windows_from_status(df, tz: str = TZ, min_seconds: float = 30.0, min_venues:
     else:
         idx = idx.tz_convert(tz)
     reason = df["haltreason"].astype(str).str.strip()
-    halted = ~reason.str.lower().isin([t.lower() for t in _HALT_NULL])
+    halted = reason.map(_is_halt_reason)
+    for v in reason.unique():                     # anything neither null, halt, nor known-routine
+        t = str(v).strip().lower().replace(" ", "").replace("_", "")
+        if t and t not in [x.lower() for x in _HALT_NULL] and not _is_halt_reason(v) \
+                and not any(tok in t for tok in _SCHEDULE_TOKENS):
+            out["unknown_reasons"].add(str(v).strip())
     feeds = df["f"].astype(str) if "f" in df.columns else pd.Series("?", index=df.index)
+    # Quorum cannot exceed the number of venues that publish status at all. CME is a SINGLE venue,
+    # so a fixed min_venues=2 would suppress every real futures halt -- including the
+    # SuspendedBySurveillance on 2020-03-12 ESH0.
+    n_venues = int(feeds.nunique())
+    min_venues = max(1, min(int(min_venues), n_venues))
 
     for feed in sorted(set(feeds)):
         m = (feeds == feed).to_numpy()

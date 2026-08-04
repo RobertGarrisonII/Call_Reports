@@ -232,3 +232,59 @@ good control day for the MWCB comparison.
 The clear types exist in the futures schema even though they are empty here, so ES now fetches them
 too: a Globex reset on a crash day would otherwise be invisible, and an empty query costs nothing
 against a 10–25 minute session.
+
+## 11. `mt_product_status` on the futures leg — three equity assumptions that do not hold
+
+The ES status stream is not a smaller version of the SPY one. Every difference below produced a
+plausible number rather than an error, which is why each needed the real rows to find.
+
+**CME publishes price limits; the equity feeds do not.** `luldlowerlimit` / `luldupperlimit` are
+empty on every row of all four SPY dates checked (2020-03-09/12/16, 2024-12-18) — the NMS bands come
+from the SIP, not the direct venue feeds. They are **populated on every ES date checked**, in the
+same integer-hundredths convention as CME prices:
+
+    ESZ4 2024-12-18   563025 / 647725      ->  5630.25 / 6477.25 index points
+
+So the futures leg has a price-band control today. Anything written about "the bands are absent" is
+a statement about the equity feeds only.
+
+**`9223372036.8547758070` is INT64_MAX, meaning "no limit this side".** It is finite when parsed, so
+it silently became a price: the ES band width came out at 1.5e+10 bps. Values at or beyond 1e9 are
+now NaN. On 2020-03-12 the sentinel sits on the **upper** limit for most of the session while the
+**lower** ratchets down through the crash — 2594.00 → 2601.00 → 2546.50 → 2382.00 → 2190.00 →
+2332.50 — i.e. the contract is limit-**down** constrained, one side only. That asymmetry is the
+economics of the day, and it was being averaged into a nonsense width.
+
+**`haltreason` is a status-reason field, not a halt flag.** On ESZ4 most of its non-null values are
+routine session bookkeeping:
+
+| value | rows | `tradingevent` |
+|---|---|---|
+| `GroupSchedule` | 18 | `NoEvent`, `NoCancel`, `ChangeOfTradingSessionResetStatistics` |
+| `MarketEvent` | 19 | `NoEvent` |
+
+Treated as halts these produced spans of 843 s, 5,914 s, 43,910 s and 20,055 s on days the future
+never stopped trading. Halt reasons are therefore **whitelisted**, not blacklisted. The asymmetry is
+deliberate: a false halt *excuses* crossing and can hide a replay fault, whereas a missed halt only
+flags a session that turns out to be fine. Unrecognized values are reported in `unknown_reasons`.
+
+**One venue is the whole market.** A market-wide equity halt stops every venue at once — on
+2020-03-09 six feeds report within 30 ms — so a venue quorum is what stops one venue's long
+regulatory status from excusing an hour of crossing on a book the other fifteen kept matching. CME
+has no second venue, so a fixed quorum of two suppressed every futures halt. Quorum now caps at the
+number of venues that publish status at all.
+
+What those last two recover, on a day already in the volatile panel:
+
+    2020-03-12  SPY   09:35:44 → 09:50:44   900.0 s   MarketWideCircuitBreakerLevel1
+    2020-03-12  ESH0  09:36:45 → 09:36:51     6.4 s   SuspendedBySurveillance
+
+A CME Velocity Logic pause, 61 s into the equity circuit-breaker halt. Velocity Logic pauses run
+5–10 s by design, so the 30 s minimum-duration filter was discarding exactly the class of
+cross-asset event this paper studies; the floor is now 1 s.
+
+Consequence for the QC: each book is judged against **its own** leg's halt windows, and the pair
+against their union. A CME pause cannot excuse a crossed SPY top — NYSE never stopped matching —
+and an equity halt cannot excuse a crossed ES top.
+
+`shortsaleindicator` is `\N` throughout on ES, as it should be: Rule 201 is an equity rule.

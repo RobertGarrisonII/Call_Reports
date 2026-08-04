@@ -892,16 +892,36 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
     -> {'ok': bool, 'reasons': [str], 'halt_snapshots': int, '<ASSET>': {'n': int, 'n_finite': int,
         'crossed_frac': float, 'crossed_frac_ex_halt': float, 'median_bid': float}}"""
     rep: dict = {"ok": True, "reasons": [], "n_rows": int(len(df))}
-    try:
-        import market_halts as mh
-        # the tape wins: df.attrs["halt_windows"] is what mt_product_status.haltreason actually said
-        wins = df.attrs.get("halt_windows") if hasattr(df, "attrs") else None
-        wins = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in wins] if wins else None
-        halt = mh.halt_mask(df.index, date=date, windows=wins) if len(df) else np.zeros(0, bool)
-    except Exception:                                    # never let the QC fail on the halt table
-        halt = np.zeros(len(df), bool)
+    attrs = df.attrs if hasattr(df, "attrs") else {}
+
+    def _mask(key):
+        """Halt mask for one leg. The tape wins: df.attrs[...] is what haltreason actually said."""
+        try:
+            import market_halts as mh
+            # ABSENT falls back to the union, and then to the built-in table -- that is the path a
+            # session takes when the status fetch failed, where a hand-entered date is better than
+            # nothing. PRESENT-but-empty is a positive statement from the tape, "this leg did not
+            # halt", and must stay empty: otherwise a pause on the other leg, or a date in the MWCB
+            # table, would excuse this book's crossing.
+            if key in attrs:
+                wins = attrs[key]
+                if not wins:
+                    return np.zeros(len(df), bool)
+            else:
+                wins = attrs.get("halt_windows")
+            wins = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in wins] if wins else None
+            return mh.halt_mask(df.index, date=date, windows=wins) if len(df) else np.zeros(0, bool)
+        except Exception:                                # never let the QC fail on the halt table
+            return np.zeros(len(df), bool)
+
+    # Each book is judged against ITS OWN halt, not the union. SPY crossing during a CME Velocity
+    # Logic pause is still a replay fault -- NYSE never stopped matching -- and vice versa. The
+    # union (df.attrs["halt_windows"]) is for pair estimates, which need both legs live.
+    halt = _mask("halt_windows")
     rep["halt_snapshots"] = int(halt.sum())
     for a in assets:
+        halt = _mask(f"halt_windows_{a}")
+        n_halt = int(halt.sum())
         bid = pd.to_numeric(df.get(f"{a}_bidprice_1", pd.Series(dtype=float)), errors="coerce").to_numpy(float)
         ask = pd.to_numeric(df.get(f"{a}_askprice_1", pd.Series(dtype=float)), errors="coerce").to_numpy(float)
         both = np.isfinite(bid) & np.isfinite(ask) if bid.size and ask.size else np.zeros(0, bool)
@@ -913,6 +933,7 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
         frac_ex = float(crossed[open_mkt].mean()) if n_open else float("nan")
         rep[a] = {"n": int(len(df)), "n_finite": n_fin,
                   "crossed_frac": frac, "crossed_frac_ex_halt": frac_ex, "n_open": n_open,
+                  "halt_snapshots": n_halt,
                   "median_bid": float(np.nanmedian(bid)) if bid.size and np.isfinite(bid).any() else float("nan")}
         if n_fin == 0:
             rep["ok"] = False
@@ -920,14 +941,14 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
                                   f"finite bid AND ask) -- the leg is missing, not thin")
         elif np.isfinite(frac_ex) and frac_ex > crossed_tol:
             rep["ok"] = False
-            extra = (f" ({frac:.1%} including the {rep['halt_snapshots']} halt snapshot(s), which "
-                     f"are expected to cross)" if rep["halt_snapshots"] else "")
+            extra = (f" ({frac:.1%} including the {n_halt} halt snapshot(s), which "
+                     f"are expected to cross)" if n_halt else "")
             rep["reasons"].append(f"{a}: top is CROSSED on {frac_ex:.1%} of {n_open} snapshots "
                                   f"OUTSIDE any halt{extra} (tolerance {crossed_tol:.1%}) -- the "
                                   f"replay is dropping removals or inventing levels")
-        elif rep["halt_snapshots"] and np.isfinite(frac) and frac > crossed_tol:
+        elif n_halt and np.isfinite(frac) and frac > crossed_tol:
             rep["reasons"].append(f"{a}: {frac:.1%} crossed overall but only {frac_ex:.2%} outside "
-                                  f"the {rep['halt_snapshots']}-snapshot MWCB halt -- the crossing "
+                                  f"the {n_halt}-snapshot halt on this leg -- the crossing "
                                   f"IS the halt (matching stops, resting orders do not), so the "
                                   f"book is correct. Exclude halt snapshots from any estimate: a "
                                   f"halted market has no valid midpoint")
@@ -1005,34 +1026,67 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
     # The halt window comes from the TAPE (mt_product_status.haltreason), not from a table of four
     # dates I typed in. A halted market has no valid midpoint and its book is legitimately crossed,
     # so every consumer needs the boundary -- and needs it right. One tiny query per session.
-    try:
-        st = _fetch_messages(ymd, "SPY", "direct", "mt_product_status", cfg["data_source"],
-                             tz=cfg["tz"], clock=cfg["clock"])
-        import market_halts as _mh
-        hres = _mh.windows_from_status(st, tz=cfg["tz"])
-        if hres["windows"]:
-            df.attrs["halt_windows"] = [(a.isoformat(), b.isoformat()) for a, b in hres["windows"]]
-            df.attrs["halt_reasons"] = sorted(hres["reasons"])
-            log.info("%s: %d halt window(s) from the tape: %s (%s)", label, len(hres["windows"]),
-                     ", ".join("%s-%s" % (a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S"))
-                               for a, b in hres["windows"]), ", ".join(sorted(hres["reasons"])))
-        # The same stream carries the two REGULATORY CONSTRAINTS on quoting: the LULD price band and
-        # Rule 201 (SSR). Both bound what a quote is allowed to be, so a response measured near one
-        # is a rule, not price discovery -- and SSR is one-sided, which is a direct confound for the
-        # signed-order-flow tables. They ride along as session columns; see market_state.py.
-        import market_state as _ms
-        df = _ms.attach_market_state(df, st, asset="SPY", tz=cfg["tz"])
-        df.attrs["market_state_coverage"] = _ms.coverage(st)
-        _sum = _ms.summarize(df, asset="SPY")
-        df.attrs["market_state"] = _sum
-        if _sum.get("ssr_any"):
-            log.warning("%s: Rule 201 SHORT SALE RESTRICTION in effect on %.0f%% of the session -- "
-                        "sell-side flow is mechanically constrained (short sales cannot execute or "
-                        "display at or below the NBB), which is a confound for Tables 5 and 7",
-                        label, 100 * _sum.get("ssr_frac_on", 0.0))
-    except Exception as exc:                      # never fail a session over the status stream
-        log.warning("%s: could not read mt_product_status (%s); halt windows fall back to the "
-                    "built-in table", label, str(exc).splitlines()[0][:160])
+    #
+    # BOTH legs, not just SPY. The two markets stop for different reasons and at different times:
+    # 2020-03-12 has a 900 s MWCB Level 1 halt on SPY at 09:35:44 and a 6.4 s
+    # SuspendedBySurveillance on ESH0 at 09:36:45 -- a CME Velocity Logic pause that fires INSIDE the
+    # equity halt. Fetching only the equity stream made the futures pause invisible, and it is
+    # exactly the kind of cross-asset event this paper is about. It also cost the ES price limits
+    # (below), which CME does publish.
+    for _asset, _prod, _ptype, _scale in (("SPY", "SPY", "direct", 1.0),
+                                          ("ES", contract, "futures", cfg["futures_scale"])):
+        try:
+            st = _fetch_messages(ymd, _prod, _ptype, "mt_product_status", cfg["data_source"],
+                                 tz=cfg["tz"], clock=cfg["clock"])
+            import market_halts as _mh
+            hres = _mh.windows_from_status(st, tz=cfg["tz"])
+            # set unconditionally: an EMPTY list is the positive statement "this leg did not halt",
+            # which is what stops the other leg's pause from excusing this book (see session_qc).
+            df.attrs[f"halt_windows_{_asset}"] = [(a.isoformat(), b.isoformat())
+                                                  for a, b in hres["windows"]]
+            df.attrs[f"halt_reasons_{_asset}"] = sorted(hres["reasons"])
+            if hres["windows"]:
+                log.info("%s: %s: %d halt window(s) from the tape: %s (%s)", label, _asset,
+                         len(hres["windows"]),
+                         ", ".join("%s-%s" % (a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S"))
+                                   for a, b in hres["windows"]), ", ".join(sorted(hres["reasons"])))
+            if hres["unknown_reasons"]:
+                # halts are whitelisted, so an unrecognized reason is deliberately NOT a halt --
+                # surfaced here to be classified rather than silently assumed either way.
+                log.warning("%s: %s: unclassified haltreason value(s) %s -- treated as NOT a halt; "
+                            "add to market_halts._HALT_TOKENS if any is one", label, _asset,
+                            ", ".join(sorted(hres["unknown_reasons"])[:6]))
+            # The same stream carries the two REGULATORY CONSTRAINTS on quoting: the LULD/price band
+            # and Rule 201 (SSR). Both bound what a quote is allowed to be, so a response measured
+            # near one is a rule, not price discovery -- and SSR is one-sided, which is a direct
+            # confound for the signed-order-flow tables. Session columns; see market_state.py.
+            # price_scale: CME publishes ES limits in integer hundredths (563025 = 5630.25), the
+            # same convention as its prices, so the futures leg needs the same scale as its book.
+            import market_state as _ms
+            df = _ms.attach_market_state(df, st, asset=_asset, tz=cfg["tz"], price_scale=_scale)
+            df.attrs[f"market_state_coverage_{_asset}"] = _ms.coverage(st)
+            _sum = _ms.summarize(df, asset=_asset)
+            df.attrs[f"market_state_{_asset}"] = _sum
+            if _asset == "SPY":                   # back-compat for readers written before the ES leg
+                df.attrs["market_state_coverage"] = df.attrs["market_state_coverage_SPY"]
+                df.attrs["market_state"] = _sum
+            if _sum.get("ssr_any"):
+                log.warning("%s: Rule 201 SHORT SALE RESTRICTION in effect on %.0f%% of the session "
+                            "-- sell-side flow is mechanically constrained (short sales cannot "
+                            "execute or display at or below the NBB), which is a confound for "
+                            "Tables 5 and 7", label, 100 * _sum.get("ssr_frac_on", 0.0))
+        except Exception as exc:                  # never fail a session over the status stream
+            log.warning("%s: %s: could not read mt_product_status (%s); halt windows fall back to "
+                        "the built-in table", label, _asset, str(exc).splitlines()[0][:160])
+    # `halt_windows` (unsuffixed) is the UNION across legs: a pair estimate needs BOTH legs matching,
+    # so either one halted means the cross-asset relationship is undefined for those snapshots. The
+    # per-asset lists stay separate because the crossed-book invariant is per book -- excusing a
+    # crossed SPY top with a CME pause would hide a real replay fault.
+    _union = sorted([tuple(w) for a in ("SPY", "ES") for w in df.attrs.get(f"halt_windows_{a}", [])])
+    if _union:
+        df.attrs["halt_windows"] = _union
+        df.attrs["halt_reasons"] = sorted(set(df.attrs.get("halt_reasons_SPY", []))
+                                          | set(df.attrs.get("halt_reasons_ES", [])))
     df.attrs["es_contract"] = contract
     qc = session_qc(df, crossed_tol=float(cfg.get("crossed_tol", 0.005)))
     df.attrs["qc"] = qc

@@ -24,14 +24,22 @@ Coverage, measured rather than assumed
 --------------------------------------
 On the 2020-03-09 SPY status stream the `shortsaleindicator` field IS populated on every venue row
 (`ShortSaleRestrictionNotInEffect` throughout), while `luldlowerlimit` / `luldupperlimit` /
-`limituplimitdownindicator` are **empty on every row**. The band fields exist in the schema but the
-direct venue feeds do not carry them for that date -- the LULD bands are disseminated by the SIP
-(CTA/UTP) rather than by the individual exchange feeds. So:
+`limituplimitdownindicator` are **empty on every row**. Same on 2020-03-12, 2020-03-16 and
+2024-12-18. The band fields exist in the schema but the direct EQUITY venue feeds do not carry them
+-- the NMS bands are disseminated by the SIP (CTA/UTP) rather than by the individual exchange feeds.
 
-  * SSR is usable today, from the data you already fetch.
-  * LULD is wired end to end and will populate itself the moment a source carries it, and
-    ``coverage()`` reports the fraction of rows that actually had a band so nobody mistakes an
-    all-NaN column for "the bands were never near".
+That is a property of those feeds, NOT of the schema, and the futures leg proves it. CME populates
+the same two columns for ES on every date checked: ESZ4 on 2024-12-18 carries 563025 / 647725
+(= 5630.25 / 6477.25 index points after the standard integer-hundredths scale), and ESH0 on
+2020-03-12 shows the limit-down mechanism working in real time -- the LOWER limit ratchets
+2594.00 -> 2601.00 -> 2546.50 -> 2382.00 -> 2190.00 through the crash while the UPPER goes to the
+"no limit" sentinel. So:
+
+  * SSR is usable today on the equity leg, from the data you already fetch.
+  * Price bands are usable today on the FUTURES leg.
+  * LULD on the equity leg is wired end to end and will populate itself the moment a source carries
+    it, and ``coverage()`` reports the fraction of rows that actually had a band so nobody mistakes
+    an all-NaN column for "the bands were never near".
 
 That distinction is the point of ``coverage``: a control that is silently all-NaN is worse than no
 control, because the regression still runs.
@@ -53,6 +61,13 @@ _NULL = ("", "nan", "<NA>", "None", "NaN", "null", "NULL", "\\N")
 # 'Activated' is IEX's spelling -- on 2020-03-16 iex_deep publishes it at 09:30:00.057 while the
 # other twelve venues say ShortSaleRestrictionInEffect within the same 1.1 seconds. Unmapped it
 # returned NaN, i.e. one venue's view of a market-wide restriction silently became "unknown".
+# CME publishes INT64_MAX (scaled) to mean "no limit on this side". On 2020-03-12 ESH0 the upper
+# limit is that sentinel from 09:25 onward while the LOWER ratchets down 2546.50 -> 2382.00 ->
+# 2190.00: the market is limit-down constrained on one side only. Parsed as a number it is
+# 9,223,372,036.85, which turns the band width into 1.5e10 bps -- finite, plausible-looking in a
+# regression table, and catastrophically wrong. Anything at or beyond this magnitude is unbounded.
+_UNBOUNDED = 1e9
+
 _SSR_ON = ("shortsalerestrictionineffect", "ineffect", "activated", "true", "y", "yes", "1")
 _SSR_OFF = ("shortsalerestrictionnotineffect", "notineffect", "deactivated", "false", "n", "no", "0")
 
@@ -103,8 +118,9 @@ def state_series(status: pd.DataFrame, tz: str = TZ, latch_ssr: bool = True) -> 
     out["ssr"] = ([_ssr_flag(v) for v in _clean(status["shortsaleindicator"])]
                   if "shortsaleindicator" in status.columns else np.nan)
     for src, dst in (("luldlowerlimit", "luld_lower"), ("luldupperlimit", "luld_upper")):
-        out[dst] = (pd.to_numeric(_clean(status[src]), errors="coerce").to_numpy(float)
-                    if src in status.columns else np.nan)
+        v = (pd.to_numeric(_clean(status[src]), errors="coerce").to_numpy(float)
+             if src in status.columns else np.full(len(out), np.nan))
+        out[dst] = np.where(np.abs(v) >= _UNBOUNDED, np.nan, v)      # sentinel -> no limit that side
     out["luld_indicator"] = (_clean(status["limituplimitdownindicator"]).to_numpy()
                              if "limituplimitdownindicator" in status.columns else np.nan)
     out = out.sort_index()
@@ -137,7 +153,7 @@ def coverage(status: pd.DataFrame) -> dict:
 
 
 def attach_market_state(df: pd.DataFrame, status: pd.DataFrame, asset: str = "SPY",
-                        tz: str = TZ) -> pd.DataFrame:
+                        tz: str = TZ, price_scale: float = 1.0) -> pd.DataFrame:
     """Add the regulatory-state columns to a session frame, as-of aligned onto its grid.
 
     Columns added (all prefixed with ``asset``):
@@ -150,6 +166,10 @@ def attach_market_state(df: pd.DataFrame, status: pd.DataFrame, asset: str = "SP
       {A}_dist_lower_bps      (mid - lower) / mid in bps
       {A}_luld_binding        1 where the best ask is at/above the upper band or the best bid at/below
                               the lower band, i.e. the constraint is actually touching the book
+
+    ``price_scale`` multiplies the band prices, exactly as it does for the book. CME publishes ES
+    limits in integer hundredths (563025 = 5630.25), so a futures leg needs 0.01 or every derived
+    bps figure is off by two orders of magnitude.
 
     A step function, forward-filled: the state holds until the venue changes it. No look-ahead."""
     if df is None or len(df) == 0:
@@ -180,8 +200,8 @@ def attach_market_state(df: pd.DataFrame, status: pd.DataFrame, asset: str = "SP
 
     out = df.copy()
     out[f"{asset}_ssr"] = pd.to_numeric(al["ssr"], errors="coerce").to_numpy(float)
-    lo = pd.to_numeric(al["luld_lower"], errors="coerce").to_numpy(float)
-    hi = pd.to_numeric(al["luld_upper"], errors="coerce").to_numpy(float)
+    lo = pd.to_numeric(al["luld_lower"], errors="coerce").to_numpy(float) * price_scale
+    hi = pd.to_numeric(al["luld_upper"], errors="coerce").to_numpy(float) * price_scale
     out[f"{asset}_luld_lower"] = lo
     out[f"{asset}_luld_upper"] = hi
     out[f"{asset}_luld_indicator"] = al["luld_indicator"].to_numpy()
@@ -236,8 +256,10 @@ def describe(rep: dict, asset: str = "SPY") -> str:
                          "for any signed-order-flow result (Tables 5 and 7).")
     if not rep.get("luld_known"):
         lines.append(f"{asset} LULD bands: NOT REPORTED by this source (the fields exist in "
-                     f"mt_product_status but the direct venue feeds leave them empty; the bands come "
-                     f"from the SIP). Columns are present and all-NaN -- do NOT use them as a control "
+                     f"mt_product_status but the direct EQUITY venue feeds leave them empty; the NMS "
+                     f"bands are disseminated by the SIP. CME DOES publish price limits for the "
+                     f"futures leg, so an all-NaN band here is a property of this feed, not of the "
+                     f"schema). Columns are present and all-NaN -- do NOT use them as a control "
                      f"until a source populates them.")
     else:
         lines.append("%s LULD bands: known on %.0f%% of rows, median width %.0f bps, closest "
