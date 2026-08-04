@@ -1016,6 +1016,8 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                                  message_types=("mt_add_order", "mt_cancel_order", "mt_modify_order",
                                                 "mt_trade", "mt_clear_orders", "mt_clear_price_levels"))
     df = spy.join(es, how="outer").sort_index()
+    # when each leg actually traded -- the resume signal for a CME halt window (see market_halts)
+    _activity = {"SPY": spy.attrs.get("activity_seconds"), "ES": es.attrs.get("activity_seconds")}
     if cfg["with_flow"]:
         if progress_cb is not None:
             progress_cb(f"{label} trade flow")
@@ -1039,12 +1041,22 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
             st = _fetch_messages(ymd, _prod, _ptype, "mt_product_status", cfg["data_source"],
                                  tz=cfg["tz"], clock=cfg["clock"])
             import market_halts as _mh
-            hres = _mh.windows_from_status(st, tz=cfg["tz"])
+            hres = _mh.windows_from_status(st, tz=cfg["tz"], activity=_activity.get(_asset))
+            for _e in hres["extended"]:
+                log.info("%s: %s: halt window extended %.1f s past the status flag's clear, to "
+                         "the resumption of trading at %s (pre-halt median inter-trade gap %.3f s, "
+                         "so a silence that long is not ordinary: ratio %.0f). The CME flag marks "
+                         "the STOP, not the duration.", label, _asset, _e["extra_seconds"],
+                         _e["resume"].strftime("%H:%M:%S.%f")[:-3], _e["pre_halt_median_gap_s"],
+                         _e["quiet_ratio"])
             # set unconditionally: an EMPTY list is the positive statement "this leg did not halt",
             # which is what stops the other leg's pause from excusing this book (see session_qc).
             df.attrs[f"halt_windows_{_asset}"] = [(a.isoformat(), b.isoformat())
                                                   for a, b in hres["windows"]]
             df.attrs[f"halt_reasons_{_asset}"] = sorted(hres["reasons"])
+            # the UNextended spans, so the flag's own claim is never lost behind the correction
+            df.attrs[f"halt_flag_windows_{_asset}"] = [(a.isoformat(), b.isoformat())
+                                                       for a, b in hres["flag_windows"]]
             if hres["windows"]:
                 log.info("%s: %s: %d halt window(s) from the tape: %s (%s)", label, _asset,
                          len(hres["windows"]),

@@ -1,5 +1,75 @@
 # Changelog
 
+## v0.9.37 -- the CME halt flag marks the STOP, not the duration (correcting v0.9.36)
+
+`ESM0_Product_Statistics_20200318` carries the cumulative `volume` counter across 976,175 rows, so
+the instants at which ES actually traded can be read directly. They contradict v0.9.36.
+
+**The correction.** v0.9.36 reported the ES halts as 5-7 second Velocity Logic pauses nested inside
+the equity halt, and explained them as flow concentrating into the futures once equities stopped.
+Both halves are wrong. Measured against the tape on 2020-03-18:
+
+    last trade before the stop   12:57:39.713
+    haltreason SET               12:57:39.716    <- 3 ms later: the ONSET is exact
+    haltreason CLEARED           12:57:45.549    <- 5.83 s: reads as a brief pause
+    first trade after the stop   13:11:17.008    <- 817.3 s with ZERO contracts traded
+
+Zero contracts for 13.6 minutes, then 1,221 in the first print. The flag is a transient
+**notification**: it marks the stop to the millisecond and says nothing about the resume. Reading
+the clear as a resume understated that halt by **140x**. And the mechanism is the opposite of what
+was claimed -- ES volume did not concentrate, it **collapsed 96%** (111.6 contracts/s before the
+equity halt, 4.4/s during, 144.7/s after). CME halts equity-index futures in coordination with the
+primary market, as its rules require; the +54 to +89 s across the three days is that relay.
+
+These are not "rough" versus "precise" readings. Flag-only says the futures traded through almost
+the entire equity halt; the tape says they were down for all but the first 89 seconds of it. They
+support opposite claims about which market leads.
+
+**What the correction reveals.** The object is not a 15-minute divergence but a short, bounded one:
+
+    12:56:11              SPY MWCB Level 1 halt begins
+    12:56:11-12:57:39.7   ES trades on -- 3,927 contracts in 88.7 s, the ONLY price venue
+    12:57:39.7            ES halts
+    13:11:11 / 13:11:17   SPY reopens; ES follows 6.0 s later
+
+Eighty-eight seconds of solitude, bounded at both ends, on a day already in the volatile panel.
+
+**The fix.** `windows_from_status(..., activity=...)` takes the instants at which the product traded
+and ends each window at the first trade after the onset instead of at the flag's clear.
+`reconstruct_session` now records those instants for free (second resolution) from the `mt_trade`
+frame it already fetches, in `attrs["activity_seconds"]`, and `_extract_one_session` passes them per
+leg. The unextended spans are kept in `flag_windows` and `attrs["halt_flag_windows_{ASSET}"]`, and
+every extension carries a `quiet_ratio` -- the extension over the pre-halt median inter-trade gap --
+because extending to the next trade is only sound where trading was dense enough that a long silence
+cannot be ordinary. On 2020-03-18 that gap is 2 ms against 811 s of silence.
+
+The equity feeds do NOT need this: their MWCB spans clear at exactly 900.0 s, matching the published
+durations. Hence a parameter rather than a change of rule, and the equity windows move by under a
+second when it is supplied.
+
+Also from this file:
+
+* `mt_product_statistics` is **not** small -- 424 MB for one contract-day, against the "handful of
+  rows" `probe_es_2020.py` assumed last release. Both front-month discriminators are in the FIRST
+  rows (`volume` is cumulative and the pre-open rows carry the previous session's closing total;
+  `openinterest` is a level), so the roll query is now capped at `--limit 40`.
+* `bidprice` / `askprice` / `volumeweightedaverageprice` / `lasttradevolume` are **empty** in this
+  stream, so it is not a top-of-book fallback for the 2020 ES leg.
+* ESM0 on 2020-03-18: Globex volume 3,135,041, RTH volume 2,605,122, open interest 2,156,542 ->
+  2,955,942. Consistent with ESM0 being the front month, which is what `rollover_days=8` picks --
+  but ESH0's figure for the same day is still needed to put beside it.
+* Sorted by `sequencenumber` the cumulative counter is monotone with exactly one step down (the
+  18:00 session reset). Sorted by receipt time **with a stable sort** it is also monotone; an
+  unstable sort scrambles the many exact timestamp ties and manufactures thousands of spurious
+  inversions. Worth recording because the replay's ordering depends on `kind="stable"` -- which it
+  already uses, in both the presort and the final clock sort.
+
+`test_es_product_status.py` grows to 14 checks: (13) pins the 140x understatement, the preserved
+`flag_windows`, the `quiet_ratio` evidence and the equity leg being left alone; (14) pins the 88.7 s
+sole-venue window and the fact that the corrected ES window now OUTLASTS the equity one rather than
+nesting inside it. Check (10) was reworded -- it is about the halt ONSET, and the durations it prints
+are flag spans.
+
 ## v0.9.36 -- the roll file: a channel-level sequence, a group-level halt, and a result
 
 `mt_product_status` for BOTH contracts (ESH0 and ESM0) on 2020-03-16 and 2020-03-18. Three findings,

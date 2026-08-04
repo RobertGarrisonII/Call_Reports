@@ -86,7 +86,8 @@ def _is_halt_reason(v: str) -> bool:
     return any(tok in t for tok in _HALT_TOKENS)
 
 
-def windows_from_status(df, tz: str = TZ, min_seconds: float = 1.0, min_venues: int = 2) -> dict:
+def windows_from_status(df, tz: str = TZ, min_seconds: float = 1.0, min_venues: int = 2,
+                        activity=None) -> dict:
     """Derive halt windows per feed from an ``mt_product_status`` frame (no I/O -- pass the frame).
 
     A halt OPENS on the first row for a feed whose ``haltreason`` is populated and CLOSES on that
@@ -97,12 +98,11 @@ def windows_from_status(df, tz: str = TZ, min_seconds: float = 1.0, min_venues: 
     ``min_seconds``  drops instantaneous status rows. It applies to an UNCLOSED span too: on
                      2024-12-18 `memoir_ltse_depth_l3` publishes `RegulatoryConcern` once, at
                      06:28:02, and never clears it, which produced a zero-length "halt" on an
-                     ordinary day. The floor is ONE SECOND, not thirty: CME Velocity Logic pauses
-                     equity-index futures for 5-10 s by design, and 2020-03-12 ESH0 carries a 6.38 s
-                     `SuspendedBySurveillance` at 09:36:45 -- inside the SPY circuit-breaker window,
-                     so the futures stopped matching while the equity leg was already halted. A
-                     30 s floor discarded exactly the cross-asset events this paper is about. The
-                     reason whitelist, not a duration threshold, is what filters routine churn.
+                     ordinary day. The floor is ONE SECOND, not thirty: the CME status flag is set
+                     for only 5-10 s even when the market is down for a quarter of an hour (see
+                     ``activity``), so a 30 s floor discarded exactly the cross-asset events this
+                     paper is about. The reason whitelist, not a duration threshold, is what filters
+                     routine churn.
 
     ``min_venues``   is the one that matters. A MARKET-WIDE halt stops every venue at once -- on
                      2020-03-09 six feeds report within 30 ms of each other. ONE venue reporting a
@@ -112,9 +112,36 @@ def windows_from_status(df, tz: str = TZ, min_seconds: float = 1.0, min_venues: 
                      hour. Spans that miss quorum are returned under ``venue_only`` rather than
                      discarded, so nothing disappears silently.
 
+    ``activity``     timestamps at which the product actually TRADED (see
+                     ``lob_reconstruct.reconstruct_session``, which records them for free from the
+                     tape it already fetched). Pass it and the window END is taken from the resumption
+                     of trading rather than from the status flag clearing.
+
+                     **This is not a refinement; without it the CME windows are wrong by two orders
+                     of magnitude.** On 2020-03-18 ESM0:
+
+                         last trade before the stop   12:57:39.713
+                         haltreason SET               12:57:39.716   <- 3 ms later: the ONSET is exact
+                         haltreason CLEARED           12:57:45.549   <- 5.83 s: reads as a brief pause
+                         first trade after the stop   13:11:17.008   <- 817.3 s of no trading at all
+
+                     Zero contracts for 13.6 minutes, then 1,221 in the first print. The flag is a
+                     transient NOTIFICATION, not a duration: it marks the stop to the millisecond and
+                     says nothing about the resume. Trusting the clear excluded 6 s of a session
+                     where 817 s of the futures leg had no market -- 811 snapshots of a stale book
+                     entering every pair estimate as though it were live.
+
+                     The equity feeds do not have this problem: their MWCB spans clear at exactly
+                     900.0 s, matching the published halt durations, so the flag there IS the
+                     duration. Hence a parameter rather than a global change of rule.
+
     -> {'windows': [(start, end)] market-wide, 'venue_only': [(feed, start, end)],
-        'by_feed': {feed: [(start, end)]}, 'reasons': set}"""
-    out = {"windows": [], "venue_only": [], "by_feed": {}, "reasons": set(), "unknown_reasons": set()}
+        'by_feed': {feed: [(start, end)]}, 'reasons': set, 'flag_windows': [(start, end)],
+        'extended': [{'flag_end', 'resume', 'extra_seconds', 'quiet_ratio'}]}
+
+    ``flag_windows`` always holds the unextended spans, so nothing is lost by passing ``activity``."""
+    out = {"windows": [], "venue_only": [], "by_feed": {}, "reasons": set(), "unknown_reasons": set(),
+           "flag_windows": [], "extended": []}
     if df is None or len(df) == 0 or "haltreason" not in df.columns:
         return out
     idx = df.index
@@ -170,33 +197,83 @@ def windows_from_status(df, tz: str = TZ, min_seconds: float = 1.0, min_venues: 
             out["windows"].append((a, b))
         else:
             out["venue_only"].append((sorted(feeds)[0], a, b))
+    out["flag_windows"] = list(out["windows"])
+    if activity is not None and len(out["windows"]):
+        out["windows"] = _extend_to_resume(out["windows"], activity, tz, out["extended"])
+    return out
+
+
+def _extend_to_resume(windows, activity, tz, log_into: list) -> list:
+    """Replace each window's end with the first trade after its start (see ``activity`` above).
+
+    ``quiet_ratio`` is the extension divided by the MEDIAN inter-trade gap in the ten minutes before
+    the halt. It is the honesty check: extending to the next trade is only sound where trading was
+    dense enough that a long silence cannot be ordinary. On 2020-03-18 ESM0 the pre-halt median gap
+    is a fraction of a second against an 817 s extension, so the ratio is enormous and the inference
+    is safe. On a thin product it would be small, the extension would be indistinguishable from a
+    quiet spell, and the number says so rather than hiding it."""
+    act = pd.DatetimeIndex(pd.to_datetime(activity))
+    act = act.tz_localize(tz) if act.tz is None else act.tz_convert(tz)
+    act = act.sort_values()
+    if not len(act):
+        return list(windows)
+    vals = act.values
+    out = []
+    for a, b in windows:
+        nxt = np.searchsorted(vals, np.datetime64(a.tz_convert("UTC").tz_localize(None)), side="right")
+        if nxt >= len(vals):                       # halted into the close: nothing resumes it
+            out.append((a, b))
+            continue
+        resume = act[nxt]
+        if resume <= b:                            # the flag already covered it (the equity case)
+            out.append((a, b))
+            continue
+        pre = act[(act >= a - pd.Timedelta(minutes=10)) & (act < a)]
+        gaps = np.diff(pre.values).astype("timedelta64[ns]").astype(float) / 1e9 if len(pre) > 1 else []
+        med = float(np.median(gaps)) if len(gaps) else float("nan")
+        extra = (resume - b).total_seconds()
+        log_into.append({"flag_end": b, "resume": resume, "extra_seconds": extra,
+                         "pre_halt_median_gap_s": med,
+                         "quiet_ratio": (extra / med) if med and np.isfinite(med) and med > 0 else float("inf")})
+        out.append((a, resume))
     return out
 
 
 def cross_asset_summary(spy_windows, es_windows, tz: str = TZ) -> dict:
     """Line the two legs' halt windows up against each other. This is a RESULT, not a diagnostic.
 
-    On every March-2020 circuit-breaker day for which both status streams are available, CME's
-    Velocity Logic paused the ES group **inside** the equity halt, roughly a minute in:
+    The futures do not keep trading through an equity circuit breaker. They halt too, about a minute
+    later, and the two markets reopen together. On 2020-03-18, measured against ESM0's own trade
+    tape:
 
-        date        SPY MWCB Level 1      ES pause                 dur    lag into the halt
-        2020-03-12  09:35:44-09:50:44     09:36:45.10-09:36:51.48  6.38s  +61.1s
-        2020-03-16  09:30:01-09:45:01     09:30:54.97-09:31:02.25  7.27s  +54.0s
-        2020-03-18  12:56:11-13:11:11     12:57:39.72-12:57:45.55  5.83s  +88.7s
+        12:56:11        SPY MWCB Level 1 halt begins
+        12:56:11-12:57:39.7   ES trades ON, 3,927 contracts in 88.7 s -- the ONLY price venue
+        12:57:39.713    ES last trade
+        12:57:39.716    ES haltreason set (3 ms later: the onset is exact)
+        12:57:45.549    ES haltreason CLEARS -- but nothing trades
+        13:11:11        SPY reopens
+        13:11:17.008    ES first trade, 1,221 contracts (+6.0 s)
 
-    Three days, three pauses, all 54-89 s in. The mechanism is not mysterious: when the equity
-    market stops matching, the futures are the only venue left with a live price, order flow
-    concentrates there, and the resulting velocity trips CME's own throttle about a minute later.
-    That is a cross-asset propagation channel with a measurable lag, on exactly the sessions this
-    paper is about, and it is not the same event as the equity halt.
+    So the interesting object is **the 88.7 seconds of solitude**, not a 15-minute divergence: a
+    short, sharp window in which the futures are the sole price-discovery venue, bounded at both
+    ends. CME halts equity-index futures in coordination with the primary market, as its rules
+    require; the ~1 minute is the relay, and the consistent +54 to +89 s across 2020-03-12, 03-16
+    and 03-18 is that relay, not a volatility threshold being crossed.
+
+    Getting this right REQUIRES passing ``activity`` to :func:`windows_from_status`. Read off the
+    status flag alone, 2020-03-18 looks like a 5.83 s pause inside a 900 s equity halt -- the futures
+    apparently trading through almost all of it. The tape says they were down for 817.3 s. The two
+    readings support opposite claims about which market leads, so the flag-only version is not a
+    rough answer, it is the wrong one.
 
     Two consequences:
 
       * For estimation, the union of the two windows is what has to be excluded -- a pair estimate
-        needs BOTH legs matching, and during the ES pause neither leg has a tradeable midpoint.
+        needs BOTH legs matching, and during the ES stop neither leg has a tradeable midpoint.
         `_extract_one_session` stores the union in ``df.attrs["halt_windows"]`` for exactly this.
-      * For the event study, the ES pause is its own onset, nested inside the equity one. Treating
-        the equity reopening as the only event on these days misses a second, faster one.
+      * For the event study, the ES halt is its own onset nested inside the equity one, and the
+        88.7 s before it is the sole-venue window. Treating the equity reopening as the only event
+        on these days misses both.
 
     ``lag_s`` is measured from the START of the containing equity window, so it is directly
     comparable across days with different halt times.

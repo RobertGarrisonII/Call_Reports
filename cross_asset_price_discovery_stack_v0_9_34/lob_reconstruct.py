@@ -749,11 +749,25 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
                              "them" if len(critical) > 1 else "it",
                              "; ".join(f"{k}: {v}" for k, v in sorted(failed.items()))))
     counts = {mt: int(len(f)) for mt, f in msgs.items()}
+    # When the product actually TRADED. Free -- the tape is already in memory -- and it is the only
+    # reliable end for a CME halt window: the status flag marks the stop to the millisecond and then
+    # clears 6 s later while the market stays down for a quarter of an hour (market_halts.activity).
+    # Kept at second resolution so a crash-day tape costs tens of thousands of entries, not millions.
+    trades = msgs.get("mt_trade")
+    act = []
+    if trades is not None and len(trades):
+        try:
+            ti = trades.index
+            ti = pd.DatetimeIndex(ti).tz_localize(tz) if getattr(ti, "tz", None) is None else ti
+            act = pd.DatetimeIndex(ti).floor("s").unique().sort_values()
+        except Exception:                          # activity is a bonus; never fail a replay over it
+            act = []
     out = reconstruct_book(msgs, asset=ml.canonical_root(product, product_type), levels=levels,
                            interval=interval, round_lot=round_lot, odd_lot_inclusive=odd_lot_inclusive,
                            session=session, tz=tz, date_str=date_str, clock=clock, price_scale=price_scale,
                            consume=True, rules=rules)
     out.attrs["message_counts"] = counts
+    out.attrs["activity_seconds"] = list(act)
 
     # A fetch that SUCCEEDS and returns zero rows was silently fine here, and that is how the four
     # 2020 ES sessions reached the dataset: `median ES=nan (ES/SPY=nan)` on a full-length 23,401-row

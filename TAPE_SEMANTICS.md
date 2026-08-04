@@ -311,21 +311,22 @@ one that orders the packet itself.
 (09:30:54.973158575 on 2020-03-16). The halt window therefore does not depend on getting the front
 month right — a roll ambiguity cannot silently move it.
 
-**The pause fires inside the equity halt, about a minute in.** On every MWCB day where both status
-streams exist:
+**The futures halt too, about a minute later — they do not trade through.** On every MWCB day where
+both status streams exist, the ES `haltreason` is SET 54–89 s into the equity halt:
 
-| date | SPY MWCB Level 1 | ES Velocity Logic pause | duration | lag into the halt |
-|---|---|---|---|---|
-| 2020-03-12 | 09:35:44–09:50:44 | 09:36:45.10–09:36:51.48 | 6.38 s | **+61.1 s** |
-| 2020-03-16 | 09:30:01–09:45:01 | 09:30:54.97–09:31:02.25 | 7.27 s | **+54.0 s** |
-| 2020-03-18 | 12:56:11–13:11:11 | 12:57:39.72–12:57:45.55 | 5.83 s | **+88.7 s** |
+| date | SPY MWCB Level 1 | ES halt onset | lag into the halt |
+|---|---|---|---|
+| 2020-03-12 | 09:35:44–09:50:44 | 09:36:45.10 | **+61.1 s** |
+| 2020-03-16 | 09:30:01–09:45:01 | 09:30:54.97 | **+54.0 s** |
+| 2020-03-18 | 12:56:11–13:11:11 | 12:57:39.72 | **+88.7 s** |
 
-Three days, three pauses, all 54–89 s in. The mechanism is not mysterious: when the equity market
-stops matching, the futures are the only venue left with a live price, order flow concentrates
-there, and the resulting velocity trips CME's own throttle about a minute later. That is a
-cross-asset propagation channel with a measurable lag, on exactly the sessions this paper studies,
-and it is **not the same event as the equity halt** — for the event study it is a second, faster
-onset nested inside the first. `market_halts.cross_asset_summary()` produces the table.
+CME halts equity-index futures in coordination with the primary market, as its rules require; the
+~1 minute is the relay, not a volatility threshold being crossed independently.
+
+**The flag is not the duration — see §13.** Those spans clear after 5–7 s, which reads as a brief
+pause. Measured against ESM0's own tape on 2020-03-18, the actual stop is **817.3 s**.
+
+`market_halts.cross_asset_summary()` produces the table.
 
 It also **corroborates the 2020-03-18 equity halt time**, which was the one entry in `MWCB_HALTS`
 never checked against a tape: a materially wrong 12:56:11 would not bracket a 12:57:39 futures
@@ -339,3 +340,57 @@ every 2020 date checked, and their limits differ by a constant calendar spread (
 on 03-16, 10.00 on 03-18) — real for both, decisive for neither. `rollover_days=8` puts 03-16 and
 03-18 on ESM0. Only **volume** can confirm that, which needs `mt_product_statistics` or a trade
 count, not the status stream.
+
+
+## 13. `haltreason` marks the stop, not the duration — and the 88.7 seconds it was hiding
+
+`ESM0_Product_Statistics_20200318` (976,175 rows) carries the cumulative `volume` counter, so the
+instants at which ES actually traded can be read directly. Against them, 2020-03-18:
+
+    last trade before the stop   12:57:39.713
+    haltreason SET               12:57:39.716    <- 3 ms later: the ONSET is exact
+    haltreason CLEARED           12:57:45.549    <- 5.83 s: reads as a brief pause
+    first trade after the stop   13:11:17.008    <- 817.3 s with ZERO contracts traded
+
+Zero contracts for 13.6 minutes, then 1,221 in the first print. Thirty-second buckets through the
+window show 1,277 contracts in 12:57:30–12:58:00 and then a flat run of zeros to 13:11:00.
+
+The status flag is a transient **notification**. It marks the stop to the millisecond and says
+nothing about the resume. Reading the clear as a resume understated this halt by **140×**, and the
+two readings are not "rough" versus "precise" — they support opposite claims. Flag-only says the
+futures traded through almost the entire equity halt (a 5.8 s pause inside 900 s). The tape says
+they were down for all but the first 89 seconds of it.
+
+So halt ends come from the resumption of trading. `windows_from_status(..., activity=...)` takes the
+trade instants that `reconstruct_session` now records for free from the tape it already fetches, and
+extends each window to the first trade after the onset. The unextended spans stay under
+`flag_windows`, and each extension carries a `quiet_ratio` — the extension divided by the pre-halt
+median inter-trade gap — because extending to the next trade is only sound where trading was dense
+enough that a long silence cannot be ordinary. Here that gap is 2 ms against 811 s of silence.
+
+The equity feeds do **not** need this. Their MWCB spans clear at exactly 900.0 s, matching the
+published durations, so there the flag *is* the duration. Hence a parameter rather than a new rule.
+
+**What the correction reveals.** The interesting object is not a 15-minute divergence between the
+legs but a short, sharp, bounded one:
+
+    12:56:11              SPY MWCB Level 1 halt begins
+    12:56:11–12:57:39.7   ES trades on — 3,927 contracts in 88.7 s, the ONLY price venue
+    12:57:39.7            ES halts
+    13:11:11 / 13:11:17   SPY reopens; ES follows 6.0 s later
+
+Eighty-eight seconds of solitude, bounded at both ends, on a day in the volatile panel. Both legs
+reopen within six seconds of each other.
+
+**Other facts from this file.** `bidprice` / `askprice` / `volumeweightedaverageprice` /
+`lasttradevolume` are **empty** in `mt_product_statistics`, so it is not a top-of-book fallback for
+the 2020 ES leg. `volume` (99.99% populated) and `openinterest` (90.2%) are cumulative and reset at
+18:00 ET; sorted by `sequencenumber` the counter is monotone with exactly one step down, the session
+reset. Sorted by receipt time **with a stable sort** it is also monotone — an unstable sort scrambles
+the many exact timestamp ties and manufactures thousands of spurious inversions, which is worth
+knowing because the replay's own ordering depends on `kind="stable"` (it uses it).
+
+The file is **424 MB for one contract-day**, which corrects an assumption in `probe_es_2020.py`:
+`mt_product_statistics` is not small. The front-month discriminators — the prior session's closing
+`volume` and the `openinterest` — are both in the FIRST rows, so a `--limit` fetch answers the roll
+question without pulling a gigabyte.

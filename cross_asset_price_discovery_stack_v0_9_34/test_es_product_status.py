@@ -31,11 +31,24 @@ The rows below are verbatim from
       halt, because there is no second futures venue to agree. Quorum is now capped at the number of
       venues that publish status at all.
 
-The payoff for (3) and (4) together is a real event: 2020-03-12 09:36:45.103 -> 09:36:51.478 ET,
-6.38 s of `SuspendedBySurveillance` on ESH0 -- a CME Velocity Logic pause -- INSIDE the 09:35:44
-SPY circuit-breaker window. The futures stopped matching while the equity leg was already halted.
-That is a cross-asset event this paper is about, and until this test it was invisible three times
-over: no ES status fetch, no quorum, and a 30 s duration floor.
+  (5) THE FLAG IS NOT THE DURATION.  `haltreason` marks the stop to the millisecond and then clears
+      while the market stays down. On 2020-03-18 ESM0 it is set 3 ms after the last trade and
+      cleared 5.83 s later -- and then nothing trades for 817.3 s. Reading the clear as a resume
+      understated that halt by 140x, and the two readings support OPPOSITE claims about which
+      market leads. Halt ends now come from the resumption of trading (`activity=`), with the
+      unextended spans kept under `flag_windows`. The equity feeds do not need this: their MWCB
+      spans clear at exactly 900.0 s.
+
+The payoff for (3), (4) and (5) together is a real event, on a day already in the volatile panel:
+
+    12:56:11              SPY MWCB Level 1 halt begins
+    12:56:11-12:57:39.7   ES trades on, 3,927 contracts in 88.7 s -- the ONLY price venue
+    12:57:39.716          ES haltreason set, 3 ms after its last trade
+    13:11:11 / 13:11:17   SPY reopens; ES follows 6.0 s later
+
+So the object is 88.7 seconds of solitude, bounded at both ends -- not a 15-minute divergence.
+Until these checks it was invisible four times over: no ES status fetch, no venue quorum, a 30 s
+duration floor, and a resume read off a flag that had already cleared.
 
 Run: python test_es_product_status.py
 """
@@ -373,12 +386,19 @@ def check_halts_are_group_level_not_contract_level():
     return ok
 
 
-def check_velocity_logic_fires_inside_the_equity_halt():
-    """The result, not the diagnostic: three MWCB days, three ES pauses, all ~1 minute in.
+def check_es_halt_onset_lags_the_equity_halt():
+    """The result: three MWCB days, three ES halts, each beginning ~1 minute into the equity halt.
 
-    When the equity market stops matching, ES is the only venue left with a live price. Flow
-    concentrates there and trips CME's own velocity throttle about a minute later. That is a
-    cross-asset propagation channel with a measurable lag, on the sessions this paper is about."""
+    This check is about the ONSET only, and the durations it prints are FLAG durations -- the span
+    over which `haltreason` is populated. Check (13) shows those understate the actual trading stop
+    by 140x on the one day where we have the tape to measure it, so nothing here should be read as
+    "the futures paused for six seconds". What the flag does give, to the millisecond, is when the
+    futures STOPPED: on 2020-03-18 the flag is set 3 ms after ESM0's last trade.
+
+    The lag is the finding. CME halts equity-index futures in coordination with the primary market,
+    as its rules require, and +54 to +89 s across three days is that relay -- not a volatility
+    threshold being crossed independently. The window before it, in which the futures are the only
+    venue still matching, is check (14)."""
     es = {"2020-03-12": mh.windows_from_status(_frame(ESH0_20200312), tz=TZ)["windows"],
           "2020-03-16": mh.windows_from_status(_roll_frame(ROLL, "ESH0"), tz=TZ)["windows"],
           "2020-03-18": mh.windows_from_status(_roll_frame(ROLL_0318, "ESH0"), tz=TZ)["windows"]}
@@ -388,7 +408,7 @@ def check_velocity_logic_fires_inside_the_equity_halt():
         nested += rep["n_nested"]
         for o in rep["overlaps"]:
             lags.append(o["lag_s"])
-            print("    %s  ES %s-%s (%.2fs) nested in SPY %s-%s, +%.1fs in"
+            print("    %s  ES flag %s-%s (%.2fs) begins inside SPY %s-%s, +%.1fs in"
                   % (d, o["es"][0].strftime("%H:%M:%S"), o["es"][1].strftime("%H:%M:%S"),
                      o["es_seconds"], o["spy"][0].strftime("%H:%M:%S"),
                      o["spy"][1].strftime("%H:%M:%S"), o["lag_s"]))
@@ -398,9 +418,11 @@ def check_velocity_logic_fires_inside_the_equity_halt():
                                                           es["2020-03-12"]))
     says_union = "Exclude the UNION" in text and "own event onset" in text
     ok = all_nested and in_family and says_union
-    print("(10) all three ES pauses are NESTED inside the equity halt (%s), at +%.1f/%.1f/%.1f s "
-          "-- a consistent lag, not a coincidence (%s)"
-          % (all_nested, lags[0], lags[1], lags[2], in_family))
+    print("(10) all three ES halts BEGIN inside the equity halt (%s), at +%.1f/%.1f/%.1f s -- a "
+          "consistent relay lag, not a coincidence (%s)" % (all_nested, lags[0], lags[1], lags[2],
+                                                            in_family))
+    print("     (durations shown are FLAG spans; check (13) measures the real stop against the "
+          "tape and it is 140x longer)")
     print("    and the summary says what to do about it: exclude the union, treat the pause as its "
           "own onset (%s) : %s" % (says_union, ok))
     return ok
@@ -422,6 +444,96 @@ def check_futures_only_pause_is_not_swallowed():
     print("(11) the 09:24:58 pre-open pause (2.09 s) has no equity halt to nest in: returned as "
           "es_only rather than dropped (%s), the unpartnered equity halt is reported too (%s), and "
           "both are named in words (%s) : %s" % (kept, spy_alone, named, ok))
+    return ok
+
+
+def check_flag_clear_is_not_a_resume():
+    """The CME status flag marks the STOP to the millisecond and says nothing about the resume.
+
+    Measured against ESM0's own cumulative-volume tape on 2020-03-18:
+
+        last trade before      12:57:39.713
+        haltreason SET         12:57:39.716    <- 3 ms later; the onset is exact
+        haltreason CLEARED     12:57:45.549    <- 5.83 s; reads as a brief pause
+        first trade after      13:11:17.008    <- 817.3 s with ZERO contracts traded
+
+    Zero for 13.6 minutes, then 1,221 contracts in the first print. Trusting the clear excluded 6 s
+    of a session in which 817 s of the futures leg had no market -- 811 snapshots of a stale book
+    entering every pair estimate as though it were live. Worse, the two readings support opposite
+    claims: flag-only says the futures traded through almost the whole equity halt, the tape says
+    they were down for all but the first 89 seconds of it.
+
+    The equity feeds do NOT have this problem -- their MWCB spans clear at exactly 900.0 s -- so the
+    resume signal is a parameter, not a change of rule."""
+    rows = [(1584550659715872667, 0, 0, "ESH0", "SuspendedBySurveillance", "", ""),
+            (1584550665549165107, 0, 0, "ESH0", "", "220100", SENTINEL)]
+    st = _roll_frame(rows, "ESH0")
+
+    # a trade tape with the real hole in it: dense before 12:57:39.713, nothing until 13:11:17.008
+    base = pd.Timestamp("2020-03-18 12:47:39.713", tz=TZ)
+    before = pd.date_range(base, periods=6000, freq="100ms")            # 10 min at 10/s
+    before = before[before <= pd.Timestamp("2020-03-18 12:57:39.713", tz=TZ)]
+    after = pd.date_range(pd.Timestamp("2020-03-18 13:11:17.008", tz=TZ), periods=600, freq="100ms")
+    act = before.append(after)
+
+    flag = mh.windows_from_status(st, tz=TZ)["windows"][0]
+    res = mh.windows_from_status(st, tz=TZ, activity=act)
+    real = res["windows"][0]
+    flag_s = (flag[1] - flag[0]).total_seconds()
+    real_s = (real[1] - real[0]).total_seconds()
+    understated = abs(flag_s - 5.83) < 0.01 and abs(real_s - 817.3) < 0.5
+    ratio = real_s / flag_s
+    kept = len(res["flag_windows"]) == 1 and res["flag_windows"][0] == flag
+    ext = res["extended"][0] if res["extended"] else {}
+    honest = ext.get("quiet_ratio", 0) > 1000 and ext.get("pre_halt_median_gap_s", 9) < 1.0
+
+    # ...and the equity case must be left ALONE: its flag already spans the real halt
+    spy_rows = [("2020-03-09 09:34:13", "xdp_arca_integrated", "MarketWideCircuitBreakerLevel1"),
+                ("2020-03-09 09:34:13", "xdp_nyse_integrated", "MarketWideCircuitBreakerLevel1"),
+                ("2020-03-09 09:49:13", "xdp_arca_integrated", ""),
+                ("2020-03-09 09:49:13", "xdp_nyse_integrated", "")]
+    spy_st = pd.DataFrame({"f": [r[1] for r in spy_rows], "haltreason": [r[2] for r in spy_rows]},
+                          index=pd.DatetimeIndex([r[0] for r in spy_rows]).tz_localize(TZ))
+    spy_act = pd.DatetimeIndex(["2020-03-09 09:34:12.900", "2020-03-09 09:49:13.100"]).tz_localize(TZ)
+    spy_w = mh.windows_from_status(spy_st, tz=TZ, activity=spy_act)
+    spy_dur = (spy_w["windows"][0][1] - spy_w["windows"][0][0]).total_seconds()
+    # the reopening auction prints a moment after the flag clears, so a sub-second nudge is expected
+    # and correct; what must NOT happen is the 140x rewrite the futures leg needs.
+    untouched = abs(spy_dur - 900.0) < 1.0
+
+    ok = understated and kept and honest and untouched
+    print("(13) the CME flag clears after %.2f s but nothing trades for %.1f s -- understated %.0fx"
+          % (flag_s, real_s, ratio))
+    print("     the unextended span is still reported under flag_windows (%s), and the extension "
+          "carries its own evidence: pre-halt median inter-trade gap %.3f s vs %.0f s of silence, "
+          "ratio %.0f (%s)" % (kept, ext.get("pre_halt_median_gap_s", float("nan")),
+                               ext.get("extra_seconds", float("nan")),
+                               ext.get("quiet_ratio", float("nan")), honest))
+    print("     the EQUITY case is left essentially alone -- its flag already spans the real halt, "
+          "%.1f s vs 900.0 (%s) : %s" % (spy_dur, untouched, ok))
+    return ok
+
+
+def check_the_sole_venue_window():
+    """What the corrected windows actually show: 88.7 s in which ES is the only price venue.
+
+    Not a 15-minute divergence -- a short, sharp, bounded window. The equity market halts at
+    12:56:11 and ES keeps matching for 88.7 s (3,927 contracts) before halting too; both reopen
+    within 6 s of each other. That is the object worth an event study, and it only becomes visible
+    once the ES window ends at the resumption of trading rather than at the flag's clear."""
+    spy = mh.halt_windows("2020-03-18")[0]
+    es = (pd.Timestamp("2020-03-18 12:57:39.713", tz=TZ), pd.Timestamp("2020-03-18 13:11:17.008", tz=TZ))
+    rep = mh.cross_asset_summary([spy], [es])
+    o = rep["overlaps"][0]
+    sole = (es[0] - spy[0]).total_seconds()
+    reopen_gap = (es[1] - spy[1]).total_seconds()
+    nested = not o["nested"]          # ES now OUTLASTS the equity window, so it is no longer nested
+    ok = abs(sole - 88.7) < 0.1 and abs(reopen_gap - 6.0) < 0.1 and abs(o["lag_s"] - 88.7) < 0.1 and nested
+    print("(14) SPY halts %s; ES keeps trading %.1f s (sole price venue) then halts %s"
+          % (spy[0].strftime("%H:%M:%S"), sole, es[0].strftime("%H:%M:%S.%f")[:-3]))
+    print("     both reopen within %.1f s of each other (SPY %s, ES %s) -- so the corrected ES "
+          "window OUTLASTS the equity one rather than nesting inside it (%s) : %s"
+          % (reopen_gap, spy[1].strftime("%H:%M:%S"), es[1].strftime("%H:%M:%S.%f")[:-3], nested, ok))
     return ok
 
 
@@ -448,8 +560,9 @@ def main():
               check_qc_judges_each_book_against_its_own_halt,
               check_sequence_is_channel_level_not_product_level,
               check_halts_are_group_level_not_contract_level,
-              check_velocity_logic_fires_inside_the_equity_halt,
-              check_futures_only_pause_is_not_swallowed, check_calendar_spread_sanity]
+              check_es_halt_onset_lags_the_equity_halt,
+              check_futures_only_pause_is_not_swallowed, check_flag_clear_is_not_a_resume,
+              check_the_sole_venue_window, check_calendar_spread_sanity]
     res = []
     for fn in checks:
         try:

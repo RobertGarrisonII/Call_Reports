@@ -161,9 +161,17 @@ def roll_evidence(dates, contracts, out):
     `rollover_days=8` puts 03-16 and 03-18 on ESM0 purely because ESH0 expires on the 20th, and
     March 2020 is not a week to trust a calendar rule about where the volume went.
 
-    `mt_product_statistics` is a handful of rows per contract per day and carries the session's own
-    totals, so it is fetched in FULL and dumped verbatim -- reading the volume field off the real
-    row beats guessing which column name the vendor uses."""
+    `mt_product_statistics` is NOT small -- ESM0 on 2020-03-18 is 976,175 rows and 424 MB for one
+    contract-day. But the two discriminators are both in the FIRST rows: `volume` is cumulative and
+    the pre-open rows carry the PREVIOUS session's closing total (3,731,392 for ESM0 going into
+    03-18), and `openinterest` is a level (2,156,542). So a small `--limit` answers the roll question
+    without pulling a gigabyte, and the rows are dumped verbatim -- reading the field off the real
+    row beats guessing which column name the vendor uses.
+
+    For reference, the full-day figures already measured for ESM0 on 2020-03-18: Globex session
+    volume 3,135,041, RTH 09:30-16:00 volume 2,605,122, open interest 2,156,542 -> 2,955,942. A
+    contract doing 2.6 M lots in RTH is the front month; what is still missing is ESH0's number on
+    the same day to put beside it."""
     def w(s=""):
         print(s)
         if out:
@@ -176,7 +184,9 @@ def roll_evidence(dates, contracts, out):
     for date in dates:
         for product in contracts:
             cmd = ["mstwx-lakequery", "--date", str(date), "-s", "futures", "-p", product,
-                   "-m", "mt_product_statistics", "--print-headers", "--format", "csv"]
+                   "-m", "mt_product_statistics", "--print-headers", "--format", "csv",
+                   "--limit", "40"]        # the discriminators are in the first rows; the full day
+                                           # is ~1 M rows / 424 MB per contract
             fd, tmp = tempfile.mkstemp(prefix="roll_", suffix=".csv")
             os.close(fd)
             try:
@@ -204,8 +214,10 @@ def roll_evidence(dates, contracts, out):
             if len(lines) > 40:
                 w("    ... %d more" % (len(lines) - 40))
             w()
-    w("Read the volume/turnover column off these rows: the contract with the larger RTH volume is")
-    w("the front month for that date, whatever rollover_days says.")
+    w("Read `volume` and `openinterest` off these rows. `volume` is cumulative and the pre-open rows")
+    w("carry the PREVIOUS session's closing total, so both are front-month discriminators without")
+    w("needing the whole day. The contract with the larger volume/open interest is the front month,")
+    w("whatever rollover_days computes.")
     w()
 
 
