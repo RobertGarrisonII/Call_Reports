@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.9.36 -- the roll file: a channel-level sequence, a group-level halt, and a result
+
+`mt_product_status` for BOTH contracts (ESH0 and ESM0) on 2020-03-16 and 2020-03-18. Three findings,
+one of which belongs in the paper rather than the code.
+
+**`sequencenumber` is a CHANNEL counter -- now demonstrated, not inferred.** All 69 of ESM0's
+sequence numbers on 2020-03-16 are also ESH0's, at *identical receipt timestamps*, carrying
+*different prices*:
+
+    seq 1821  receipt=1584307805348763972  ESH0  exchange=1584307776613206983  limits 2567.50/2838.50
+    seq 1821  receipt=1584307805348763972  ESM0  exchange=1584307757763848469  limits 2555.50/2826.50
+
+One CME packet, several instruments. So a per-product fetch sees a sparse subset of a channel-wide
+counter, gaps in it are the other products rather than lost messages (what `debug_crossing` CHECK 4
+reports as `not-ours`), and pruning events by it -- the original crossed-book bug -- was never
+meaningful. The same rows show `exchangetimestamp` is PER INSTRUMENT inside a shared packet and can
+be **18.8 s older** than its packet-mates', so the receipt clock is the only one that orders the
+packet itself.
+
+**Velocity Logic pauses the ES GROUP, not a contract.** ESH0 and ESM0 stop at the same nanosecond,
+so the halt window does not depend on getting the front month right -- a roll ambiguity cannot
+silently move it.
+
+**The result: the futures pause fires INSIDE the equity halt, about a minute in.** On every MWCB day
+where both status streams exist:
+
+| date | SPY MWCB Level 1 | ES Velocity Logic pause | duration | lag into the halt |
+|---|---|---|---|---|
+| 2020-03-12 | 09:35:44-09:50:44 | 09:36:45.10-09:36:51.48 | 6.38 s | **+61.1 s** |
+| 2020-03-16 | 09:30:01-09:45:01 | 09:30:54.97-09:31:02.25 | 7.27 s | **+54.0 s** |
+| 2020-03-18 | 12:56:11-13:11:11 | 12:57:39.72-12:57:45.55 | 5.83 s | **+88.7 s** |
+
+Three days, three pauses, all 54-89 s in. When the equity market stops matching, ES is the only
+venue left with a live price; flow concentrates there and trips CME's own throttle about a minute
+later. That is a cross-asset propagation channel with a measurable lag, on exactly the sessions this
+paper studies, and it is NOT the same event as the equity halt -- for the event study it is a
+second, faster onset nested inside the first.
+
+It also **corroborates the 2020-03-18 equity halt time**, the one `MWCB_HALTS` entry never checked
+against a tape: a materially wrong 12:56:11 would not bracket a 12:57:39 futures pause sitting in
+family with the other two days. That is the other leg speaking, not proof, and the comment says so.
+
+New: `market_halts.cross_asset_summary()` / `describe_cross_asset()` produce the table above, with
+`lag_s` measured from the containing equity window's start so it is comparable across days.
+Unpartnered spans survive: 2020-03-18's fourth pause (2.09 s at 09:24:58, pre-open, no equity halt
+near it) comes back under `es_only` rather than being dropped for failing to match, and an equity
+halt with no futures partner comes back under `spy_only`.
+
+`test_es_product_status.py` grows to 12 checks, pinning all of the above to the verbatim rows.
+
+**What the roll file does NOT settle: the roll.** Both contracts publish status, price limits and
+halts on every 2020 date checked, and their limits differ by a constant calendar spread (12.00 index
+points on 03-16, 10.00 on 03-18) -- real for both, decisive for neither. `probe_es_2020.py` now
+dumps `mt_product_statistics` in full for each candidate contract, which carries the session
+totals; the front month is whichever has the RTH volume, not whatever `rollover_days=8` computes.
+
+Also settled by this file: hypotheses (B) and (C) for the missing 2020 ES leg are dead. Status
+returns rows for BOTH contracts on ALL four 2020 dates, so the product codes, the source and the
+dates are all valid. Whatever empties the book is the message types -- which is what the probe
+measures.
+
 ## v0.9.35 -- an empty fetch is not a thin day (and the 2020 ES probe)
 
 Starting work on the missing 2020 ES leg turned up the reason nobody noticed it for four sessions.

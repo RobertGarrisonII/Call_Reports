@@ -295,12 +295,161 @@ def check_qc_judges_each_book_against_its_own_halt():
     return ok
 
 
+# ── the roll file: ESH0 vs ESM0 on 2020-03-16 and 2020-03-18 ────────────────────────────────────
+# (receipt ns, seq, exchange ns, product, haltreason, lower, upper) -- verbatim, both contracts.
+ROLL = [
+    (1584307805348763972, 1821, 1584307776613206983, "ESH0", "", "256750", "283850"),
+    (1584307805348763972, 1821, 1584307757763848469, "ESM0", "", "255550", "282650"),
+    (1584309570020704105, 5980, 1584309570000000000, "ESH0", "GroupSchedule", "", ""),
+    (1584309570020704105, 5980, 1584309570000000000, "ESM0", "GroupSchedule", "", ""),
+    (1584365102086021870, 788789, 1584365102085316903, "ESH0", "", "251350", SENTINEL),
+    (1584365102086021870, 788789, 1584365102085316903, "ESM0", "", "250150", SENTINEL),
+    (1584365454973158575, 796560, 1584365454968025073, "ESH0", "SuspendedBySurveillance", "", ""),
+    (1584365454973158575, 796560, 1584365454968025073, "ESM0", "SuspendedBySurveillance", "", ""),
+    (1584365462246928960, 796828, 1584365462246236823, "ESH0", "", "235100", SENTINEL),
+    (1584365462246928960, 796828, 1584365462246236823, "ESM0", "", "233900", SENTINEL),
+]
+# 2020-03-18, the second pause of the day (the one that lands in the equity halt)
+ROLL_0318 = [
+    (1584550659715872667, 68805988, 1584550659714102239, "ESH0", "SuspendedBySurveillance", "", ""),
+    (1584550659715872667, 68805988, 1584550659714102239, "ESM0", "SuspendedBySurveillance", "", ""),
+    (1584550665549165107, 68806421, 1584550665548547789, "ESH0", "", "220100", SENTINEL),
+    (1584550665549165107, 68806421, 1584550665548547789, "ESM0", "", "219100", SENTINEL),
+]
+
+
+def _roll_frame(rows, product):
+    r = [x for x in rows if x[3] == product]
+    idx = pd.DatetimeIndex([pd.Timestamp(x[0], unit="ns", tz="UTC") for x in r]).tz_convert(TZ)
+    return pd.DataFrame({"f": ["cme_globex30_cme"] * len(r), "haltreason": [x[4] for x in r],
+                         "shortsaleindicator": ["\\N"] * len(r),
+                         "luldlowerlimit": [x[5] for x in r], "luldupperlimit": [x[6] for x in r],
+                         "limituplimitdownindicator": [""] * len(r)}, index=idx)
+
+
+def check_sequence_is_channel_level_not_product_level():
+    """Hard evidence for a thing the crossed-book diagnosis had to infer.
+
+    `sequencenumber` is a CHANNEL counter, not a per-product one. ESH0 and ESM0 return rows carrying
+    the SAME sequence number at the SAME receipt timestamp with DIFFERENT prices -- one CME packet
+    carrying several instruments. A per-product fetch therefore sees a sparse subset of a
+    channel-wide counter, so gaps in it are the OTHER products, not lost messages. `debug_crossing`
+    CHECK 4 calls those gaps `not-ours` on exactly this reasoning; here it is demonstrated rather
+    than argued.
+
+    The same rows kill the other idea: ordering or pruning events by `sequencenumber` across a
+    per-product fetch is meaningless, because the counter does not belong to the product."""
+    shared = [(a, b) for a, b in zip(ROLL[::2], ROLL[1::2]) if a[1] == b[1] and a[0] == b[0]]
+    all_shared = len(shared) == len(ROLL) // 2
+    # ...and the payloads under one sequence number are genuinely different instruments
+    px = [(a[5], b[5]) for a, b in shared if a[5]]
+    differ = all(x != y for x, y in px) and len(px) >= 3
+    # the exchange timestamp is PER INSTRUMENT inside the shared packet, and can be far older
+    skew = max(abs(a[2] - b[2]) for a, b in shared) / 1e9
+    ok = all_shared and differ and skew > 1.0
+    print("(8) ESH0 and ESM0 share a sequence namespace: %d/%d rows carry the same sequencenumber "
+          "at the same receipt timestamp (%s)" % (len(shared), len(ROLL) // 2, all_shared))
+    print("    with different per-contract prices under it (%s), and per-instrument exchange "
+          "timestamps up to %.1f s apart inside one packet (%s)" % (differ, skew, skew > 1.0))
+    print("    -> a gap in a per-product sequence is the OTHER products, not a lost message, and the")
+    print("       receipt clock is the only one that orders the packet itself : %s" % ok)
+    return ok
+
+
+def check_halts_are_group_level_not_contract_level():
+    """Velocity Logic pauses the ES GROUP: both contracts stop at the same nanosecond.
+
+    That is a useful robustness property -- the halt window does not depend on getting the front
+    month right, so a roll ambiguity cannot silently move it."""
+    h = mh.windows_from_status(_roll_frame(ROLL, "ESH0"), tz=TZ)["windows"]
+    m = mh.windows_from_status(_roll_frame(ROLL, "ESM0"), tz=TZ)["windows"]
+    same = len(h) == 1 and h == m
+    dur = (h[0][1] - h[0][0]).total_seconds() if h else float("nan")
+    ok = same and abs(dur - 7.27) < 0.01
+    print("(9) 2020-03-16: ESH0 and ESM0 pause at the SAME instant (%s), %s-%s, %.2f s : %s"
+          % (same, h[0][0].strftime("%H:%M:%S.%f")[:-3] if h else "-",
+             h[0][1].strftime("%H:%M:%S.%f")[:-3] if h else "-", dur, ok))
+    print("    the halt is a property of the ES group, so it survives a wrong front-month choice.")
+    return ok
+
+
+def check_velocity_logic_fires_inside_the_equity_halt():
+    """The result, not the diagnostic: three MWCB days, three ES pauses, all ~1 minute in.
+
+    When the equity market stops matching, ES is the only venue left with a live price. Flow
+    concentrates there and trips CME's own velocity throttle about a minute later. That is a
+    cross-asset propagation channel with a measurable lag, on the sessions this paper is about."""
+    es = {"2020-03-12": mh.windows_from_status(_frame(ESH0_20200312), tz=TZ)["windows"],
+          "2020-03-16": mh.windows_from_status(_roll_frame(ROLL, "ESH0"), tz=TZ)["windows"],
+          "2020-03-18": mh.windows_from_status(_roll_frame(ROLL_0318, "ESH0"), tz=TZ)["windows"]}
+    lags, nested = [], 0
+    for d, ws in es.items():
+        rep = mh.cross_asset_summary(mh.halt_windows(d), ws)
+        nested += rep["n_nested"]
+        for o in rep["overlaps"]:
+            lags.append(o["lag_s"])
+            print("    %s  ES %s-%s (%.2fs) nested in SPY %s-%s, +%.1fs in"
+                  % (d, o["es"][0].strftime("%H:%M:%S"), o["es"][1].strftime("%H:%M:%S"),
+                     o["es_seconds"], o["spy"][0].strftime("%H:%M:%S"),
+                     o["spy"][1].strftime("%H:%M:%S"), o["lag_s"]))
+    all_nested = nested == 3 and len(lags) == 3
+    in_family = all(40.0 < x < 120.0 for x in lags)
+    text = mh.describe_cross_asset(mh.cross_asset_summary(mh.halt_windows("2020-03-12"),
+                                                          es["2020-03-12"]))
+    says_union = "Exclude the UNION" in text and "own event onset" in text
+    ok = all_nested and in_family and says_union
+    print("(10) all three ES pauses are NESTED inside the equity halt (%s), at +%.1f/%.1f/%.1f s "
+          "-- a consistent lag, not a coincidence (%s)"
+          % (all_nested, lags[0], lags[1], lags[2], in_family))
+    print("    and the summary says what to do about it: exclude the union, treat the pause as its "
+          "own onset (%s) : %s" % (says_union, ok))
+    return ok
+
+
+def check_futures_only_pause_is_not_swallowed():
+    """2020-03-18 also has a 2.09 s pause at 09:24:58 -- pre-open, with no equity halt anywhere near.
+
+    It must come back as `es_only`, not be quietly dropped for failing to match a SPY window."""
+    rows = [(1584537898649350889, 0, 0, "ESH0", "SuspendedBySurveillance", "", ""),
+            (1584537900739027991, 0, 0, "ESH0", "", "235250", SENTINEL)]
+    ws = mh.windows_from_status(_roll_frame(rows, "ESH0"), tz=TZ)["windows"]
+    rep = mh.cross_asset_summary(mh.halt_windows("2020-03-18"), ws)
+    kept = len(rep["es_only"]) == 1 and not rep["overlaps"]
+    spy_alone = len(rep["spy_only"]) == 1              # the equity halt has no ES partner here
+    txt = mh.describe_cross_asset(rep)
+    named = "futures-only event" in txt and "ES matching throughout" in txt
+    ok = kept and spy_alone and named
+    print("(11) the 09:24:58 pre-open pause (2.09 s) has no equity halt to nest in: returned as "
+          "es_only rather than dropped (%s), the unpartnered equity halt is reported too (%s), and "
+          "both are named in words (%s) : %s" % (kept, spy_alone, named, ok))
+    return ok
+
+
+def check_calendar_spread_sanity():
+    """A cheap cross-check that both contracts' limits are real: their difference is the carry."""
+    h = ms.state_series(_roll_frame(ROLL, "ESH0"))["luld_lower"].dropna() * SCALE
+    m = ms.state_series(_roll_frame(ROLL, "ESM0"))["luld_lower"].dropna() * SCALE
+    sp = (h.to_numpy() - m.to_numpy())
+    tight = np.allclose(sp, 12.00, atol=1e-9)
+    ok = tight and len(sp) == 3
+    print("(12) ESH0 - ESM0 price limits on 2020-03-16 = %s index points across %d paired rows -- a "
+          "constant calendar spread, so both contracts' limits are genuine and comparable : %s"
+          % (", ".join("%.2f" % v for v in sp), len(sp), ok))
+    print("    NOTE: this does NOT settle which is the front month. Status is published for both")
+    print("    contracts on every 2020 date checked; only VOLUME can decide the roll.")
+    return ok
+
+
 def main():
     checks = [check_cme_publishes_price_limits, check_int64_sentinel_is_not_a_price,
               check_routine_session_notices_are_not_halts,
               check_single_venue_quorum_admits_the_cme_pause,
               check_the_pause_lands_inside_the_spy_halt, check_limit_down_ratchet_is_visible,
-              check_qc_judges_each_book_against_its_own_halt]
+              check_qc_judges_each_book_against_its_own_halt,
+              check_sequence_is_channel_level_not_product_level,
+              check_halts_are_group_level_not_contract_level,
+              check_velocity_logic_fires_inside_the_equity_halt,
+              check_futures_only_pause_is_not_swallowed, check_calendar_spread_sanity]
     res = []
     for fn in checks:
         try:

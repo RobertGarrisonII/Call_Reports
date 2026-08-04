@@ -288,3 +288,54 @@ against their union. A CME pause cannot excuse a crossed SPY top — NYSE never 
 and an equity halt cannot excuse a crossed ES top.
 
 `shortsaleindicator` is `\N` throughout on ES, as it should be: Rule 201 is an equity rule.
+
+## 12. The March-2020 roll file — three things ESH0 vs ESM0 settles
+
+`mt_product_status` for **both** contracts on 2020-03-16 and 2020-03-18.
+
+**`sequencenumber` is a CHANNEL counter, not a per-product one — demonstrated, not inferred.** On
+2020-03-16, all 69 of ESM0's sequence numbers are also ESH0's, at *identical receipt timestamps*,
+carrying *different prices*:
+
+    seq 1821  receipt=1584307805348763972  ESH0  exchange=1584307776613206983  limits 2567.50/2838.50
+    seq 1821  receipt=1584307805348763972  ESM0  exchange=1584307757763848469  limits 2555.50/2826.50
+
+One CME packet, several instruments. So a per-product fetch sees a **sparse subset** of a
+channel-wide counter, and gaps in it are the other products rather than lost messages — which is
+what `debug_crossing` CHECK 4 reports as `not-ours`, and what made pruning by `sequencenumber` the
+original crossed-book bug. It also shows the `exchangetimestamp` is **per instrument** inside a
+shared packet and can be **18.8 s older** than its packet-mates', so the receipt clock is the only
+one that orders the packet itself.
+
+**Velocity Logic pauses the ES GROUP, not a contract.** ESH0 and ESM0 stop at the same nanosecond
+(09:30:54.973158575 on 2020-03-16). The halt window therefore does not depend on getting the front
+month right — a roll ambiguity cannot silently move it.
+
+**The pause fires inside the equity halt, about a minute in.** On every MWCB day where both status
+streams exist:
+
+| date | SPY MWCB Level 1 | ES Velocity Logic pause | duration | lag into the halt |
+|---|---|---|---|---|
+| 2020-03-12 | 09:35:44–09:50:44 | 09:36:45.10–09:36:51.48 | 6.38 s | **+61.1 s** |
+| 2020-03-16 | 09:30:01–09:45:01 | 09:30:54.97–09:31:02.25 | 7.27 s | **+54.0 s** |
+| 2020-03-18 | 12:56:11–13:11:11 | 12:57:39.72–12:57:45.55 | 5.83 s | **+88.7 s** |
+
+Three days, three pauses, all 54–89 s in. The mechanism is not mysterious: when the equity market
+stops matching, the futures are the only venue left with a live price, order flow concentrates
+there, and the resulting velocity trips CME's own throttle about a minute later. That is a
+cross-asset propagation channel with a measurable lag, on exactly the sessions this paper studies,
+and it is **not the same event as the equity halt** — for the event study it is a second, faster
+onset nested inside the first. `market_halts.cross_asset_summary()` produces the table.
+
+It also **corroborates the 2020-03-18 equity halt time**, which was the one entry in `MWCB_HALTS`
+never checked against a tape: a materially wrong 12:56:11 would not bracket a 12:57:39 futures
+pause that sits in family with the other two days' lags. That is the other leg speaking, not proof.
+
+2020-03-18 carries a **fourth** pause, 2.09 s at 09:24:58 — pre-open, with no equity halt near it.
+`cross_asset_summary` returns it under `es_only` rather than dropping it for failing to match.
+
+**What this does NOT settle: the roll.** Both contracts publish status, price limits and halts on
+every 2020 date checked, and their limits differ by a constant calendar spread (12.00 index points
+on 03-16, 10.00 on 03-18) — real for both, decisive for neither. `rollover_days=8` puts 03-16 and
+03-18 on ESM0. Only **volume** can confirm that, which needs `mt_product_statistics` or a trade
+count, not the status stream.

@@ -48,7 +48,11 @@ MWCB_HALTS = {
     "2020-03-09": [("09:34:13", "09:49:13")],     # tape: 09:34:13.078 -> 09:49:13.103
     "2020-03-12": [("09:35:44", "09:50:44")],     # tape: 09:35:44     -> 09:50:44  (was 09:35:37)
     "2020-03-16": [("09:30:01", "09:45:01")],     # tape: 09:30:01     -> 09:45:01  (was 09:30:00)
-    "2020-03-18": [("12:56:11", "13:11:11")],     # NOT yet verified against the tape
+    "2020-03-18": [("12:56:11", "13:11:11")],     # CORROBORATED: the ESH0/ESM0 Velocity Logic pause
+                                                  # lands at 12:57:39.7, +88.7s -- in family with the
+                                                  # +61.1s and +54.0s on 03-12 and 03-16. Not proof
+                                                  # (it is the other leg), but a materially wrong
+                                                  # equity time would not bracket it.
 }
 
 
@@ -167,6 +171,83 @@ def windows_from_status(df, tz: str = TZ, min_seconds: float = 1.0, min_venues: 
         else:
             out["venue_only"].append((sorted(feeds)[0], a, b))
     return out
+
+
+def cross_asset_summary(spy_windows, es_windows, tz: str = TZ) -> dict:
+    """Line the two legs' halt windows up against each other. This is a RESULT, not a diagnostic.
+
+    On every March-2020 circuit-breaker day for which both status streams are available, CME's
+    Velocity Logic paused the ES group **inside** the equity halt, roughly a minute in:
+
+        date        SPY MWCB Level 1      ES pause                 dur    lag into the halt
+        2020-03-12  09:35:44-09:50:44     09:36:45.10-09:36:51.48  6.38s  +61.1s
+        2020-03-16  09:30:01-09:45:01     09:30:54.97-09:31:02.25  7.27s  +54.0s
+        2020-03-18  12:56:11-13:11:11     12:57:39.72-12:57:45.55  5.83s  +88.7s
+
+    Three days, three pauses, all 54-89 s in. The mechanism is not mysterious: when the equity
+    market stops matching, the futures are the only venue left with a live price, order flow
+    concentrates there, and the resulting velocity trips CME's own throttle about a minute later.
+    That is a cross-asset propagation channel with a measurable lag, on exactly the sessions this
+    paper is about, and it is not the same event as the equity halt.
+
+    Two consequences:
+
+      * For estimation, the union of the two windows is what has to be excluded -- a pair estimate
+        needs BOTH legs matching, and during the ES pause neither leg has a tradeable midpoint.
+        `_extract_one_session` stores the union in ``df.attrs["halt_windows"]`` for exactly this.
+      * For the event study, the ES pause is its own onset, nested inside the equity one. Treating
+        the equity reopening as the only event on these days misses a second, faster one.
+
+    ``lag_s`` is measured from the START of the containing equity window, so it is directly
+    comparable across days with different halt times.
+
+    -> {'overlaps': [{...}], 'es_only': [(a, b)], 'spy_only': [(a, b)], 'n_nested': int}"""
+    def _norm(ws):
+        out = []
+        for a, b in (ws or []):
+            a, b = pd.Timestamp(a), pd.Timestamp(b)
+            a = a.tz_localize(tz) if a.tz is None else a.tz_convert(tz)
+            b = b.tz_localize(tz) if b.tz is None else b.tz_convert(tz)
+            out.append((a, b))
+        return sorted(out)
+
+    spy, es = _norm(spy_windows), _norm(es_windows)
+    rep = {"overlaps": [], "es_only": [], "spy_only": [], "n_nested": 0}
+    matched_spy = set()
+    for a, b in es:
+        hit = next(((x, y) for x, y in spy if x <= a <= y or x <= b <= y or (a <= x and y <= b)), None)
+        if hit is None:
+            rep["es_only"].append((a, b))
+            continue
+        matched_spy.add(hit)
+        nested = hit[0] <= a and b <= hit[1]
+        rep["n_nested"] += int(nested)
+        rep["overlaps"].append({"spy": hit, "es": (a, b), "nested": nested,
+                                "lag_s": (a - hit[0]).total_seconds(),
+                                "es_seconds": (b - a).total_seconds(),
+                                "spy_seconds": (hit[1] - hit[0]).total_seconds()})
+    rep["spy_only"] = [w for w in spy if w not in matched_spy]
+    return rep
+
+
+def describe_cross_asset(rep: dict) -> str:
+    lines = []
+    for o in rep["overlaps"]:
+        lines.append("ES paused %s-%s (%.2fs) %s the equity halt %s-%s (%.0fs), starting %+.1fs in"
+                     % (o["es"][0].strftime("%H:%M:%S.%f")[:-3], o["es"][1].strftime("%H:%M:%S.%f")[:-3],
+                        o["es_seconds"], "INSIDE" if o["nested"] else "overlapping",
+                        o["spy"][0].strftime("%H:%M:%S"), o["spy"][1].strftime("%H:%M:%S"),
+                        o["spy_seconds"], o["lag_s"]))
+    for a, b in rep["es_only"]:
+        lines.append("ES paused %s-%s (%.2fs) with the equity market OPEN -- a futures-only event"
+                     % (a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S"), (b - a).total_seconds()))
+    for a, b in rep["spy_only"]:
+        lines.append("equity halted %s-%s (%.0fs) with ES matching throughout"
+                     % (a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S"), (b - a).total_seconds()))
+    if rep["overlaps"]:
+        lines.append("Exclude the UNION from any pair estimate: during the ES pause neither leg has "
+                     "a tradeable midpoint. The nested pause is its own event onset.")
+    return "\n".join(lines) if lines else "no halt on either leg"
 
 
 def halt_windows(date, tz: str = TZ) -> list:

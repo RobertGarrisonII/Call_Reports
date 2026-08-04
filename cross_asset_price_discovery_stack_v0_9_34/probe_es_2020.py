@@ -152,6 +152,63 @@ def run(dates, contracts, limit, out):
     return lines
 
 
+def roll_evidence(dates, contracts, out):
+    """Which contract is the FRONT MONTH, by volume rather than by a calendar rule.
+
+    The status stream cannot answer this. ESH0 and ESM0 both publish status, price limits and halts
+    on every 2020 date checked, and their limits differ only by a constant calendar spread (12.00
+    index points on 2020-03-16, 10.00 on 03-18) -- real for both, decisive for neither. Meanwhile
+    `rollover_days=8` puts 03-16 and 03-18 on ESM0 purely because ESH0 expires on the 20th, and
+    March 2020 is not a week to trust a calendar rule about where the volume went.
+
+    `mt_product_statistics` is a handful of rows per contract per day and carries the session's own
+    totals, so it is fetched in FULL and dumped verbatim -- reading the volume field off the real
+    row beats guessing which column name the vendor uses."""
+    def w(s=""):
+        print(s)
+        if out:
+            with open(out, "a") as fh:
+                fh.write(s + "\n")
+
+    w("=" * 96)
+    w("ROLL EVIDENCE -- mt_product_statistics in full (small), to pick the front month by VOLUME")
+    w("=" * 96)
+    for date in dates:
+        for product in contracts:
+            cmd = ["mstwx-lakequery", "--date", str(date), "-s", "futures", "-p", product,
+                   "-m", "mt_product_statistics", "--print-headers", "--format", "csv"]
+            fd, tmp = tempfile.mkstemp(prefix="roll_", suffix=".csv")
+            os.close(fd)
+            try:
+                with open(tmp, "w") as fh:
+                    res = sp.run(cmd, stdout=fh, stderr=sp.PIPE, text=True, timeout=1800, check=False)
+                if res.returncode != 0:
+                    w("  %s %s: QUERY FAILED rc=%d %s" % (date, product, res.returncode,
+                                                          (res.stderr or "").strip()[:120]))
+                    continue
+                lines = [ln for ln in open(tmp).read().splitlines() if ln.strip()]
+            except FileNotFoundError:
+                w("  mstwx-lakequery not on PATH -- run this on the workbench")
+                return
+            except sp.TimeoutExpired:
+                w("  %s %s: TIMEOUT" % (date, product))
+                continue
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            w("  --- %s %s : %d row(s) ---" % (date, product, max(0, len(lines) - 1)))
+            for ln in lines[:40]:
+                w("    " + ln)
+            if len(lines) > 40:
+                w("    ... %d more" % (len(lines) - 40))
+            w()
+    w("Read the volume/turnover column off these rows: the contract with the larger RTH volume is")
+    w("the front month for that date, whatever rollover_days says.")
+    w()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -163,6 +220,8 @@ def main():
                     help="known-good date probed last for contrast ('' to skip)")
     ap.add_argument("--full-counts", action="store_true",
                     help="drop --limit for true row counts (SLOW: millions of rows on a crash day)")
+    ap.add_argument("--no-roll", action="store_true",
+                    help="skip the mt_product_statistics dump that picks the front month by volume")
     ap.add_argument("--out", default="", help="also write the report here")
     a = ap.parse_args()
 
@@ -170,8 +229,11 @@ def main():
         os.unlink(a.out)
     limit = 0 if a.full_counts else 5
 
-    run([d.strip() for d in a.dates.split(",") if d.strip()],
-        [c.strip().upper() for c in a.contracts.split(",") if c.strip()], limit, a.out)
+    dates = [d.strip() for d in a.dates.split(",") if d.strip()]
+    contracts = [c.strip().upper() for c in a.contracts.split(",") if c.strip()]
+    run(dates, contracts, limit, a.out)
+    if not a.no_roll:
+        roll_evidence(dates, contracts, a.out)
     if a.control:
         print("\n### CONTROL: a date the extractor handles correctly, for contrast ###\n")
         run([a.control], CONTRACTS_CONTROL, limit, a.out)
