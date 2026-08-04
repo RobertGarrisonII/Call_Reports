@@ -87,6 +87,7 @@ CORR_WINDOW=100
 N_LAGS="bic"          # integer, or an information criterion: bic | aic | hq
 PMAX=12
 N_LAGS_INT=""        # resolved integer, filled in by STAGE 4c
+T9_DCC=""            # "--with-dcc", set by STAGE 4c if the lag order tracks the corr window
 STAGES="0,1,2,3,4,5,6,7"
 DRY=0
 QUICK=0
@@ -301,6 +302,7 @@ if have_stage 1; then
            test_validate_aggregated.py \
            test_halt_aware_qc.py \
            test_driver_flags.py \
+           test_svar_lag_artifact.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -563,14 +565,41 @@ p, tab = cs.select_svar_lag(sess, spec="informational", corr_window=win,
 if p is None:
     sys.exit(1)
 sys.stderr.write(tab[["aic", "bic", "hqic"]].round(3).to_string() + "\n")
-print(int(p))
+# Is the selected lag an answer or an artifact of how dCorr is built? See lag_diagnosis:
+# d(W-bar rolling correlation) carries an MA term at exactly lag W, and the criterion finds it.
+d = cs.lag_diagnosis(p, corr_window=win, pmax=pmax, corr_method="rolling")
+sys.stderr.write("LAG DIAGNOSIS: " + d["text"] + "\n")
+print("%d %d %d" % (int(p), int(d["window_artifact"]), int(d["at_boundary"])))
 EOF
 )"
+        LAG_ART=""; LAG_EDGE=""
         if [ -n "$N_LAGS_INT" ]; then
+          set -- $N_LAGS_INT
+          N_LAGS_INT="$1"; LAG_ART="${2:-0}"; LAG_EDGE="${3:-0}"
           info "selected p=${N_LAGS_INT} by ${N_LAGS^^} over p<=${PMAX} (IC table in the log)"
-          if [ "$N_LAGS_INT" -ge "$PMAX" ] 2>/dev/null; then
+          if [ "$N_LAGS_INT" = "0" ]; then
+            info "NOTE: p=0 means the criterion found no dynamics. A VAR(0) has no impulse response,"
+            info "so p=1 is used downstream and the response is impact-only. On a wide"
+            info "--corr-window this usually means the criterion could not see the window's own MA"
+            info "spike rather than that the system is empty."
+            N_LAGS_INT=1
+          fi
+          if [ "$LAG_ART" = "1" ]; then
+            info "WARNING: p EQUALS --corr-window (${CORR_WINDOW}). That is an artifact, not a"
+            info "finding: dCorr is the difference of a ${CORR_WINDOW}-bar rolling correlation, so it"
+            info "carries an MA term at exactly lag ${CORR_WINDOW} and the criterion is locating it."
+            info "On simulated data with a CONSTANT correlation and iid liquidity this reproduces"
+            info "exactly (test_svar_lag_artifact.py). Re-run STAGE 5 with --with-dcc: the DCC"
+            info "conditional correlation has no fixed-width box to difference and returns p*~1 on"
+            info "that same data. NOTE that 'both ways' does NOT fix this on its own -- Pearson and"
+            info "HY differ on asynchronicity but both difference the same ${CORR_WINDOW}-bar box."
+            T9_DCC="--with-dcc"
+          fi
+          if [ "$LAG_EDGE" = "1" ] || { [ "$N_LAGS_INT" -ge "$PMAX" ] 2>/dev/null; }; then
             info "WARNING: p == pmax, so the criterion is still improving at the edge of the search."
-            info "That is a BOUND, not an optimum -- re-run with a larger --pmax before reporting it."
+            info "That is a BOUND, not an optimum. Note that with --corr-window ${CORR_WINDOW} the"
+            info "induced spike sits at lag ${CORR_WINDOW}, so raising --pmax walks TOWARD the window"
+            info "rather than converging -- change the dependent variable, not the search."
           fi
         else
           info "selection failed (too few usable rows?); downstream stages fall back to their defaults"
@@ -590,6 +619,8 @@ fi
 if have_stage 5; then
   say "STAGE 5  Table 9 on Pearson AND Hayashi-Yoshida d-correlation"
   T9ARGS="--spec informational --n-lags ${N_LAGS} --pmax ${PMAX} --n-boot ${N_BOOT} --out-dir ${OUT}"
+  # set by STAGE 4c when the selected lag turned out to equal the correlation window
+  [ -n "${T9_DCC:-}" ] && T9ARGS="$T9ARGS ${T9_DCC}"
   [ -n "$NJ" ] && T9ARGS="$T9ARGS --n-jobs $NJ"
   if [ "$SOURCE" = "demo" ]; then
     # shellcheck disable=SC2086

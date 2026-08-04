@@ -78,6 +78,13 @@ def main(argv=None):
     ap.add_argument("--spec", default="informational", help="standard | weighted | informational")
     ap.add_argument("--corr-window", type=int, default=100,
                     help="bars in the correlation window (paper: 100)")
+    ap.add_argument("--with-dcc", action="store_true",
+                    help="add a third column using the DCC conditional correlation. Pearson and HY "
+                         "differ in how they treat asynchronicity but BOTH difference a fixed "
+                         "corr-window box, which puts an MA term at exactly lag W and makes the "
+                         "selected lag order track the window rather than the data "
+                         "(test_svar_lag_artifact.py). DCC is recursive, has no box, and is the "
+                         "column to quote when the lag caution fires.")
     ap.add_argument("--n-lags", default="6",
                     help="fixed integer, or an information criterion: bic | aic | hq. "
                          "A criterion is resolved ONCE on the pooled SVAR frame and the chosen "
@@ -138,7 +145,7 @@ def main(argv=None):
     tbl = pt.table_correlation_irf_both_ways(
         sessions, spec=a.spec, ident=a.ident, cumulative=a.cumulative, n_boot=a.n_boot,
         n_lags=n_lags, horizon=a.horizon, corr_window=a.corr_window, min_obs=a.min_obs,
-        seed=a.seed, n_jobs=a.n_jobs)
+        seed=a.seed, n_jobs=a.n_jobs, with_dcc=a.with_dcc)
     if tbl.df.empty:
         print(tbl.notes or "no output")
         return 1

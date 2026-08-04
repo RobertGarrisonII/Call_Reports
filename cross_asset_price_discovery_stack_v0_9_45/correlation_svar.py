@@ -303,6 +303,69 @@ def orthogonalized_irf(A, Sigma, H, ident="cholesky"):
 
 
 # ── Table 9: IRF of correlation to each shock, by regime ──────────────────────
+def lag_diagnosis(p, corr_window, pmax, corr_method="rolling", tol=1) -> dict:
+    """Is the selected lag order an ANSWER, or an artifact of how the dependent variable is built?
+
+    Two failure modes, both of which look like a number in a table note:
+
+    ``window_artifact``  p* == corr_window (within ``tol``). `dCorr` is the first difference of a
+                         W-bar rolling correlation, so it adds one observation and drops the one
+                         from W bars ago: an MA term at lag W and nowhere else. The criterion
+                         locates that spike precisely and reports it as the lag order. On simulated
+                         data with a CONSTANT correlation and iid liquidity -- nothing for a VAR to
+                         find -- BIC returns p* = 8, 12, 20, 25 for corr_window = 8, 12, 20, 25.
+                         Exactly the window, every time (test_svar_lag_artifact.py).
+
+    ``at_boundary``      p* == pmax. The criterion was still improving where the search stopped, so
+                         the number is a bound. With the paper's 100-bar window the induced spike
+                         sits at lag 100, so any search bounded below that climbs to its own edge --
+                         which is what footnote 17's "AIC points at 60" is describing.
+
+    Neither is fixed by a longer search or a different criterion, because neither is about the data.
+    The fix is the dependent variable: ``corr_method='dcc'`` is a recursive conditional correlation
+    with no fixed-width box to difference, and returns p* ~ 1 on that same simulated data whatever
+    the window. ``corr_method='hy'`` removes the Epps attenuation but keeps the rolling box, so it
+    does NOT remove this -- report it with the window in mind.
+
+    -> {'window_artifact': bool, 'at_boundary': bool, 'ok': bool, 'text': str}"""
+    rep = {"window_artifact": False, "at_boundary": False, "no_dynamics": False, "text": ""}
+    if p is not None and int(p) == 0:
+        rep["no_dynamics"] = True
+        rep["ok"] = False
+        rep["text"] = ("the criterion selected p=0 -- no dynamics at all. A VAR(0) has no impulse "
+                       "response, so a caller must floor it at 1 and read the result as "
+                       "impact-only. On a wide correlation window this usually means the criterion "
+                       "could not see the window's own MA spike rather than that the system is "
+                       "dynamically empty; corr_method='dcc' gives a lag order that means something.")
+        return rep
+    if p is None:
+        rep["text"] = "no lag order could be selected (the IC table was empty or degenerate)"
+        rep["ok"] = False
+        return rep
+    lines = []
+    if corr_window and abs(int(p) - int(corr_window)) <= int(tol) and int(p) > 1:
+        rep["window_artifact"] = True
+        lines.append("SELECTED LAG p=%d EQUALS corr_window (%d). That is an artifact, "
+                     "not a finding: d(rolling correlation) carries an MA term at exactly lag W, "
+                     "and the criterion is locating it. On data with a constant correlation and iid "
+                     "liquidity this reproduces exactly (p*=W for W=8,12,20,25). Re-run with "
+                     "corr_method='dcc', whose conditional correlation has no fixed-width box to "
+                     "difference and returns p*~1 on the same data; corr_method='hy' does NOT fix "
+                     "it, because it keeps the rolling window." % (int(p), int(corr_window)))
+    if pmax and int(p) >= int(pmax):
+        rep["at_boundary"] = True
+        lines.append("SELECTED LAG p=%d IS THE SEARCH BOUND (pmax=%d), so the criterion was still "
+                     "improving where the search stopped -- a bound, not an optimum. If the "
+                     "correlation window is %s, the induced spike sits at lag %s and any pmax below "
+                     "it will end here; raising pmax will walk toward the window rather than "
+                     "converge." % (int(p), int(pmax), corr_window or "?", corr_window or "?"))
+    rep["ok"] = not (rep["window_artifact"] or rep["at_boundary"])
+    rep["text"] = " ".join(lines) if lines else (
+        "p=%d: not at the search bound and not equal to the correlation window (%s), so the lag "
+        "order is not obviously an artifact of how dCorr is built." % (int(p), corr_window))
+    return rep
+
+
 def select_svar_lag(data, spec="informational", n_levels=10, target_qty=None,
                     corr_method="rolling", corr_window=100, wspread_kind="cost_to_fill",
                     extra_fn=None, criterion="bic", pmax=12):

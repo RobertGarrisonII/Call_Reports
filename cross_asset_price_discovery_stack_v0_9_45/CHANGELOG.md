@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.9.45 -- the Table 9 lag order is the correlation window, not a finding
+
+Asked whether STAGE 4c should be a VECM rather than an SVAR, given that 60 lags is a boundary
+solution and not BIC-optimal. Two separate answers.
+
+**On VECM: no, and it would not help.** Every variable in the Eq. (5) system is already stationary
+-- differenced quoted and weighted spreads, OFI, RV, microprice deviation, and d-correlation. There
+is no unit root and nothing to cointegrate. The cointegrated object in this paper is the PRICE
+system (log SPY, log ES with beta=(1,-1)) and it already has its VECM:
+`price_discovery_shares._fit_vecm_fixed` / `panel_vecm`, which is what Hasbrouck information shares
+and Gonzalo-Granger require, plus `ecm_sde` and `markov_switching_vecm`. Table 9 asks how a
+correlation responds to liquidity shocks; the VECM asks where price discovery happens. Swapping one
+for the other would not touch the lag problem, because the lag problem is in how the dependent
+variable is built.
+
+**On the lag: it is an artifact, and it reproduces exactly.** `dCorr` is the first difference of a
+W-bar rolling correlation, so it adds one observation and drops the one from W bars ago -- an MA
+term at lag W and nowhere else. The criterion locates that spike and reports it as the lag order.
+On simulated data with a CONSTANT correlation of 0.6 and iid liquidity variables -- nothing for a
+VAR to find:
+
+| corr_method | corr_window | BIC-selected p* |
+|---|---|---|
+| rolling | 8 | **8** |
+| rolling | 12 | **12** |
+| rolling | 20 | **20** |
+| rolling | 25 | **25** |
+| rolling | 40 | 0 |
+| rolling | 50 | 0 |
+| dcc | 25 | 1 |
+| dcc | 50 | 1 |
+
+p* == corr_window, every time. Above W~40 the spike stops covering the k^2*log(T) cost of the lags
+before it and BIC quits at 0 -- the opposite failure, and the more dangerous one, because a small
+lag reads as "the criterion converged". With the paper's 100-bar window the spike sits at lag 100,
+so any search bounded below that climbs to its own edge and stops: which is what footnote 17's "AIC
+points at 60" is describing, and what a p==pmax boundary warning is really reporting. Raising
+`--pmax` walks toward the window rather than converging.
+
+DCC is immune: its conditional correlation is a recursive filter driven by the data, with no
+fixed-width box to difference. **`--source both-ways` does NOT fix this on its own** -- Pearson and
+HY differ on asynchronicity but difference the same box.
+
+What this release adds:
+
+* `correlation_svar.lag_diagnosis()` classifies a selected lag as `window_artifact` (p == W),
+  `at_boundary` (p == pmax) or `no_dynamics` (p == 0), with the cause and the fix in words.
+* The diagnosis is written into the **table caption** by `table_correlation_irf_both_ways`, not just
+  a log: a lag order is a researcher degree of freedom that ends up in the note, so the note is
+  where a reader has to be told when it is not a finding.
+* STAGE 4c prints the diagnosis and, when the lag equals the window, automatically adds `--with-dcc`
+  to STAGE 5.
+* New `--with-dcc` on `run_table9_both_ways.py` adds a third column on the DCC conditional
+  correlation -- the only one of the three without a fixed-width window.
+* **p=0 no longer crashes.** The criterion can legitimately return 0 (the W=40/50 rows above), and
+  the IRF code raised `IndexError` on the empty coefficient list. Consumers floor at 1 and say so in
+  the caption; the selection itself still reports the honest 0.
+* `test_svar_lag_artifact.py` (5 checks) pins p*==W, DCC's immunity, the p=0 collapse, the
+  diagnosis firing correctly and staying quiet on a healthy selection, and that the Table 9 system
+  carries no price levels while the VECM lives on the price system.
+
 ## v0.9.44 -- the version check does not belong in the correctness gate
 
 v0.9.43 put `check_version.py` into the STAGE 1 gate, and it aborted a replication run at minute two:

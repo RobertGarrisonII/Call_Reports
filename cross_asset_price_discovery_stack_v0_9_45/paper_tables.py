@@ -195,7 +195,8 @@ def table_correlation_irf(sessions, spec="informational", ident="cholesky", cumu
 def table_correlation_irf_both_ways(sessions, spec="informational", ident="cholesky",
                                     cumulative=False, extra_fn=None, n_boot=499, n_lags=4,
                                     horizon=6, corr_window=80, min_obs=200, seed=0, n_jobs=None,
-                                    criterion=None, pmax=12,
+                                    criterion=None, pmax=12, with_dcc=False,
+                                    methods=(("Pearson", "rolling"), ("HY", "hy")),
                                     title="Table 9 (repro): IRF of return correlation, Pearson vs Hayashi-Yoshida"):
     """Table 9 estimated twice -- once on the paper's grid-sampled Pearson d-correlation and once
     on the Epps-robust Hayashi-Yoshida d-correlation over the same window -- reported side by side
@@ -220,19 +221,44 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
     # Resolve the lag ONCE, here, so BOTH estimator blocks are fitted at the same order --
     # otherwise a Pearson/HY difference could be a lag difference, which is the one thing this
     # table exists to rule out.
+    if with_dcc and not any(m == "dcc" for _l, m in methods):
+        # A THIRD dependent variable, and the only one of the three without a fixed-width window.
+        # Pearson and HY differ in how they handle asynchronicity but both difference a W-bar box,
+        # so neither removes the lag artifact above -- DCC is what the caution in the note points at.
+        methods = tuple(methods) + (("DCC", "dcc"),)
     lag_note = ""
     if criterion is not None:
         p_sel = csv.select_svar_lag(sessions, spec=spec, corr_window=corr_window,
                                     extra_fn=extra_fn, criterion=criterion, pmax=pmax)[0]
         if p_sel is not None:
             lag_note = f" Lag order p={int(p_sel)} chosen by {str(criterion).upper()} over p<={pmax} on the pooled SVAR frame."
-            n_lags = int(p_sel)
+            # A criterion CAN return 0 -- it does so on a wide rolling window, where the induced
+            # spike no longer covers the cost of the lags before it. A VAR(0) has no dynamics and
+            # no impulse response to compute, and the IRF code raises on the empty coefficient
+            # list rather than saying so. Floor at 1 and put the fact in the note: p*=0 is
+            # information (the criterion found nothing), not a value to fit.
+            n_lags = max(1, int(p_sel))
+            if int(p_sel) == 0:
+                lag_note += (" The criterion selected p=0 -- no dynamics at all -- which cannot be "
+                             "fitted as an IRF; p=1 is used and the response should be read as "
+                             "impact-only. A p=0 selection on a wide correlation window usually "
+                             "means the criterion could not see the window's own MA spike, not "
+                             "that the system is dynamically empty.")
+            # The lag order is a researcher degree of freedom that ends up in this note, so the note
+            # is where a reader has to be told when it is not a finding. d(W-bar rolling correlation)
+            # carries an MA term at exactly lag W; on data with a CONSTANT correlation the criterion
+            # returns p*=W every time (test_svar_lag_artifact.py). A table whose lag equals its own
+            # window is reporting its estimator, and this says so in the caption rather than in a log
+            # nobody keeps.
+            _d = csv.lag_diagnosis(p_sel, corr_window=corr_window, pmax=pmax, corr_method="rolling")
+            if not _d["ok"]:
+                lag_note += " CAUTION: " + _d["text"]
     kw = dict(spec=spec, n_lags=n_lags, horizon=horizon, ident=ident, cumulative=cumulative,
               corr_window=corr_window, min_obs=min_obs, extra_fn=extra_fn, seed=seed, n_jobs=n_jobs)
     base = ("Impact" if not cumulative else f"Cumulative ({horizon}-step)") + \
            f" orthogonalized response of d-correlation, x100; identification = {ident}; VAR({n_lags})." + lag_note
     out, nums = {}, {}
-    for label, method in (("Pearson", "rolling"), ("HY", "hy")):
+    for label, method in methods:
         if n_boot and n_boot > 0:
             res = csv.correlation_irf_inference(sessions, corr_method=method, n_boot=n_boot,
                                                 alpha=0.10, **kw)
