@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.9.43 -- one version number, enforced; and the measurement that decides rebuild-vs-ladder
+
+**The archive shipped as `v0934` for nine consecutive releases.** `__init__.__version__` sat at
+0.9.20 while the CHANGELOG read 0.9.42 and the package directory said `v0_9_34` -- three different
+answers to "which version is this?", with the archive name, the one artifact that leaves the
+machine, the most wrong of the three.
+
+New `check_version.py`, in the STAGE 1 gate, refuses to let them disagree. It also DERIVES the
+package directory and archive names from `__version__` (`package_name()`, `archive_name()`) so the
+packaging step cannot pick one by hand, and warns when a stale archive from an older version is
+sitting next to the package waiting to be shipped by mistake. On its first run it failed all three
+checks, which is the point.
+
+The directory is now `cross_asset_price_discovery_stack_v0_9_43` and the archive
+`cross_asset_price_discovery_stack_v0943.zip`.
+
+**On rebuilding the ES book versus using CME's ladder.** It is already a parameter --
+`--es-book-source {aggregated,replay}`, added in v0.9.42 -- and both paths are tested. What was
+missing is the evidence to choose between them, so this release adds it rather than more argument.
+
+* `validate_aggregated.py` now selects the message family by row count, exactly as the extractor
+  does. Hardcoding the order-by-order types meant the replay-vs-ladder comparison **could not run at
+  all on the 2020 sessions**: it replayed nothing and would have reported a 0% match against a
+  perfectly good ladder. The one comparison that answers the question was unavailable on precisely
+  the four dates where the question mattered.
+* New `ladder_cadence()` / `describe_cadence()` report how often the venue republishes the ladder
+  **relative to the sampling grid**, which is what actually decides it. The two sources can only
+  differ on the grid the paper uses if the ladder is republished LESS often than the grid samples
+  it. If it updates many times per grid cell, an as-of sample takes the same final state a replay
+  would reach and the choice is immaterial for every measurement built on that grid; if it does not,
+  cells without an update are stale and `--es-book-source replay` is the better default. The report
+  states which, in those terms.
+
+What cadence does NOT settle, and the report says so: order-level detail -- queue position, per-order
+dynamics -- is absent from an aggregated ladder at any cadence. A question that needs it needs the
+replay regardless.
+
 ## v0.9.42 -- the ES leg is CME's own ladder, on every date in the panel
 
 The futures leg is now built from `mt_aggregated_price_update` rather than replayed from messages.

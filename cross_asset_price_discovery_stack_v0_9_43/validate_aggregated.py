@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -78,6 +79,77 @@ def aggregated_to_canonical(df: pd.DataFrame, asset: str, levels: int = 10,
             out[f"{asset}_{tag}quantity_{i}"] = _num(f"{side}quantity_{i}").to_numpy(float)
     out[f"{asset}_mid"] = (out[f"{asset}_bidprice_1"] + out[f"{asset}_askprice_1"]) / 2.0
     return out
+
+
+def ladder_cadence(agg: pd.DataFrame, interval: str = "1s", session=("09:30", "16:00"),
+                   tz: str = "America/New_York", date_str: Optional[str] = None) -> dict:
+    """How often the venue republishes the ladder, RELATIVE TO THE SAMPLING GRID.
+
+    This is the number that decides "rebuild the ES book or use CME's ladder", and it decides it
+    empirically rather than by argument. The two sources can only differ on the grid the paper
+    actually uses if the ladder is republished LESS often than the grid samples it. If the ladder
+    updates many times per grid cell, then the as-of sample takes the same final state a replay
+    would have reached, and the choice is immaterial for every measurement built on that grid.
+
+    So: the fraction of grid cells containing at least one ladder update, and the median number of
+    updates per cell. A ladder that beats the grid comfortably makes the question moot; one that
+    does not is a real argument for rebuilding, and the numbers say which.
+
+    Note what this does NOT settle: order-level detail (queue position, per-order dynamics) is
+    absent from an aggregated ladder at ANY cadence, so a question that needs it needs the replay
+    regardless of what this reports."""
+    out = {"n_rows": int(len(agg))}
+    if agg is None or len(agg) == 0:
+        return out
+    idx = agg.index
+    if getattr(idx, "tz", None) is None:
+        idx = pd.DatetimeIndex(idx).tz_localize(tz)
+    else:
+        idx = idx.tz_convert(tz)
+    if date_str:
+        d = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+    else:
+        d = idx[0].strftime("%Y-%m-%d")
+    g0 = pd.Timestamp(f"{d} {session[0]}", tz=tz)
+    g1 = pd.Timestamp(f"{d} {session[1]}", tz=tz)
+    grid = pd.date_range(g0, g1, freq=interval)
+    insess = idx[(idx >= g0) & (idx <= g1)]
+    out["n_in_session"] = int(len(insess))
+    out["n_cells"] = int(len(grid))
+    if not len(insess) or len(grid) < 2:
+        return out
+    step = grid[1] - grid[0]
+    cell = ((insess - g0) // step).astype("int64")
+    per = pd.Series(1, index=cell).groupby(level=0).size()
+    out["cells_covered_frac"] = float(len(per) / len(grid))
+    out["updates_per_cell_median"] = float(per.median())
+    out["updates_per_cell_p05"] = float(per.quantile(0.05))
+    gaps = np.diff(insess.values).astype("timedelta64[ns]").astype(float) / 1e9
+    out["gap_median_s"] = float(np.median(gaps)) if len(gaps) else float("nan")
+    out["gap_p95_s"] = float(np.quantile(gaps, 0.95)) if len(gaps) else float("nan")
+    out["grid_s"] = float(step.total_seconds())
+    return out
+
+
+def describe_cadence(c: dict) -> list:
+    if not c.get("n_in_session"):
+        return ["ladder cadence: no in-session rows"]
+    faster = c.get("gap_median_s", float("inf")) < c.get("grid_s", 1.0)
+    lines = ["ladder cadence vs the %.0fs sampling grid: %s in-session update(s) over %s cell(s); "
+             "median gap %.4fs (p95 %.4fs); %.1f%% of cells carry an update, median %.0f per cell"
+             % (c.get("grid_s", 1.0), f"{c['n_in_session']:,d}", f"{c['n_cells']:,d}",
+                c.get("gap_median_s", float("nan")), c.get("gap_p95_s", float("nan")),
+                100 * c.get("cells_covered_frac", 0.0), c.get("updates_per_cell_median", 0))]
+    if faster:
+        lines.append("  -> the ladder is republished FASTER than the grid samples it, so an as-of "
+                     "sample takes the same final state a replay would reach. On this grid the two "
+                     "book sources cannot materially differ; rebuilding buys order-level detail "
+                     "(queue position), not accuracy.")
+    else:
+        lines.append("  -> the ladder is republished SLOWER than the grid samples it, so cells "
+                     "without an update are stale. Here rebuilding from messages IS more faithful "
+                     "and --es-book-source replay is the better default.")
+    return lines
 
 
 def session_statistics(df: pd.DataFrame, price_scale: float = 1.0) -> dict:
@@ -147,22 +219,43 @@ def run(date_str, product, ptype="futures", price_scale=0.01, levels=10, interva
     feeds = sorted(agg["f"].astype(str).unique()) if "f" in agg.columns else []
     asset = "X"
 
+    # EVERY candidate family, then let the row counts choose -- the same rule the extractor uses.
+    # Hardcoding the order-by-order types here meant this validation could not run at all on the
+    # 2020 sessions, whose capture is price-level: it would replay nothing and report a 0% match
+    # against a perfectly good ladder. The comparison that decides "rebuild or use the ladder" was
+    # unavailable on exactly the four dates where the question mattered.
     msgs = {}
     for mt in ("mt_add_order", "mt_cancel_order", "mt_modify_order", "mt_trade",
+               "mt_price_level_update", "mt_modify_price_level", "mt_delete_price_level",
                "mt_clear_orders", "mt_clear_price_levels"):
         try:
             msgs[mt] = _fetch(date_str, product, ptype, mt, data_source, tz, clock)
         except Exception as exc:
             return (f"{product} {date_str}: fetch {mt} failed ({exc}); cannot validate a replay that "
                     f"could not be built.", 1)
+    counts = {k: int(len(v)) for k, v in msgs.items()}
+    family, why = lob.select_book_family(counts)
+    if family in ("MBO", "MBP"):
+        keep = set(lob._MBO_INSERT + lob._MBO_REMOVE) if family == "MBO" else \
+            set(lob._MBP_INSERT + lob._MBP_REMOVE)
+        for mt in list(msgs):
+            if mt in set(lob._MBO_INSERT + lob._MBO_REMOVE + lob._MBP_INSERT + lob._MBP_REMOVE) \
+                    and mt not in keep:
+                msgs[mt] = pd.DataFrame()
+    elif family is None:
+        return (f"{product} {date_str}: no message family can build a book here -- {why}. The ladder "
+                f"has {len(agg):,d} row(s), so the ES leg is fine; there is simply no independent "
+                f"replay to compare it against on this date.", 1)
     recon = lob.reconstruct_book(msgs, asset=asset, levels=levels, interval=interval,
                                  session=(a, b), tz=tz, date_str=date_str, clock=clock,
                                  price_scale=price_scale, consume=True)
     bench = aggregated_to_canonical(agg, asset, levels=levels, price_scale=price_scale)
     tbl = compare(recon, bench, asset, levels=levels)
+    cadence = ladder_cadence(agg, interval=interval, session=(a, b), tz=tz, date_str=date_str)
 
     lines = [f"reconstruction vs the venue's own ladder: {product} ({ptype}) {date_str}",
              f"benchmark = {_AGG}, feeds={feeds or '?'}, SAME lake and SAME capture clock ({clock})",
+             f"replay built from the {family} family ({why})",
              f"grid {interval} over {session}, {len(recon):,d} snapshots, price_scale={price_scale}", ""]
     if tbl.empty:
         return ("\n".join(lines + ["no comparable levels"]), 1)
@@ -176,6 +269,7 @@ def run(date_str, product, ptype="futures", price_scale=0.01, levels=10, interva
     l1 = tbl[tbl["level"] == 1]
     worst = float(np.nanmin(l1["price_match"])) if len(l1) else np.nan
     lines.append("level-1 price agreement: %s" % ("n/a" if not np.isfinite(worst) else f"{worst:.4%}"))
+    lines += [""] + describe_cadence(cadence)
 
     try:
         st = _fetch(date_str, product, ptype, _STATS, data_source, tz, clock)

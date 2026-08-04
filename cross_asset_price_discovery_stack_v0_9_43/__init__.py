@@ -31,7 +31,12 @@ if _HERE not in _sys.path:
 OUTPUT_DIR = _os.path.join(_HERE, "output")
 _os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-__version__ = "0.9.20"
+#: THE version. Single source of truth: the package directory name, the release archive name and
+#: the CHANGELOG's top entry are all derived from or checked against it (see check_version.py,
+#: which is in the STAGE 1 gate). It drifted 22 releases once -- pinned at 0.9.20 while the
+#: CHANGELOG read 0.9.42 and every archive shipped as "v0934" -- so the check is a test, not a
+#: convention.
+__version__ = "0.9.43"
 
 __all__ = [
     'autoscale',

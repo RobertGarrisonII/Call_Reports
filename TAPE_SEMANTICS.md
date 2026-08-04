@@ -623,3 +623,37 @@ direction: the leg *is* the ladder, so the comparison is evidence that an indepe
 from raw messages reproduces it — i.e. that the ladder is a faithful book rather than a lossy
 summary of one. It validates the **source choice**, not the extraction, and the driver and the
 module both say so now. Reporting it the old way would be circular.
+
+## 19. Rebuild or use the ladder? The measurement that decides it
+
+§18 switched the ES leg to CME's ladder. That was a judgement call, and it deserves evidence rather
+than argument, so `validate_aggregated.py` now reports the number that settles it.
+
+**The two sources can only differ on the grid the paper actually uses if the ladder is republished
+less often than the grid samples it.** If CME republishes many times per 1-second cell, an as-of
+sample takes the same final state a replay would reach, and the choice cannot materially affect any
+measurement built on that grid. If it republishes more slowly, cells without an update are stale and
+rebuilding *is* more faithful. `ladder_cadence()` measures exactly that — median inter-update gap,
+fraction of grid cells carrying an update, updates per cell — and `describe_cadence()` states the
+verdict in those terms.
+
+What cadence does **not** settle, and the report says so: order-level detail — queue position,
+per-order dynamics — is absent from an aggregated ladder at any cadence. A question that needs it
+needs the replay regardless of how fast the ladder ticks.
+
+**A gap this exposed.** `validate_aggregated.py` hardcoded the order-by-order message types, so on
+the 2020 sessions it replayed nothing and would have reported a 0% match against a perfectly good
+ladder. The one comparison that answers "rebuild or ladder?" was unavailable on precisely the four
+dates where the question matters. It now selects the family by row count, exactly as the extractor
+does (§17).
+
+## 20. One version number
+
+`__init__.__version__` sat at 0.9.20 while the CHANGELOG read 0.9.42 and the package directory said
+`v0_9_34` — and the release archive shipped as `v0934` for nine consecutive releases. Three
+different answers to "which version is this?", with the archive name, the one artifact that leaves
+the machine, the most wrong.
+
+`check_version.py` (in the STAGE 1 gate) refuses to let them disagree, and `package.sh` derives both
+names from `__version__` so packaging cannot pick one by hand. It also warns when a stale archive
+from an older version is sitting next to the package waiting to be shipped by mistake.

@@ -288,6 +288,7 @@ if have_stage 1; then
            test_extract_resilience.py \
            test_validate_sample.py \
            test_feed_reset.py \
+           check_version.py \
            test_validate_aggregated.py \
            test_halt_aware_qc.py \
            test_driver_flags.py \
