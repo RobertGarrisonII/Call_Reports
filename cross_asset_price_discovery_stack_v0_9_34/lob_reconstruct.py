@@ -700,6 +700,63 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
     return out
 
 
+_MBO_INSERT = ("mt_add_order",)
+_MBO_REMOVE = ("mt_cancel_order", "mt_modify_order")
+_MBP_INSERT = ("mt_price_level_update", "mt_modify_price_level")
+_MBP_REMOVE = ("mt_price_level_update", "mt_delete_price_level")
+
+
+def select_book_family(counts: dict) -> tuple:
+    """Which family of messages actually carries the book, decided from ROW COUNTS, not from an era.
+
+    CME's capture changed shape between 2020 and 2024, and both shapes were mis-read once:
+
+        message type                 2020 ES      2024 ES
+        mt_add_order                 1-4 rows*    populated
+        mt_cancel_order              EMPTY        populated
+        mt_modify_order              EMPTY        populated
+        mt_price_level_update        EMPTY        EMPTY
+        mt_modify_price_level        populated    EMPTY
+        mt_delete_price_level        populated    EMPTY
+        mt_trade                     populated    populated
+
+        * one to four rows for an entire session, under a probe limit of five -- so those are
+          complete counts, not truncated ones. Stray messages, not a stream.
+
+    So the 2020 capture is market-by-PRICE and the 2024 capture is market-by-ORDER, and
+    `mt_price_level_update` -- the one MBP type the extractor did fetch -- is empty in BOTH eras.
+    That is why "CME publishes no price-level types" looked true when it was checked against 2024:
+    the check used the only MBP type CME never populates.
+
+    This function exists so the lesson is not re-learned a third time. Nothing here is keyed to a
+    date. A family is viable only if it has BOTH an insert source and a removal source with rows,
+    which is what rules 2020's four stray adds out: adds without cancels do not build a thin book,
+    they build a book nothing ever leaves, and every level rests to the close.
+
+    -> (family, reason) with family in {'MBO', 'MBP', 'BOTH', None}. 'BOTH' keeps everything, which
+    is the correct answer for a hybrid consolidated equity book and the reason this is opt-in."""
+    def tot(names):
+        return sum(int(counts.get(n, 0) or 0) for n in names)
+
+    mbo_i, mbo_r = tot(_MBO_INSERT), tot(_MBO_REMOVE)
+    mbp_i, mbp_r = tot(_MBP_INSERT), tot(_MBP_REMOVE)
+    mbo_ok, mbp_ok = mbo_i > 0 and mbo_r > 0, mbp_i > 0 and mbp_r > 0
+    detail = ("MBO insert=%d remove=%d; MBP insert=%d remove=%d" % (mbo_i, mbo_r, mbp_i, mbp_r))
+    if mbo_ok and mbp_ok:
+        # BOTH, never "the denser one". A consolidated equity book is genuinely hybrid -- some
+        # venues publish order-by-order and others price-level, and SPY needs them together.
+        # Discarding the smaller family there would silently drop whole venues from the NBBO.
+        return "BOTH", "both families are populated and both are kept (%s)" % detail
+    if mbo_ok:
+        return "MBO", "order-by-order (%s)" % detail
+    if mbp_ok:
+        return "MBP", "price-level (%s)" % detail
+    if mbo_i or mbp_i:
+        return None, ("inserts arrived but NO removals, so the book would never empty and every "
+                      "level would rest to the close (%s)" % detail)
+    return None, "no book-carrying messages at all (%s)" % detail
+
+
 def reconstruct_session(date_str: str, product: str = "SPY", product_type: str = "direct",
                         levels: int = 10, interval: str = "1s", round_lot: int = 100,
                         odd_lot_inclusive: bool = True, session=("09:30", "16:00"),
@@ -708,7 +765,8 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
                         message_types=("mt_add_order", "mt_cancel_order", "mt_modify_order", "mt_trade",
                                        "mt_price_level_update", "mt_clear_orders",
                                        "mt_clear_price_levels"),
-                        progress_cb=None, strict: bool = True, rules: Optional[dict] = None):
+                        progress_cb=None, strict: bool = True, rules: Optional[dict] = None,
+                        select_family: bool = False):
     """Live entry point: fetch the message types via mstbook_loader and reconstruct the book on one
     GPS-disciplined capture clock. Multi-venue equities (SPY) come back as the consolidated NBBO/ladder
     (hybrid MBO+MBP); a single-venue future (ES) is a CME order-by-order (MBO) replay -- pass the MBO
@@ -749,6 +807,26 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
                              "them" if len(critical) > 1 else "it",
                              "; ".join(f"{k}: {v}" for k, v in sorted(failed.items()))))
     counts = {mt: int(len(f)) for mt, f in msgs.items()}
+    # ``select_family``: fetch every candidate type and let the ROW COUNTS say which family carries
+    # the book on this date, rather than hardcoding an era (see select_book_family). The losing
+    # family is dropped so its stray messages -- 2020's four orphan adds, which have no cancels to
+    # remove them -- cannot leak levels into a book built from the other family.
+    family = None
+    if select_family:
+        family, why = select_book_family(counts)
+        log.info("%s %s: book family = %s -- %s", date_str, product, family or "NONE", why)
+        keep = set(_MBO_INSERT + _MBO_REMOVE + _MBP_INSERT + _MBP_REMOVE)
+        if family == "MBO":
+            keep = set(_MBO_INSERT + _MBO_REMOVE)
+        elif family == "MBP":
+            keep = set(_MBP_INSERT + _MBP_REMOVE)
+        if family in ("MBO", "MBP"):
+            for mt in list(msgs):
+                if mt in set(_MBO_INSERT + _MBO_REMOVE + _MBP_INSERT + _MBP_REMOVE) and mt not in keep:
+                    if counts.get(mt):
+                        log.info("%s %s: dropping %d %s row(s) -- not part of the %s family carrying "
+                                 "this session", date_str, product, counts[mt], mt, family)
+                    msgs[mt] = pd.DataFrame()
     # When the product actually TRADED. Free -- the tape is already in memory -- and it is the only
     # reliable end for a CME halt window: the status flag marks the stop to the millisecond and then
     # clears 6 s later while the market stays down for a quarter of an hour (market_halts.activity).
@@ -767,6 +845,7 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
                            session=session, tz=tz, date_str=date_str, clock=clock, price_scale=price_scale,
                            consume=True, rules=rules)
     out.attrs["message_counts"] = counts
+    out.attrs["book_family"] = family
     out.attrs["activity_seconds"] = list(act)
 
     # A fetch that SUCCEEDS and returns zero rows was silently fine here, and that is how the four
@@ -790,12 +869,14 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
             "%s %s: the reconstructed book has a finite top on 0 of %d snapshots -- the leg is "
             "MISSING, not thin, and returning it would put a full-length all-NaN column into the "
             "dataset (which is how the 2020 ES sessions got there). Book-critical type(s) with zero "
-            "rows: %s. Row counts: %s. If the day really is empty for these types the feed carries "
-            "this product some other way for this era -- check mt_price_level_update / "
-            "mt_aggregated_price_update and the contract code -- rather than replaying nothing."
+            "rows: %s. Row counts: %s. Family verdict: %s. If the day really is empty for these "
+            "types the feed carries this product some other way for this era -- pass "
+            "select_family=True with the MBO and MBP types together, or fall back to "
+            "mt_aggregated_price_update -- rather than replaying nothing."
             % (date_str, product, len(out), ", ".join(empty) or "(none -- rows arrived but built no "
                "book, so suspect the product/venue filter or price_scale)",
-               ", ".join("%s=%d" % (k, v) for k, v in sorted(counts.items()))))
+               ", ".join("%s=%d" % (k, v) for k, v in sorted(counts.items())),
+               "%s (%s)" % select_book_family(counts)))
     if n_top == 0:
         log.warning("%s %s: reconstructed book is EMPTY (0 finite tops of %d snapshots); row counts: "
                     "%s", date_str, product, len(out),

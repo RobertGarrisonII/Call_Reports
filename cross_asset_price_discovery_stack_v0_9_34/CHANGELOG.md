@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.9.41 -- the 2020 ES capture is market-by-PRICE (the missing leg, diagnosed)
+
+`probe_es_2020.py` across all four MWCB dates and both contracts, with 2024-12-18 as control:
+
+| message type | 2020 ES | 2024 ES |
+|---|---|---|
+| `mt_add_order` | **1-4 rows for a whole session*** | populated |
+| `mt_cancel_order` | **EMPTY** | populated |
+| `mt_modify_order` | **EMPTY** | populated |
+| `mt_price_level_update` | **EMPTY** | **EMPTY** |
+| `mt_modify_price_level` | **populated** | EMPTY |
+| `mt_delete_price_level` | **populated** | EMPTY |
+| `mt_trade` | populated | populated |
+
+\* under a probe limit of five, so those are COMPLETE counts -- stray messages, not a stream.
+
+**The 2020 CME capture is market-by-price; the 2024 capture is market-by-order.** The extractor asked
+for order-by-order on every date, so on the four 2020 sessions it fetched a handful of orphan adds,
+no cancels and no modifies, and built nothing. That is the whole of `median ES=nan (ES/SPY=nan)`.
+`mt_missing_product_messages` and `mt_error` are empty on every 2020 date and both contracts: the
+capture is intact, and the wrong question was asked of it.
+
+**Why a direct check missed it.** `mt_price_level_update` -- the one MBP type the ES fetch list did
+carry -- is empty in BOTH eras. Tested against 2024 it returned "header only", which read as "CME
+publishes no price-level types" and went into the code as a fact about the venue. It was a fact
+about the one MBP type CME never populates.
+
+**The fix is deliberately NOT "2020 uses MBP".** That hardcodes a second era observation one release
+after the first one broke. Every candidate type is now fetched and `select_book_family()` picks from
+the row counts, requiring both an insert source AND a removal source -- which is what rules out the
+four orphan adds. Adds without cancels do not build a thin book; they build a book nothing ever
+leaves, with depth growing monotonically and the top crossed on most snapshots. That is the exact
+signature of the original crossed-book bug, and a naive "use whatever has rows" fallback produces
+it. When both families are populated the verdict is `BOTH` and nothing is dropped, because a
+consolidated equity book is genuinely hybrid and taking "the denser family" on SPY would silently
+remove whole venues from the NBBO.
+
+`_extract_one_session` now fetches the full candidate set for ES with `select_family=True`; the
+chosen family is logged, recorded in `attrs["book_family"]`, and named in the empty-book error so
+the next reader is told the capture is price-level rather than having to re-derive it.
+
+New `test_es_book_family.py` (5 checks) pins the probe's real counts, the orphan-add refusal, the
+hybrid `BOTH` case, an end-to-end 2020-shaped fetch that builds a correct 2546.50/2547.00 book with
+the orphan ask excluded, and the old fetch list now failing loudly on 2020 data.
+
+**A methodology question this raises, not a defect.** `mt_aggregated_price_update` is populated in
+BOTH eras -- the only book source uniform across the whole sample. Using it for the ES leg
+throughout would remove the futures replay entirely and make the ES methodology identical on every
+date, at the cost of CME's published depth rather than a reconstructed one.
+`validate_aggregated.py` already reads it and already shows the 2024 MBO replay agreeing with it.
+
 ## v0.9.40 -- 2020-03-12 closes the set: all four MWCB days measured
 
 `mt_product_status` and `mt_product_statistics` for ESH0 and ESM0 on the roll boundary itself, the

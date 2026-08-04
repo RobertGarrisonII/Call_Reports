@@ -540,3 +540,50 @@ confirmations of boundaries hand-entered before any of them was checked.
 
 2020-03-12 has the busiest pre-halt tape of the four (240 lots/s) and still falls 73%. 2020-03-16
 remains excluded — no RTH baseline exists when the halt begins one second after the open.
+
+## 17. The 2020 ES leg: the capture is market-by-PRICE
+
+`probe_es_2020.py` across all four MWCB dates and both contracts, with 2024-12-18 as control:
+
+| message type | 2020 ES | 2024 ES |
+|---|---|---|
+| `mt_add_order` | **1–4 rows for a whole session*** | populated |
+| `mt_cancel_order` | **EMPTY** | populated |
+| `mt_modify_order` | **EMPTY** | populated |
+| `mt_price_level_update` | **EMPTY** | **EMPTY** |
+| `mt_modify_price_level` | **populated** | EMPTY |
+| `mt_delete_price_level` | **populated** | EMPTY |
+| `mt_trade` | populated | populated |
+| `mt_aggregated_price_update` | populated | populated |
+
+\* under a probe limit of five, so those are *complete* counts — stray messages, not a stream.
+
+**The 2020 CME capture is market-by-price; the 2024 capture is market-by-order.** The extractor
+asked for order-by-order on every date, so on the four 2020 sessions it fetched a handful of orphan
+adds, no cancels and no modifies, and built nothing. That is the whole of `median ES=nan`.
+
+`mt_missing_product_messages` and `mt_error` are empty on every 2020 date and both contracts, so the
+capture is intact. Nothing was lost; the wrong question was asked.
+
+**Why a direct check missed it.** `mt_price_level_update` — the one MBP type the ES fetch list did
+carry — is empty in **both** eras. Testing it against 2024 returned "header only", which read as
+*"CME publishes no price-level types"* and was written into the code as a fact about the venue. It
+was a fact about the one MBP type CME never populates. §6 recorded that conclusion and it was wrong.
+
+**The fix is deliberately not "2020 uses MBP".** That would hardcode a second era observation one
+release after the first one broke, and a third capture change would break it again. Every candidate
+type is now fetched and `lob_reconstruct.select_book_family()` picks from the row counts, requiring
+both an insert source **and** a removal source. That requirement is what rules out 2020's four
+orphan adds: adds with no cancels do not build a thin book, they build a book nothing ever leaves —
+depth growing monotonically, top crossed on most snapshots, the exact signature of the original
+crossed-book bug. A naive "use whatever has rows" fallback would have produced it.
+
+A consolidated equity book is genuinely hybrid, so when both families are populated the verdict is
+`BOTH` and nothing is dropped — taking "the denser family" on SPY would silently remove whole venues
+from the NBBO.
+
+**Still open: `mt_aggregated_price_update` is populated in both eras** — the only book source uniform
+across the whole sample. Using it for the ES leg throughout would remove the futures replay entirely
+and make the ES methodology identical on every date, at the cost of CME's published depth rather
+than a reconstructed one. `validate_aggregated.py` already reads it and already shows the 2024 MBO
+replay agreeing with it. That is a methodology decision, not a defect.

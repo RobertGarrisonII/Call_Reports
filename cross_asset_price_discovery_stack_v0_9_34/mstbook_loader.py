@@ -1064,14 +1064,26 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                                  session=(cfg["start_time"], cfg["end_time"]), tz=cfg["tz"],
                                  data_source=cfg["data_source"], clock=cfg["clock"],
                                  price_scale=cfg["futures_scale"], progress_cb=progress_cb,
-                                 # CME publishes NO price-level types for ES (mt_price_level_update /
-                                 # mt_modify_price_level / mt_delete_price_level all return header-only),
-                                 # so the futures leg is MBO by necessity, not by choice. The clear
-                                 # types ARE in the futures schema -- empty on a normal day, but a
-                                 # Globex reset on a crash day would otherwise be invisible, and an
-                                 # empty query costs nothing next to a 10-25 minute session.
+                                 # EVERY candidate type, with the family chosen from row counts at
+                                 # run time (lob.select_book_family). CME's capture changes shape
+                                 # across eras -- 2024 ES is order-by-order with the MBP types empty,
+                                 # 2020 ES is price-level via mt_modify_price_level /
+                                 # mt_delete_price_level -- and `mt_price_level_update`, the one MBP
+                                 # type the old fetch list carried, is empty in BOTH. That is how the
+                                 # four 2020 sessions came back with no ES leg at all: the fetch
+                                 # asked for order-by-order on a price-level capture and got a
+                                 # session's worth of nothing.
+                                 #
+                                 # Hardcoding "2020 = MBP" would repeat the mistake one era later,
+                                 # so nothing here is keyed to a date. The clear types are included
+                                 # for the same reason as before: empty on a normal day, but a Globex
+                                 # reset on a crash day would otherwise be invisible, and an empty
+                                 # query costs nothing next to a 10-25 minute session.
+                                 select_family=True,
                                  message_types=("mt_add_order", "mt_cancel_order", "mt_modify_order",
-                                                "mt_trade", "mt_clear_orders", "mt_clear_price_levels"))
+                                                "mt_trade", "mt_price_level_update",
+                                                "mt_modify_price_level", "mt_delete_price_level",
+                                                "mt_clear_orders", "mt_clear_price_levels"))
     df = spy.join(es, how="outer").sort_index()
     # when each leg actually traded -- the resume signal for a CME halt window (see market_halts)
     _activity = {"SPY": spy.attrs.get("activity_seconds"), "ES": es.attrs.get("activity_seconds")}
