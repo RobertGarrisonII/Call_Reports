@@ -25,6 +25,16 @@ boundaries; this catches that.
 
 Exit codes: 0 = agreement within tolerance;  2 = disagreement;  1 = could not run.
 
+WHAT THIS PROVES SINCE v0.9.42. The extractor now builds the ES leg FROM this ladder
+(aggregated_book.py), so running this is no longer a check on the shipped futures book -- that would
+be the ladder against itself. The direction has inverted, and the result is still worth having: an
+INDEPENDENT reconstruction from the raw message tape is compared against the ladder, and agreement
+is evidence that the ladder is a faithful book rather than a lossy summary of one. It validates the
+SOURCE CHOICE, not the extraction. Report it that way.
+
+It also remains the right tool if the leg is switched back with --es-book-source replay, where it
+recovers its original meaning.
+
 CAVEAT on mt_product_statistics: the rows are a running stream and the EARLY ones carry the PREVIOUS
 session's figures (on 2024-12-18 the 17:38 ET row still shows the prior settlement, stamped
 2024-12-15 19:00 ET). Take the last non-null value of each field inside the trade date, never the

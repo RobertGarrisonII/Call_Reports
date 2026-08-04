@@ -1059,8 +1059,25 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                                   round_lot=cfg["round_lot"], odd_lot_inclusive=cfg["odd_lot_inclusive"],
                                   session=(cfg["start_time"], cfg["end_time"]), tz=cfg["tz"],
                                   data_source=cfg["data_source"], clock=cfg["clock"], progress_cb=progress_cb)
-    es = lob.reconstruct_session(ymd, contract, "futures", levels=cfg["levels"], interval=cfg["interval"],
-                                 round_lot=cfg["round_lot"], odd_lot_inclusive=cfg["odd_lot_inclusive"],
+    # THE ES LEG COMES FROM CME'S OWN LADDER (mt_aggregated_price_update), not from a replay.
+    # CME is one venue and its ladder IS the book, so there is nothing to consolidate; the ladder is
+    # populated in every era checked while the message families are not (2024 order-by-order, 2020
+    # price-level, and the one MBP type the old fetch list carried empty in both); and it gives ONE
+    # mechanism across a 2020-2026 panel instead of two. validate_aggregated.py already compares the
+    # replay against this same ladder and the driver runs it as a gate, so this is a switch to the
+    # benchmark the replay was measured against. See aggregated_book.py for what is given up.
+    if cfg.get("es_book_source", "aggregated") == "aggregated":
+        import aggregated_book as ab
+        es = ab.session_from_aggregated(ymd, contract, "futures", levels=cfg["levels"],
+                                        interval=cfg["interval"],
+                                        session=(cfg["start_time"], cfg["end_time"]), tz=cfg["tz"],
+                                        data_source=cfg["data_source"], clock=cfg["clock"],
+                                        price_scale=cfg["futures_scale"], progress_cb=progress_cb)
+    else:
+        # the message replay, kept reachable: --es-book-source replay. Needed if a future question
+        # asks for futures QUEUE dynamics, which the aggregated ladder cannot answer.
+        es = lob.reconstruct_session(ymd, contract, "futures", levels=cfg["levels"],
+                                 interval=cfg["interval"], round_lot=cfg["round_lot"], odd_lot_inclusive=cfg["odd_lot_inclusive"],
                                  session=(cfg["start_time"], cfg["end_time"]), tz=cfg["tz"],
                                  data_source=cfg["data_source"], clock=cfg["clock"],
                                  price_scale=cfg["futures_scale"], progress_cb=progress_cb,
@@ -1259,7 +1276,8 @@ def extract_sessions(date_specs: Sequence, es_symbol: str = "ES", levels: int = 
                      data_source: str = "apu", tz: str = "America/New_York", with_flow: bool = True,
                      classify: str = "aggressor", side_buy_label: str = "Bid",
                      futures_scale: float = 0.01, rollover_days: int = 8,
-                     book_source: str = "reconstruct", round_lot: int = 100,
+                     book_source: str = "reconstruct", es_book_source: str = "aggregated",
+                     round_lot: int = 100,
                      odd_lot_inclusive: bool = True, clock: str = "receipt",
                      progress: Optional[bool] = None, max_workers: int = 1,
                      backend: Optional[str] = None, cache_dir: str = "", resume: bool = True,
@@ -1321,7 +1339,8 @@ def extract_sessions(date_specs: Sequence, es_symbol: str = "ES", levels: int = 
            "end_time": end_time, "data_source": data_source, "tz": tz, "with_flow": with_flow,
            "classify": classify, "side_buy_label": side_buy_label, "futures_scale": futures_scale,
            "rollover_days": rollover_days, "round_lot": round_lot, "odd_lot_inclusive": odd_lot_inclusive,
-           "clock": clock, "cache_dir": cache_dir, "resume": bool(resume), "crossed_tol": crossed_tol}
+           "clock": clock, "cache_dir": cache_dir, "resume": bool(resume), "crossed_tol": crossed_tol,
+           "es_book_source": es_book_source}
 
     def _emit(msg):                                         # per-session summary line
         _tqdm.write(msg) if bar is not None else log.info("%s", msg)

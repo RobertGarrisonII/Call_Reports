@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.9.42 -- the ES leg is CME's own ladder, on every date in the panel
+
+The futures leg is now built from `mt_aggregated_price_update` rather than replayed from messages.
+
+**Why.** CME is a single venue and its ladder IS the book -- there is nothing to consolidate, so
+replaying messages to rebuild an object the venue already publishes, on the same lake and the same
+capture clock, adds a failure mode and buys nothing. The ladder is populated in every era checked
+while the message families are not (v0.9.41: 2024 order-by-order, 2020 price-level, and the one MBP
+type the old fetch list carried empty in both), so the leg stops depending on which family the
+vendor happened to capture. And a 2020-2026 panel should not build its futures book two different
+ways depending on the year.
+
+**What is given up, stated plainly.** Aggregated depth carries price and size per level but no
+order-level detail: no per-order queue position, and depth limited to the ten levels CME
+disseminates. Nothing in this paper's ES measurements needs more -- they are top-of-book and 10-level
+depth on a 1-second grid -- but a future question about futures queue dynamics would need the replay.
+It is kept, still tested, and still era-aware: `--es-book-source replay`.
+
+New `aggregated_book.py`:
+
+* `session_from_aggregated()` builds one session on the same grid with the SAME schema as the replay
+  -- `ES_{bid,ask}{price,quantity}_{1..10}`, `ES_nbbo_bid/ask`, `ES_mid` -- so nothing downstream can
+  tell which source it got. `nbbo` equals the top of the ladder because CME has no odd lots and
+  nothing to consolidate. A level the venue never published gets price NaN and quantity 0.0, exactly
+  as the replay emits, so depth sums agree.
+* As-of sampling is forward-only: a grid point preceding every ladder row is NaN, never back-filled.
+  The pre-open rows (ES publishes from ~17:45 ET the previous day) are why the fetch is not
+  restricted to the session -- the ladder is warm at 09:30 and the first snapshot is a real book.
+* The column mapping is delegated to `validate_aggregated.aggregated_to_canonical` so the BOOK and
+  the BENCHMARK cannot drift apart.
+* An empty ladder RAISES rather than returning a full-length all-NaN leg, and the message points at
+  the replay fallback.
+* `activity_seconds` still comes from `mt_trade`, not the ladder: the ladder keeps updating through
+  a CME stop (orders can be entered and pulled), so it cannot mark the resume, and the status flag
+  understates a CME stop by ~130x.
+
+**One consequence for the validation section of the paper.** `validate_aggregated.py` compares a
+message replay against this ladder. That used to validate the shipped ES book; it now runs in the
+opposite direction, because the leg IS the ladder. It is still worth running -- agreement is evidence
+that an independent reconstruction from the raw tape reproduces the ladder, i.e. that the ladder is a
+faithful book rather than a lossy summary of one -- but it validates the SOURCE CHOICE, not the
+extraction. Reporting it the old way would be circular. The driver's STAGE 3 text and the module
+docstring both say so now.
+
+New `test_es_aggregated_leg.py` (6 checks): builds where the replay could not, schema identical to
+the replay's, empty ladder refused, halt boundary still derived from the trade tape, replay path
+still reachable, and `session_qc` judging the ladder leg by the same invariant.
+
 ## v0.9.41 -- the 2020 ES capture is market-by-PRICE (the missing leg, diagnosed)
 
 `probe_es_2020.py` across all four MWCB dates and both contracts, with 2024-12-18 as control:

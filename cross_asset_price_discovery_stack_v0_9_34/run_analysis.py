@@ -274,6 +274,7 @@ def load_sessions(args):
                                        interval=args.interval, with_flow=True,
                                        classify=getattr(args, "classify", "aggressor"),
                                        book_source=getattr(args, "book_source", "reconstruct"),
+                                       es_book_source=getattr(args, "es_book_source", "aggregated"),
                                        round_lot=getattr(args, "round_lot", 100),
                                        odd_lot_inclusive=not getattr(args, "round_lot_only", False),
                                        clock=getattr(args, "clock", "receipt"), progress=_prog,
@@ -675,6 +676,12 @@ def parse_args(argv=None):
                         "consolidated multi-venue books do cross briefly, so this is not zero")
     p.add_argument("--only", type=lambda s: s.split(","), default=None)
     p.add_argument("--skip", type=lambda s: s.split(","), default=None)
+    p.add_argument("--es-book-source", default="aggregated", choices=["aggregated", "replay"],
+                   help="ES leg from CME's own 10-level ladder (mt_aggregated_price_update, the "
+                        "default: one venue, one mechanism on every date in the panel, and the "
+                        "source validate_aggregated.py already benchmarks the replay against) or "
+                        "from the message replay ('replay': order-level detail, but the message "
+                        "family differs by era and must be selected at run time)")
     p.add_argument("--no-align-books", action="store_true",
                    help="do not forward-fill each book onto the grid; alignment fixes unaligned SPY/ES "
                         "rows that otherwise NaN-poison the OFI-based stages (cross-impact, structural IRF)")

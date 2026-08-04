@@ -587,3 +587,39 @@ across the whole sample. Using it for the ES leg throughout would remove the fut
 and make the ES methodology identical on every date, at the cost of CME's published depth rather
 than a reconstructed one. `validate_aggregated.py` already reads it and already shows the 2024 MBO
 replay agreeing with it. That is a methodology decision, not a defect.
+
+## 18. The ES leg is now CME's own ladder, on every date
+
+The open question at the end of §17 is decided: the futures leg is built from
+`mt_aggregated_price_update` throughout, not from a message replay.
+
+**Why.** CME is a single venue and its ladder *is* the book — there is nothing to consolidate, so
+replaying messages to rebuild an object the venue already publishes on the same lake and the same
+capture clock adds a failure mode and buys nothing. The ladder is populated in every era checked,
+while the message families are not: two separate hardcoded assumptions about "what CME publishes"
+were wrong, and one of them silently emptied four sessions. And a panel spanning 2020–2026 should
+not build its futures book two different ways depending on the year.
+
+**What is given up, stated plainly.** Aggregated depth means price and size per level but no
+order-level detail: no per-order queue position, and depth limited to the ten levels CME
+disseminates. Nothing in this paper's ES measurements needs more — they are top-of-book and 10-level
+depth on a 1-second grid — but a future question about futures queue dynamics would need the replay
+back. It is kept and still tested: `--es-book-source replay`, with the era-aware family selection
+of §17 intact.
+
+**The schema is identical**, so nothing downstream can tell which source produced the leg: the same
+`{ES}_{bid,ask}{price,quantity}_{1..10}`, `ES_nbbo_bid/ask` (equal to the top of the ladder, since
+CME has no odd lots and nothing to consolidate) and `ES_mid`. A level the venue never published gets
+price NaN and quantity 0.0, exactly as the replay emits, so depth sums agree.
+
+**The halt boundary still comes from the trade tape.** The ladder keeps updating through a CME stop
+— orders can still be entered and pulled — so it cannot mark the resume. `activity_seconds` is
+therefore still built from `mt_trade` even though the book no longer is, because the status flag
+understates a CME stop by ~130× (§13, §15).
+
+**One consequence for the paper's validation section.** `validate_aggregated.py` compares a message
+replay against this ladder. That used to validate the shipped ES book. It now runs in the opposite
+direction: the leg *is* the ladder, so the comparison is evidence that an independent reconstruction
+from raw messages reproduces it — i.e. that the ladder is a faithful book rather than a lossy
+summary of one. It validates the **source choice**, not the extraction, and the driver and the
+module both say so now. Reporting it the old way would be circular.
