@@ -1002,7 +1002,6 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                          classify=cfg["classify"], side_buy_label=cfg["side_buy_label"],
                          futures_scale=cfg["futures_scale"], start_time=cfg["start_time"],
                          end_time=cfg["end_time"], data_source=cfg["data_source"])
-    df.attrs["es_contract"] = contract
     # The halt window comes from the TAPE (mt_product_status.haltreason), not from a table of four
     # dates I typed in. A halted market has no valid midpoint and its book is legitimately crossed,
     # so every consumer needs the boundary -- and needs it right. One tiny query per session.
@@ -1017,9 +1016,24 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
             log.info("%s: %d halt window(s) from the tape: %s (%s)", label, len(hres["windows"]),
                      ", ".join("%s-%s" % (a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S"))
                                for a, b in hres["windows"]), ", ".join(sorted(hres["reasons"])))
+        # The same stream carries the two REGULATORY CONSTRAINTS on quoting: the LULD price band and
+        # Rule 201 (SSR). Both bound what a quote is allowed to be, so a response measured near one
+        # is a rule, not price discovery -- and SSR is one-sided, which is a direct confound for the
+        # signed-order-flow tables. They ride along as session columns; see market_state.py.
+        import market_state as _ms
+        df = _ms.attach_market_state(df, st, asset="SPY", tz=cfg["tz"])
+        df.attrs["market_state_coverage"] = _ms.coverage(st)
+        _sum = _ms.summarize(df, asset="SPY")
+        df.attrs["market_state"] = _sum
+        if _sum.get("ssr_any"):
+            log.warning("%s: Rule 201 SHORT SALE RESTRICTION in effect on %.0f%% of the session -- "
+                        "sell-side flow is mechanically constrained (short sales cannot execute or "
+                        "display at or below the NBB), which is a confound for Tables 5 and 7",
+                        label, 100 * _sum.get("ssr_frac_on", 0.0))
     except Exception as exc:                      # never fail a session over the status stream
         log.warning("%s: could not read mt_product_status (%s); halt windows fall back to the "
                     "built-in table", label, str(exc).splitlines()[0][:160])
+    df.attrs["es_contract"] = contract
     qc = session_qc(df, crossed_tol=float(cfg.get("crossed_tol", 0.005)))
     df.attrs["qc"] = qc
     med_spy = qc["SPY"]["median_bid"]

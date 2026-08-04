@@ -114,6 +114,27 @@ def report(date_str, product, ptype="direct", data_source="apu", tz="America/New
                 lines.append("    Exclude these snapshots from every estimate: no valid midpoint.")
             else:
                 lines.append(f"{_STATUS:32s} {len(stat):>8,d} row(s)   no halt")
+            # The two REGULATORY constraints on quoting, both confounds for this paper. Coverage is
+            # reported, not assumed: a control that is silently all-NaN is worse than none, because
+            # the regression still runs and the coefficient means nothing.
+            try:
+                import market_state as msx
+                cov = msx.coverage(stat)
+                lines.append("    regulatory state: SSR reported on %.0f%% of rows, LULD bands on "
+                             "%.0f%%" % (100 * cov.get("ssr", 0.0), 100 * cov.get("luld_upper", 0.0)))
+                sv = msx.state_series(stat)["ssr"].dropna()
+                if len(sv) and sv.max() > 0:
+                    lines.append("    RULE 201 SHORT SALE RESTRICTION was in effect on this date --")
+                    lines.append("    short sales cannot execute or display at or below the NBB, so")
+                    lines.append("    sell-side flow is mechanically constrained. Control for it before")
+                    lines.append("    reading signed order flow (Tables 5 and 7) as tandem trading.")
+                elif len(sv):
+                    lines.append("    Rule 201 SSR: not in effect at any point on this date")
+                if cov.get("luld_upper", 0.0) == 0.0:
+                    lines.append("    LULD bands are NOT carried by these feeds (they come from the")
+                    lines.append("    SIP); the band columns will be all-NaN -- do not use as a control.")
+            except Exception as exc:
+                lines.append("    regulatory state: could not read (%s)" % type(exc).__name__)
             if "marketsession" in stat.columns:
                 ses = sorted(set(stat["marketsession"].astype(str).str.strip()) - {"", "\\N", "nan"})
                 if ses:

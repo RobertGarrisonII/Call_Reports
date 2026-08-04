@@ -65,6 +65,16 @@ def qc_sessions(sessions, assets=("SPY", "ES"), crossed_tol: float = 0.005) -> p
             row[f"{a}_crossed"] = rep[a]["crossed_frac"]
             row[f"{a}_crossed_open"] = rep[a].get("crossed_frac_ex_halt", float("nan"))
             row[f"{a}_med_bid"] = rep[a]["median_bid"]
+        # Rule 201 state. Which sessions were short-sale restricted is a SAMPLE fact the paper has
+        # to report: SSR constrains the sell side only, so a restricted day has mechanically
+        # asymmetric signed order flow -- the exact quantity Tables 5 and 7 count.
+        try:
+            import market_state as _ms
+            msum = df.attrs.get("market_state") or _ms.summarize(df, asset=assets[0])
+            row["ssr_frac"] = msum.get("ssr_frac_on", float("nan")) if msum.get("ssr_known") else float("nan")
+            row["luld_known"] = msum.get("luld_known", 0.0)
+        except Exception:
+            row["ssr_frac"] = float("nan"); row["luld_known"] = 0.0
         # a fetch failure recorded at reconstruction time is the usual cause; surface it here too
         ff = df.attrs.get("fetch_failed") if hasattr(df, "attrs") else None
         row["fetch_failed"] = ",".join(sorted(ff)) if ff else ""
@@ -92,6 +102,9 @@ def main(argv=None) -> int:
         for c in (f"{a_}_crossed", f"{a_}_crossed_open"):
             if c in show.columns:
                 show[c] = show[c].map(lambda v: "n/a" if not np.isfinite(v) else f"{v:.2%}")
+    for c in ("ssr_frac", "luld_known"):
+        if c in show.columns:
+            show[c] = show[c].map(lambda v: "n/r" if not np.isfinite(v) else f"{v:.0%}")
     body = ["crossed-book gate on the SAVED frames (tolerance %.2f%%)" % (100 * a.crossed_tol),
             "%d session(s) from %s" % (len(tbl), a.pickle), "", show.to_string(), ""]
     bad = tbl[~tbl["ok"]]
@@ -106,6 +119,20 @@ def main(argv=None) -> int:
                  "Run debug_crossing.py on each date above for the root cause (it re-fetches the",
                  "raw messages, which is why it is not the gate), then re-extract or drop the day.",
                  "Do NOT estimate on a session that violates its own invariant."]
+    ssr = tbl[tbl["ssr_frac"].fillna(0) > 0] if "ssr_frac" in tbl.columns else tbl.iloc[:0]
+    if len(ssr):
+        body += ["",
+                 "SHORT SALE RESTRICTED sessions (Rule 201): %s"
+                 % ", ".join("%s (%.0f%% of the session)" % (d, 100 * r["ssr_frac"])
+                             for d, r in ssr.iterrows()),
+                 "  Short sales cannot execute or display at or below the NBB, so the sell side is",
+                 "  constrained and the buy side is not. Signed order flow on these days is",
+                 "  mechanically asymmetric -- report them in the sample appendix and control for",
+                 "  them before reading Tables 5 and 7 as evidence of directional tandem trading."]
+    if "luld_known" in tbl.columns and float(tbl["luld_known"].fillna(0).max()) == 0.0:
+        body += ["",
+                 "LULD bands: not reported by this source on any session. The columns exist and are",
+                 "all-NaN, so do NOT use them as a control -- an all-NaN regressor still fits."]
     halted = tbl[tbl["halt"] > 0] if "halt" in tbl.columns else tbl.iloc[:0]
     if len(halted):
         body += ["",

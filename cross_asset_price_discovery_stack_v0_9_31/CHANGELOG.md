@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.9.31 -- LULD bands and Rule 201 as session columns, with coverage measured not assumed
+
+Both fields live in `mt_product_status`, next to the halt. Neither is a result; both are mechanical
+constraints on quoting, and both are confounds for this paper in particular.
+
+**Rule 201 (SSR) is the one that bites.** After a 10% decline a covered security cannot have short
+sales executed or displayed at or below the national best bid, that day and the next. The constraint
+is one-sided by construction -- sell side yes, buy side no -- and Tables 5 and 7 count SIGNED order
+flow. A restricted session therefore has mechanically asymmetric flow that looks exactly like
+directional tandem trading. March 2020 is full of such days, and the paper currently does not
+mention the rule.
+
+**LULD bands** bound where a quote may be displayed, and a quote sitting at a band edge for 15
+seconds triggers a Limit State and then a pause. As the mid approaches a band, spread, depth and
+cancellation rates change *because they must*. On a volatility day that is a large share of the
+session, and the paper reads those movements as responses to information.
+
+`market_state.py` attaches both to every session frame:
+
+    {A}_ssr              1 while restricted, 0 while not, NaN if unknown -- never 0 for unknown
+    {A}_luld_lower/_upper, {A}_luld_indicator
+    {A}_luld_band_bps    band width relative to the mid
+    {A}_dist_upper_bps / {A}_dist_lower_bps    room the quote has before each band
+    {A}_luld_binding     1 where the best ask is at/through the upper band (or bid through the lower)
+
+State is carried FORWARD only -- a change at 11:00 does not colour 10:00. The columns ride on the
+frame, so they reach `final_dataset.parquet` and any regression without further plumbing.
+`qc_frames` now lists short-sale-restricted sessions, and `feed_health` reports the state per date.
+
+### Coverage is measured, because one of the two is not actually there
+
+On the 2020-03-09 SPY status stream `shortsaleindicator` is populated on **every** venue row
+(`ShortSaleRestrictionNotInEffect` throughout, so that session was NOT restricted), while
+`luldlowerlimit` / `luldupperlimit` / `limituplimitdownindicator` are **empty on every row** -- the
+bands are disseminated by the SIP, not by the direct venue feeds.
+
+So SSR is usable today from data already fetched, and LULD is wired end to end but will produce
+all-NaN columns until a source carries it. `coverage()` reports the fraction of rows that actually
+had each field, and both `describe()` and `qc_frames` say outright *"do NOT use them as a control"*
+when the answer is zero. **A control that is silently all-NaN is worse than no control, because the
+regression still runs and the coefficient means nothing.** For the same reason an unknown SSR is
+NaN, never 0 -- absence of the field is not evidence of an unrestricted session.
+
+To get the bands, the LULD messages need a SIP source (CTA/UTP) in the lake; if one exists, point
+`mt_product_status` at it and every derived column populates itself with no further change.
+
 ## v0.9.30 -- the halt is in the tape, so stop hardcoding it
 
 `mt_product_status` carries `haltreason` per venue, and on 2020-03-09 SPY it says exactly this:
