@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.9.39 -- 2020-03-09 completes the set, and the futures do not absorb the flow
+
+The last missing date. `mt_product_status` and `mt_product_statistics` for ESH0 and ESM0 on
+2020-03-09.
+
+**The flag/tape gap, on every day that can be measured:**
+
+| date | flag span | actual stop | understated | sole-venue window | ES resumes vs SPY reopen |
+|---|---|---|---|---|---|
+| 2020-03-09 | 6.38 s | **834.12 s** | 131x | 65.9 s | **+0.010 s** |
+| 2020-03-16 | 7.27 s | **846.06 s** | 116x | 53.9 s | **+0.012 s** |
+| 2020-03-18 | 5.83 s | **817.30 s** | 140x | 88.7 s | +6.0 s |
+
+Three days, both contracts, 116-140x. The v0.9.37 correction holds everywhere it can be tested.
+
+**A second cross-validation of `MWCB_HALTS`.** ES resumes at 09:49:13.010 on 03-09 and 09:45:01.012
+on 03-16 against table ends of 09:49:13 and 09:45:01, derived from the SPY status tape. Two dates,
++10 ms and +12 ms, from an independent feed.
+
+**The futures do NOT absorb the flow.** The natural prior is that when equities halt, trading
+concentrates into the futures. On the two days with a valid intraday baseline it does the opposite:
+61.8 -> 3.0 lots/s on 03-09 (**-95%**) and 105.7 -> 44.2 on 03-18 (**-58%**), then zero for the rest
+of the halt, then 144-368 lots/s on the joint reopen. So the sole-venue window is not a burst of
+concentrated price discovery -- it is a near-freeze that ends in an outright halt about a minute in.
+
+2020-03-16 is EXCLUDED from that claim: its equity halt begins one second after the 09:30 open, so
+there is no RTH baseline, and measuring "before" from the overnight session gives +1128% -- an
+artifact of comparing an opening print to Globex overnight. Two days is what the data supports and
+two days is what is claimed.
+
+**The roll is asymmetric around its boundary.** Share held by the contract the calendar rule picks:
+2020-03-09 (-3 days) ESH0 **93.7%**; 2020-03-16 (+4) ESM0 60.4%; 2020-03-18 (+6) ESM0 78.0%. Before
+the boundary the front month is the old contract and holds nearly everything; after it the new
+contract leads while the old one keeps a large share as its open interest unwinds (ESH0 OI is still
+2.69 M on 03-16 vs ESM0 1.43 M). `roll_window_days()` is therefore **signed** -- negative before,
+positive after -- and `_extract_one_session` warns on the post-roll window while only noting the
+pre-roll one. The previous unsigned version fired the SPLIT warning on 2020-03-09, a 93.7%
+concentrated session.
+
+`test_es_product_status.py` grows to 17 checks; (17) is the volume-collapse table with its exclusion.
+
+**Still unmeasured: 2020-03-12**, the roll boundary itself (offset 0), where the code picks ESH0 --
+the session most likely to be near 50/50 and the only one of the four whose front-month choice has
+not been checked against volume.
+
 ## v0.9.38 -- the roll settled by volume, and the flag gap confirmed on a second day
 
 Four ES tapes (ESH0 and ESM0, 2020-03-16 and 2020-03-18) close two open questions.

@@ -440,3 +440,57 @@ checked.
 
 Contracts traded while ES was the only venue: 3,698 (ESH0) + 4,132 (ESM0) on 03-16 in 53.9 s;
 1,288 + 3,927 on 03-18 in 88.7 s.
+
+## 15. 2020-03-09 completes the set — four MWCB days, one pattern
+
+`mt_product_status` and `mt_product_statistics` for ESH0 and ESM0 on 2020-03-09, the date that was
+missing.
+
+**The flag/tape gap on every day we can measure:**
+
+| date | flag span | actual stop | understated | sole-venue window | ES resumes vs SPY reopen |
+|---|---|---|---|---|---|
+| 2020-03-09 | 6.38 s | **834.12 s** | 131× | 65.9 s | **+0.010 s** |
+| 2020-03-16 | 7.27 s | **846.06 s** | 116× | 53.9 s | **+0.012 s** |
+| 2020-03-18 | 5.83 s | **817.30 s** | 140× | 88.7 s | +6.0 s |
+
+Both contracts halt and resume at identical instants on every date, confirming the halt is
+group-level. The flag ONSET tracks the last trade closely on the front month (+452 ms on 03-09,
++24 ms on 03-16, +11 ms on 03-18) and less closely on the back month (+5.96 s for ESM0 on 03-09,
+which trades a fraction as much) — as expected, since the last trade is only a proxy for the stop in
+proportion to how densely the contract trades.
+
+**A second cross-validation of the equity halt table.** ES's first trade back is 09:49:13.010 on
+03-09 and 09:45:01.012 on 03-16, against `MWCB_HALTS` ends of 09:49:13 and 09:45:01 derived from the
+SPY status tape. Two dates, +10 ms and +12 ms, from an independent feed.
+
+**The futures do not absorb the flow — they nearly stop.** The natural prior is that when equities
+halt, trading concentrates into the futures. On the two days with a valid intraday baseline:
+
+| date | RTH lots/s before the halt | during the sole-venue window | change |
+|---|---|---|---|
+| 2020-03-09 | 61.8 | 3.0 | **−95%** |
+| 2020-03-18 | 105.7 | 44.2 | **−58%** |
+
+Then zero for the rest of the halt, then 144–368 lots/s on the joint reopen. **2020-03-16 is
+excluded**: its equity halt begins one second after the 09:30 open, so there is no RTH trading to
+compare against, and using the overnight session as a baseline yields +1128% — an artifact of
+comparing an opening print to Globex overnight, not a finding.
+
+**The roll, with 03-09 added.** Share of RTH volume held by the contract the calendar rule picks:
+
+| date | roll offset | picked | share |
+|---|---|---|---|
+| 2020-03-09 | −3 days | ESH0 | **93.7%** |
+| 2020-03-16 | +4 days | ESM0 | 60.4% |
+| 2020-03-18 | +6 days | ESM0 | 78.0% |
+
+The two sides of the boundary are not alike. **Before** it the front month is still the old contract
+and holds nearly everything; **after** it the new contract leads while the old one keeps a large
+share as its open interest unwinds (ESH0 open interest is still 2.69 M on 03-16 against ESM0's
+1.43 M). So `roll_window_days()` is signed — negative before, positive after — and the extractor
+warns on the post-roll window while only noting the pre-roll one.
+
+**Still unmeasured: 2020-03-12**, the roll boundary itself (offset 0), where the code picks ESH0.
+It is the session most likely to be near 50/50, and the only one of the four whose front-month
+choice has not been checked against volume.
