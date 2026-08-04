@@ -4,6 +4,7 @@
 **From:** Robert Garrison
 **Re:** Elevating *Cross-Asset Market Order Flow, Liquidity, and Price Discovery* to a top-3 finance journal
 **Date:** June 2026
+**Revised:** August 2026 — §§9–10 added after the first clean full-sample replication run
 
 ## Thesis
 
@@ -75,6 +76,156 @@ Items 2–3 are the publishable core; 4–5 move it from a strong field paper to
 
 JF or RFS. The one-sentence pitch: *cross-asset price discovery is governed by the relative shape of the limit-order book — the deeper, flatter market leads — and we identify the channel causally off an exogenous quote-feed disruption.* It advances the ETF/futures price-discovery literature (Hasbrouck; Chan) by making the information share endogenous to book depth; it brings the modern order-flow-imbalance and cross-impact apparatus (Cont–Kukanov–Stoikov; Cont–Cucuringu–Zhang) to the cross-asset question; and it does the second-moment work to current standard (Barndorff-Nielsen–Hansen–Lunde–Shephard; Hayashi–Yoshida) — the realized-variance toolkit Kevin flagged in the original acknowledgments is now load-bearing.
 
+## 9. August 2026 addendum — what the full-sample runs taught us
+
+Since June the stack has gone from verified-on-synthetic to a completed extraction of the full
+event sample — 24 sessions (10 volatile, 10 matched baseline, the four March-2020 MWCB days),
+2020–2026, 561,624 frame-rows — and the first end-to-end replication run is clean: every gate
+green, both legs present on every session including the circuit-breaker days. Getting there forced
+a sequence of methodological corrections. I list each with its reason, because several change
+numbers we currently publish, and one produces a result I think belongs in the paper in its own
+right. Everything below is pinned by a regression test against verbatim tape rows, so none of it
+can silently regress.
+
+**9.1 The nulls in Tables 5 and 7 measure the wrong thing.** The published Panel A null is iid
+Binomial(n, ½) per market. Real order flow is over-dispersed, autocorrelated, and seasonal within
+the day, so that null rejects for reasons that have nothing to do with *cross-market* trading — a
+referee who notices will discount the tables entirely. We now benchmark against independence *given
+the observed marginals* (which isolates the cross-market component by construction), report the
+corner log odds ratio (marginal-free, hence comparable across panels whose marginals differ
+enormously), and add a permutation null that shuffles only the pairing between the markets. The
+consequential correction is Table 7's: the published comparison applies the per-second null (0.4%)
+to every aggregation, but at the actual per-bar order counts the independence null is 22.9% at ten
+milliseconds and 50.1% at action time. Restated at matched nulls the observed corners are **33.5×
+the null at one second, 1.32× at ten milliseconds, and 0.97× at action time**. The tandem effect is
+a *one-second phenomenon* — sharper and more interesting than the uniform-null version, and we say
+it before a referee computes it against us.
+
+**9.2 Table 9's dependent variable carries its own measurement error — and its lag order was the
+window.** Two problems, one specification. First, grid-sampled Pearson correlation is attenuated by
+asynchronous quote updating (Epps), and the attenuation moves with trading intensity — which sits
+on the right-hand side of Eq. (5). A response can be measurement error correlating with its own
+regressor. We estimate the table both ways (Pearson and Hayashi–Yoshida, identical sessions, window
+and identification) and report the difference. On the extracted sample this is not cosmetic: the
+ES order-flow-imbalance response in the benchmark panel **flips sign and loses significance**
+(−0.014*** Pearson → +0.009 n.s. HY), two effects are significant only under HY, and one
+(WtdSpread_SPY) is stable across both — the only cell we should interpret as published. Second,
+footnote 17's mystery — AIC pointing at 60 lags — is now explained: the first difference of a
+W-bar rolling correlation carries an MA term at exactly lag W, and the criterion locates it. On
+simulated data with a *constant* correlation and iid liquidity, BIC selects p\* = W exactly (8, 12,
+20, 25 for W = 8, 12, 20, 25) and collapses to 0 for wide windows. Raising the search bound walks
+toward the window, not toward the truth. The fix is the dependent variable, not the search: the DCC
+conditional correlation has no fixed-width box to difference and returns p\* ≈ 1 on the same null
+data. Table 9 now runs three ways (Pearson / HY / DCC), the caption states the lag diagnosis, and
+DCC is the defensible basis for the lag order. The sixty lags were an estimator artifact; we can
+now say so in print.
+
+**9.3 A halted market has no midpoint — and the halt boundary must come from the tape.** The MWCB
+halt windows are derived per venue from the status stream (`mt_product_status.haltreason`), not
+from a hand-entered table. During a Level 1 halt the exchanges stop matching but do not cancel
+resting orders, so a *correctly* reconstructed book is crossed for the full fifteen minutes — on
+2020-03-09 the residual "defect" of 3.88% crossed snapshots is 901 halt seconds of 23,401, and
+outside the halts the crossed rate is 0.02–0.17% on all four days. Halt snapshots are excluded from
+every estimate — including them adds mechanical comovement, not price discovery — and the
+boundaries are now cross-validated from the *other leg*: ES's first trade back lands +10 ms, +6 ms
+and +12 ms after our recorded SPY halt ends on the three days both tapes exist. Two independent
+feeds agreeing at the millisecond on boundaries that were hand-entered before either was checked.
+
+**9.4 The futures do not trade through the equity halt — the sole-venue window is a new exhibit.**
+The natural prior (and my own first write-up) was that flow migrates to ES when equities halt. The
+tape says otherwise, twice over. First, CME's halt flag marks the *stop*, not the duration: it is
+set milliseconds after the last trade and clears 5.8–7.3 s later while nothing trades for
+**817–846 s** — reading the flag as the window understates the stop by two orders of magnitude
+(116–140×), and the two readings support opposite claims about which market leads. Halt ends now
+come from the resumption of trading. Second, with the windows measured correctly, every MWCB day
+has the same anatomy: the equity market halts; ES keeps trading *alone* for 54–89 seconds — the
+only price venue in the pair — and then halts too; both reopen together (within 6 s). And in its
+window of solitude ES's trading rate *falls* — −95%, −73%, −58% on the three days with a valid
+intraday baseline — before going to zero. The futures do not absorb the flow; they nearly stop,
+then stop. For the event study this means two nested onsets per day (the equity halt, then the
+coordinated futures stop ~1 minute in), union-excluded pair estimates, and a sharply bounded
+54–89 s window in which one venue *is* price discovery — which I think is a publishable exhibit on
+its own.
+
+**9.5 The ES book is the venue's own ladder — one mechanism across the whole panel.** The
+message-level ES replay hid an era dependence: CME's 2024 capture is order-by-order (MBO), its 2020
+capture is price-level (`mt_modify_price_level`/`mt_delete_price_level`), and the one price-level
+type we had checked is empty in *both* eras — so the four 2020 sessions extracted with no ES leg at
+all, silently (a full-length frame of NaN, one log line). Rather than hardcode a second era
+assumption one release after the first one failed, the futures leg is now built from
+`mt_aggregated_price_update` — CME's own ten-level ladder, populated in every era we checked, on
+the same lake and capture clock. The reasons: CME is a single venue, so its ladder *is* the book
+and there is nothing to consolidate; and a panel spanning 2020–2026 should not construct its
+futures book two different ways depending on the year. What is given up (order-level queue detail)
+is nothing our measurements use; what is gained is uniformity and a validation we can state
+cleanly: an *independent* message replay, its family selected from row counts at run time,
+reproduces the ladder — evidence the ladder is a faithful book, i.e. validation of the source
+choice, stated in that direction to avoid circularity. A measured ladder-cadence statistic
+(updates per grid cell) decides rebuild-vs-take empirically rather than by argument.
+
+**9.6 The roll is a week, not a switch — measured, not assumed.** Front-month volume shares
+measured from the statistics stream across the March 2020 roll: **93.7%** three days before the
+boundary, **72.8%** at it, **60.4%** four days after, **78.0%** by six. The calendar rule picks the
+volume leader on all four days, but a single-contract ES leg misses 6–40% of futures volume inside
+the roll week — and all four MWCB days sit inside it. We do not splice (the contracts carry a 10–12
+point calendar spread; a stitched series jumps at the seam); we report the measured share in the
+sample appendix, per session, via a tool that settles any date from forty vendor rows. One
+criterion note for the appendix: open interest *disagrees* with volume on exactly the contested day
+(34.6% vs 60.4% on 03-16) because OI is a day-stale stock of positions while volume is the flow
+price discovery is made of — volume is the criterion, and the disagreement is reported rather than
+assumed away.
+
+**9.7 Regulatory state as confounds: Rule 201 and price limits.** Tables 5 and 7 count *signed*
+order flow, and Regulation SHO Rule 201 is one-sided by construction — short sales cannot execute
+at or below the NBB, suppressing aggressive ETF selling while leaving buying untouched. The status
+tape shows exactly one restricted session in our sample: 2020-03-16, restricted from the opening
+bell for 100% of the session. A dummy "control" is not identifiable there — one restricted day,
+collinear with its own at-the-open circuit-breaker halt — so the treatment is (i) the MWCB panel
+reported with and without that session, and (ii) a one-sided diagnostic, the sell-minus-buy
+Neutral-referenced local log odds ratio, which is ~0 under symmetric dependence and decisively
+negative under sell-side suppression. On our published matrices it is +0.005 / +0.011 / +0.066 —
+symmetric, no SSR fingerprint at the pooled level, which is itself worth a sentence. Separately,
+the venue status stream settles the band question: the direct equity feeds carry no LULD fields
+(the bands are SIP-disseminated), but CME *does* publish ES price limits — including the
+limit-down ratchet on 2020-03-12 (lower limit stepping 2594.00 → 2190.00 with the upper unbounded)
+— so the futures leg has a usable band control today and the equity leg does not; the coverage is
+measured and reported so an all-NaN column is never mistaken for a control.
+
+**9.8 Reproducibility is now a referee exhibit, not a promise.** Every failure above was *silent* —
+a full-length, correctly-shaped, wrong dataset. The replication is therefore a single command with
+staged gates: a correctness gate of fifty test modules, each pinning a named correction to verbatim
+tape rows; a per-session crossed-book invariant (with halt-aware exclusions, and ladder-integrity
+checks — monotone depth, coverage, staleness — for the taken futures book, where "crossed" is
+vacuous by construction); driver-flag and version-consistency gates; caches keyed by everything
+that changes a frame, including the ES book source; and run logs that state which source produced
+each table — including the distinction between the paper's order-submission counts and the
+trade-signed counts the frames carry (executions, not submissions: a better-identified object, and
+labelled as such rather than passed off as the published measure). This is what current JF/RFS
+data-and-code policies ask for, and it is also, frankly, how the errors above were found.
+
+## 10. What this changes in the draft
+
+Concretely, before anything new is estimated:
+
+1. **Table 7 restated at matched nulls.** The headline becomes: tandem trading is a one-second
+   phenomenon (33.5× / 1.32× / 0.97×). The uniform-null version does not survive refereeing.
+2. **Table 5 re-benchmarked** — independence given marginals, corner log OR with z, the MWCB panel
+   with and without 2020-03-16, and the corner-asymmetry diagnostic in the notes.
+3. **Table 9 three ways** (Pearson / HY / DCC), the Pearson→HY deltas reported as the Epps share of
+   each response, DCC as the lag-order basis, and footnote 17 replaced by the artifact explanation.
+4. **The MWCB event study redesigned** around two nested onsets, union-excluded pair estimates, the
+   ±6 s coordinated reopening, and the 54–89 s sole-venue window as its own exhibit.
+5. **A sample appendix** with, per session: the ES contract used and its measured roll share, SSR
+   state (including *unknown*, never conflated with unrestricted), halt windows from the tape, and
+   the QC line (crossed rate outside halts, both legs).
+
+**Sequence update (June §7):** step 1 (data) is *done* — the 24-session extraction is clean and
+cached; step 2 (information shares) is unblocked and next. Three items are open: the 10 ms
+extraction (the Epps exhibit is largest there); one unresolved ladder-vs-replay disagreement on
+ESH5 2024-12-18 to run down before we lean on the 2024 ES leg; and re-estimating Tables 5/7 from
+the extracted trade tape (wired, labelled DATA(trades)) alongside the published order-count
+versions.
+
 ## Appendix: the code stack
 
 Fourteen analysis modules, each with a self-contained synthetic self-test, composing through a common per-session book-frame interface, plus a single driver (`run_analysis.py`) that runs the whole sequence end-to-end and a run guide (README):
@@ -95,4 +246,4 @@ Fourteen analysis modules, each with a self-contained synthetic self-test, compo
 - `robust_prices.py` — noise-robust observables for the SDE: depth-weighted microprice, book-centroid and area-under-curve/cost-to-fill mids, curve-length-normalized book states, and sparse-sampling / pre-averaging for the measure; the `price_fn` / `state_fn` glue that feeds them into `ecm_sde`.
 - `run_analysis.py` — the driver: one command loads/extracts the frames, runs every stage above, and writes the result tables and a summary report.
 
-Everything is synthetic-tested against known data-generating processes. The stack has since grown well beyond these fourteen modules — most materially, the onset identification spine (the heteroskedasticity-identified stress-response surface f(state)) and the message-level book reconstruction with the event-ordering / crossed-book fix noted in §6 — all held to the same synthetic-self-test discipline. The empirical results await the multi-event data run in step 1; as of this revision the reconstruction layer is fully verified and the first co-temporal stress window is in hand.
+Everything is synthetic-tested against known data-generating processes. As of the August revision the stack stands at roughly sixty modules under a fifty-module test gate, each test pinning a named correction to the verbatim tape rows that motivated it. The stack has since grown well beyond the original fourteen modules — most materially, the onset identification spine (the heteroskedasticity-identified stress-response surface f(state)) and the message-level book reconstruction with the event-ordering / crossed-book fix noted in §6 — all held to the same synthetic-self-test discipline. The empirical results await the multi-event data run in step 1; as of this revision the reconstruction layer is fully verified and the first co-temporal stress window is in hand.
