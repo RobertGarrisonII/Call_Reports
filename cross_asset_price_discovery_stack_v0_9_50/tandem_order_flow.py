@@ -231,6 +231,35 @@ def dependence_summary(freq, n_bars=None):
            "PCMOF_ratio": pc / epc if epc > 0 else np.nan,
            "NCMOF_ratio": nc / enc if enc > 0 else np.nan,
            "log_OR": float(np.log((a * d) / (b * c))) if min(a, b, c, d) > 0 else np.nan}
+    # The sell-side and buy-side association SEPARATELY, because Rule 201 is one-sided and this is
+    # its signature. SSR blocks short sales from executing at or below the NBB -- it removes
+    # aggressive ETF selling specifically, the ETF-Sell COLUMN of this matrix, and leaves buying
+    # untouched. Genuine tandem trading has no reason to prefer one corner; a restricted session
+    # does.
+    #
+    # The statistic must be LOCAL odds ratios referenced to the Neutral cells, not corner mass over
+    # its independence expectation: suppressing a corner also moves the marginals, so P/E
+    # self-normalises and barely registers (measured: a 60% cut to the SS cell moved P/E by 1% and
+    # the local log OR by -0.92, its full log 0.4). With the neutral row and column as the
+    # reference:
+    #
+    #     lor_sell = log( P[S,S] P[N,N] / (P[S,N] P[N,S]) )     fut-sell <-> etf-sell association
+    #     lor_buy  = log( P[B,B] P[N,N] / (P[B,N] P[N,B]) )     fut-buy  <-> etf-buy  association
+    #     corner_asym = lor_sell - lor_buy
+    #
+    # ~0 when dependence is symmetric; decisively negative when the sell association is suppressed.
+    # Note the direction: SSR pushes log_OR DOWN, the same direction as the below-baseline MWCB
+    # result -- which is why the MWCB panel must also be reported excluding its restricted session
+    # (2020-03-16).
+    ss = (P[0, 0], P[1, 1], P[0, 1], P[1, 0])                 # (S,S) (N,N) (S,N) (N,S)
+    bb = (P[2, 2], P[1, 1], P[2, 1], P[1, 2])                 # (B,B) (N,N) (B,N) (N,B)
+    out["lor_sell"] = (float(np.log((ss[0] * ss[1]) / (ss[2] * ss[3])))
+                       if min(ss) > 0 else np.nan)
+    out["lor_buy"] = (float(np.log((bb[0] * bb[1]) / (bb[2] * bb[3])))
+                      if min(bb) > 0 else np.nan)
+    out["corner_asym"] = (out["lor_sell"] - out["lor_buy"]
+                          if np.isfinite(out["lor_sell"]) and np.isfinite(out["lor_buy"])
+                          else float("nan"))
     if n_bars:
         n = np.array([a, b, c, d]) / 100.0 * float(n_bars)
         if n.min() > 0:

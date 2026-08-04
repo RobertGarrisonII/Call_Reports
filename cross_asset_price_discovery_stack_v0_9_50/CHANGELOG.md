@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.9.50 -- Rule 201: why there is no dummy, and what stands in for one
+
+Asked how short sale restrictions are handled and whether a control is needed. The honest audit
+first: SSR was **measured everywhere and controlled nowhere**. `market_state` detects and latches
+it, the QC table reports it, extraction warns about it -- and no estimator consumed `SPY_ssr`. The
+docstrings promised "controls"; nothing delivered one.
+
+**Why the obvious control is not identifiable.** The sample contains exactly ONE restricted
+session, 2020-03-16 -- which is also an MWCB day that opened one second into its circuit-breaker
+halt on a limit-down gap. An SSR dummy is a relabelled day effect, collinear with everything else
+that made that day extreme. Adding it would claim an identification the sample cannot deliver.
+
+**What stands in for it, both now in STAGE 4:**
+
+* **`corner_asym`** -- Rule 201 is one-sided: short sales cannot execute at or below the NBB, so it
+  suppresses aggressive ETF SELLING and leaves buying untouched. Genuine tandem trading has no
+  reason to prefer a corner; a restricted session does. The statistic is the difference of
+  Neutral-referenced local log odds ratios (`lor_sell - lor_buy`), NOT corner mass over its
+  independence expectation -- suppressing a corner also moves the marginals, so P/E self-normalises
+  and barely registers (measured: a 60% cut to Sell-Sell moved P/E ~1% and the local log OR by its
+  full ln 0.4 = -0.916, recovered exactly in the test).
+* **The ex-SSR panel** -- when the MWCB panel contains restricted sessions, STAGE 4 rebuilds it
+  without them (`C MWCB exSSR`), so the below-baseline MWCB dependence result can be read against
+  the version that cannot carry the SSR channel. Direction matters: SSR pushes log_OR DOWN, the
+  same direction as that result.
+* New `mstbook_loader.session_is_ssr(df)` -> (restricted, known). Unknown is a third state, never
+  "unrestricted"; STAGE 4 prints the source-silent sessions by name.
+
+**A substantive finding, pinned in the test:** on the paper's PUBLISHED matrices the asymmetry is
++0.005 (baseline), +0.011 (volatile), +0.066 (MWCB) -- symmetric, against a -0.92 scale for a 60%
+suppression. The pooled published panels do NOT carry the SSR fingerprint. Whether the single
+restricted session does is exactly what the per-session real-data run will show.
+
+New `test_ssr_confound.py` (4 checks), in the STAGE 1 gate. 50 test modules, all passing.
+
 ## v0.9.49 -- audit: five defects, four of them recent, one a landmine in the QC gate
 
 A code audit (pyflakes sweep + a semantic pass over everything that changed since v0.9.42), with

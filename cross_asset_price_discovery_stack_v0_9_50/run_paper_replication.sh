@@ -305,6 +305,7 @@ if have_stage 1; then
            test_svar_lag_artifact.py \
            test_run_corrections.py \
            test_stack_audit.py \
+           test_ssr_confound.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -523,6 +524,21 @@ try:
                   for d, r, f in sess]
         by = tof.table5_from_sessions(tagged, ml.counts_from_frame)
         _skipped = by.pop("_skipped", [])
+        # Rule 201 sessions get the MWCB panel REBUILT without them. A regression dummy is not an
+        # option here: one restricted session (2020-03-16), which is also an MWCB day that opened
+        # straight into its halt -- the dummy would be a relabelled day effect, collinear with
+        # everything else that made that day extreme. Exclusion is the identifiable treatment, and
+        # corner_asym (below) is the within-day diagnostic.
+        _ssr_days = [d for d, _r, f in sess if ml.session_is_ssr(f)[0]]
+        _ssr_unknown = [d for d, _r, f in sess if not ml.session_is_ssr(f)[1]]
+        _mw_ssr = sorted(set(_ssr_days) & mw)
+        if _mw_ssr:
+            t2 = [(d, "C MWCB exSSR", f) for d, r, f in tagged
+                  if r == "C MWCB" and d not in _ssr_days]
+            if t2:
+                by2 = tof.table5_from_sessions(t2, ml.counts_from_frame)
+                by2.pop("_skipped", None)
+                by.update(by2)
         panels = {k: (v["frequency"] if isinstance(v, dict) and "frequency" in v else v)
                   for k, v in by.items()}
         source = ("DATA(trades): %d of %d extracted session(s), signed trade tape"
@@ -545,11 +561,26 @@ for k in sorted(panels):
     rows.append({"panel": k, "PCMOF": d["PCMOF"], "PCMOF_indep": d["PCMOF_indep"],
                  "PCMOF_ratio": d["PCMOF_ratio"], "NCMOF": d["NCMOF"],
                  "NCMOF_indep": d["NCMOF_indep"], "NCMOF_ratio": d["NCMOF_ratio"],
-                 "log_OR": d["log_OR"], "log_OR_z": d.get("log_OR_z", np.nan)})
+                 "log_OR": d["log_OR"], "log_OR_z": d.get("log_OR_z", np.nan),
+                 "corner_asym": d.get("corner_asym", np.nan)})
 t5 = pd.DataFrame(rows).set_index("panel").round(3)
 print("\nTable 5 -- cross-market dependence, separated from each market's own directionality")
 print("  SOURCE: %s" % source)
 print(t5.to_string())
+print("\n  corner_asym = sell-side minus buy-side local log odds (Neutral-referenced): ~0 when")
+print("  the dependence is symmetric, decisively negative when aggressive ETF selling is")
+print("  suppressed -- Rule 201's one-sided signature. On the PUBLISHED panels it is +0.005 /")
+print("  +0.011 / +0.066: symmetric, i.e. no SSR fingerprint at the pooled level.")
+try:
+    if _mw_ssr:
+        print("  SSR sessions in the MWCB panel: %s -- panel C is also reported excluding them"
+              % ", ".join(_mw_ssr))
+        print("  (a dummy is unidentifiable at one restricted session, collinear with that day's halt).")
+    if _ssr_unknown:
+        print("  SSR state UNKNOWN (source silent; absence is not 'unrestricted'): %s"
+              % ", ".join(sorted(_ssr_unknown)))
+except NameError:
+    pass                                        # published-matrix fallback: no session frames
 print("\n  binomial null (n=505/112, one second): PCMOF = NCMOF = 0.4% per corner pair")
 print("  'indep' = independence GIVEN the observed marginals -- the benchmark that isolates")
 print("  cross-market trading. log_OR is marginal-free, so it is comparable across panels.")

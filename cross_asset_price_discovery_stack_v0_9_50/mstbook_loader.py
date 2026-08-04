@@ -920,6 +920,26 @@ def counts_from_frame(df: pd.DataFrame, assets=("SPY", "ES")):
             res[assets[0]][2], res[assets[1]][2])
 
 
+def session_is_ssr(df) -> tuple:
+    """(restricted, known) for one session frame.
+
+    Reads the extraction-time summary first (attrs["market_state"]), then the SPY_ssr column.
+    ``known=False`` means the source never reported the indicator -- and absence is NOT
+    'unrestricted': five sessions of the 2026-08-04 run are in that state. Callers must treat
+    unknown as unknown, which is why this returns two booleans instead of one."""
+    try:
+        ms = df.attrs.get("market_state") if hasattr(df, "attrs") else None
+        if ms and ms.get("ssr_known"):
+            return bool(ms.get("ssr_frac_on", 0.0) > 0), True
+        if "SPY_ssr" in df.columns:
+            v = pd.to_numeric(df["SPY_ssr"], errors="coerce")
+            if v.notna().any():
+                return bool(v.fillna(0).mean() > 0), True
+    except Exception:
+        pass
+    return False, False
+
+
 def has_trade_flow(sessions, assets=("SPY", "ES")) -> bool:
     """True if the session frames carry attach_flow's trade columns (so counts_from_frame works)."""
     if not sessions:
