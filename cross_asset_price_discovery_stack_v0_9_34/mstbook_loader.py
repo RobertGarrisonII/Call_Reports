@@ -99,8 +99,9 @@ def roll_window_days(as_of_date: date, rollover_days: int = 8) -> int:
     contract the calendar rule picks:
 
         2020-03-09   3 days BEFORE   ESH0   93.7%   <- concentrated; an ordinary session
-        2020-03-16   4 days after    ESM0   60.4%   <- split
-        2020-03-18   6 days after    ESM0   78.0%   <- split
+        2020-03-12   AT the boundary ESH0   72.8%   <- split, and the calendar rule still picks right
+        2020-03-16   4 days after    ESM0   60.4%   <- the trough
+        2020-03-18   6 days after    ESM0   78.0%   <- recovering
 
     Before the boundary the front month is still the old contract and holds nearly everything. AFTER
     it, the new contract leads but the old one keeps a large share while its open interest unwinds
@@ -1039,10 +1040,10 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                                         rollover_days=cfg["rollover_days"])
     _roll_d = roll_window_days(_parse_yyyymmdd(ymd), cfg["rollover_days"])
     if 0 <= _roll_d <= 7:                     # the roll is a week, not a day (see roll_window_days)
-        log.warning("%s: %d day(s) AFTER the %s roll boundary -- volume is SPLIT across contracts "
-                    "here. Measured on the March 2020 roll, the new front month carried 60.4%% on "
-                    "03-16 and 78.0%% on 03-18 while the old contract kept the rest (its open "
-                    "interest is still unwinding). %s is the right front month, but the "
+        log.warning("%s: %+d day(s) from the %s roll boundary -- volume is SPLIT across contracts "
+                    "here. Measured across the March 2020 roll, the leading contract carried 72.8%% "
+                    "AT the boundary, 60.4%% four days after and 78.0%% by six, against 93.7%% three "
+                    "days before. %s is the right front month, but the "
                     "single-contract leg is not the whole futures market on this session; say so in "
                     "the sample appendix rather than splicing -- the contracts carry a 10-12 point "
                     "calendar spread, so a stitched series jumps at the seam.",

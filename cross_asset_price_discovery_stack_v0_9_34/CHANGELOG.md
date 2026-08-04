@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.9.40 -- 2020-03-12 closes the set: all four MWCB days measured
+
+`mt_product_status` and `mt_product_statistics` for ESH0 and ESM0 on the roll boundary itself, the
+last unmeasured session.
+
+**The roll boundary: ESH0 at 72.8%**, so the calendar rule is right on all four MWCB days. The full
+curve, as share of RTH volume held by the contract `rollover_days=8` picks:
+
+| date | roll offset | picked | share |
+|---|---|---|---|
+| 2020-03-09 | -3 days | ESH0 | **93.7%** |
+| 2020-03-12 | **0 (boundary)** | ESH0 | **72.8%** |
+| 2020-03-16 | +4 days | ESM0 | **60.4%** (trough) |
+| 2020-03-18 | +6 days | ESM0 | **78.0%** |
+
+Concentrated before, dropping through the boundary, troughing four days after, recovering by six --
+so the single-contract ES leg misses 6-40% of futures volume depending where in the roll week a
+session sits. The extractor warning now quotes the whole curve rather than the two post-roll points.
+
+**The flag/tape gap, complete across all four days:**
+
+| date | flag span | actual stop | understated | sole-venue | ES resumes vs SPY reopen |
+|---|---|---|---|---|---|
+| 2020-03-09 | 6.38 s | 834.12 s | 131x | 65.9 s | **+0.010 s** |
+| 2020-03-12 | 6.38 s | **839.88 s** | **132x** | **60.1 s** | **+0.006 s** |
+| 2020-03-16 | 7.27 s | 846.06 s | 116x | 53.9 s | **+0.012 s** |
+| 2020-03-18 | 5.83 s | 817.30 s | 140x | 88.7 s | +6.0 s |
+
+The ES down-time is stable at 817-846 s against a 900 s equity halt, because ES halts about a minute
+in and resumes with the cash market.
+
+**Third cross-validation of `MWCB_HALTS`:** ES resumes 09:50:44.006 on 03-12 against a table end of
+09:50:44 -- +6 ms, joining +10 ms and +12 ms. Three independent confirmations of boundaries
+hand-entered before any was checked.
+
+**The volume collapse holds on a third baseline:** 240.3 -> 65.8 lots/s on 03-12 (**-73%**), the
+busiest pre-halt tape of the four. With 03-09 (-95%) and 03-18 (-58%) that is three days, all falls.
+2020-03-16 stays excluded -- no RTH baseline exists when the halt begins one second after the open.
+
+`test_es_product_status.py` at 17 checks, now covering all four MWCB dates.
+
 ## v0.9.39 -- 2020-03-09 completes the set, and the futures do not absorb the flow
 
 The last missing date. `mt_product_status` and `mt_product_statistics` for ESH0 and ESM0 on

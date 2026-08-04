@@ -542,17 +542,20 @@ def check_the_sole_venue_window():
 # because Velocity Logic stops the ES group rather than a contract.
 TAPE_HALTS = [
     ("2020-03-09", ("09:34:13", "09:49:13"), "09:35:18.887", "09:49:13.010", 6.38),
+    ("2020-03-12", ("09:35:44", "09:50:44"), "09:36:44.124", "09:50:44.006", 6.38),
     ("2020-03-16", ("09:30:01", "09:45:01"), "09:30:54.949", "09:45:01.012", 7.27),
     ("2020-03-18", ("12:56:11", "13:11:11"), "12:57:39.704", "13:11:17.008", 5.83),
 ]
 # RTH 09:30-16:00 volume, from the same tapes
 RTH_VOLUME = {("2020-03-09", "ESH0"): 2010427, ("2020-03-09", "ESM0"): 135318,
+              ("2020-03-12", "ESH0"): 3136474, ("2020-03-12", "ESM0"): 1169026,
               ("2020-03-16", "ESH0"): 1986076, ("2020-03-16", "ESM0"): 3027078,
               ("2020-03-18", "ESH0"): 732903,  ("2020-03-18", "ESM0"): 2605122}
 # lots/s in the 5 min of RTH before the equity halt, and during the sole-venue window.
 # 2020-03-16 has NO entry on purpose: its halt begins 1 s after the 09:30 open, so there is no
 # RTH baseline to compare against and the comparison must not be manufactured from overnight.
-SOLE_VENUE_RATE = {"2020-03-09": (61.8, 3.0), "2020-03-18": (105.7, 44.2)}
+SOLE_VENUE_RATE = {"2020-03-09": (61.8, 3.0), "2020-03-12": (240.3, 65.8),
+                   "2020-03-18": (105.7, 44.2)}
 
 
 def check_flag_understatement_across_days():
@@ -583,12 +586,13 @@ def check_flag_understatement_across_days():
               "sole-venue %.1f s   ES reopens %+.3f s" % (d, f, r, ratio, sole, reopen))
     # the cross-validation, on the two days where ES resumes with the equity market
     xv = []
-    for d, resume in (("2020-03-09", "09:49:13.010"), ("2020-03-16", "09:45:01.012")):
+    for d, resume in (("2020-03-09", "09:49:13.010"), ("2020-03-12", "09:50:44.006"),
+                      ("2020-03-16", "09:45:01.012")):
         gap = (pd.Timestamp(f"{d} {resume}", tz=TZ) - mh.halt_windows(d)[0][1]).total_seconds()
         xv.append((d, 1000 * gap))
         ok &= abs(gap) < 0.05
-    print("     the ES tape resumes %s after the SPY halt END that MWCB_HALTS carries -- two "
-          "independent feeds, on a boundary hand-entered before either was checked : %s"
+    print("     the ES tape resumes %s after the SPY halt END that MWCB_HALTS carries -- three "
+          "independent confirmations of a boundary hand-entered before any was checked : %s"
           % (", ".join("%s +%.0f ms" % (d, g) for d, g in xv), ok))
     return bool(ok)
 
@@ -601,19 +605,20 @@ def check_futures_activity_falls_when_equities_halt():
 
         date        RTH lots/s before the halt   during the sole-venue window   change
         2020-03-09                        61.8                            3.0    -95%
+        2020-03-12                       240.3                           65.8    -73%
         2020-03-18                       105.7                           44.2    -58%
 
     2020-03-16 is deliberately EXCLUDED. Its equity halt begins one second after the 09:30 open, so
     there is no RTH trading to compare against; measuring "before" from the overnight session gives
     +1128%, which is an artifact of comparing an opening print to Globex overnight, not a finding.
-    Two days is what the data supports and two days is what is claimed."""
+    Three days is what the data supports and three days is what is claimed."""
     ok, rows = True, []
     for d, (before, sole) in sorted(SOLE_VENUE_RATE.items()):
         chg = 100 * (sole / before - 1)
         rows.append((d, before, sole, chg))
         ok &= chg < -50
     excluded = "2020-03-16" not in SOLE_VENUE_RATE
-    ok = bool(ok and excluded and len(SOLE_VENUE_RATE) == 2)
+    ok = bool(ok and excluded and len(SOLE_VENUE_RATE) == 3)
     print("(17) futures trading rate when the equity market halts:")
     for d, b, s_, c in rows:
         print("     %s  %6.1f lots/s before -> %5.1f during the sole-venue window   %+.0f%%"
@@ -639,21 +644,23 @@ def check_roll_is_settled_by_volume():
     price jump at the seam. It is a sample fact the paper has to state."""
     import mstbook_loader as ml
     ok, shares, picked = True, {}, {}
-    for d in ("2020-03-09", "2020-03-16", "2020-03-18"):
+    for d in ("2020-03-09", "2020-03-12", "2020-03-16", "2020-03-18"):
         h, m = RTH_VOLUME[(d, "ESH0")], RTH_VOLUME[(d, "ESM0")]
         picked[d] = ml.get_front_month_contract("ES", as_of_date=ml._parse_yyyymmdd(d.replace("-", "")))
         shares[d] = (m if picked[d] == "ESM0" else h) / (h + m)     # share held by the CHOSEN contract
         ok &= shares[d] > 0.5                                       # the calendar rule picks the leader
-    agrees = picked == {"2020-03-09": "ESH0", "2020-03-16": "ESM0", "2020-03-18": "ESM0"}
-    # 03-09 is a NORMAL day (93.7% in one contract); the split is specific to the post-roll sessions
-    split = (shares["2020-03-09"] > 0.90 and 0.55 < shares["2020-03-16"] < 0.65
-             and 0.75 < shares["2020-03-18"] < 0.80)
+    agrees = picked == {"2020-03-09": "ESH0", "2020-03-12": "ESH0",
+                        "2020-03-16": "ESM0", "2020-03-18": "ESM0"}
+    # the roll curve: concentrated before, troughing four days after, recovering by six
+    split = (shares["2020-03-09"] > 0.90 and 0.70 < shares["2020-03-12"] < 0.75
+             and 0.55 < shares["2020-03-16"] < 0.65 and 0.75 < shares["2020-03-18"] < 0.80)
     ok = bool(ok and agrees and split)
     print("(16) share of RTH volume held by the contract the calendar rule picks: %s"
           % ", ".join("%s %s %.1f%%" % (d, picked[d], 100 * s) for d, s in sorted(shares.items())))
-    print("     it picks the leading contract on all three days (%s)" % agrees)
-    print("     03-09 is a NORMAL day at 93.7%%; the two POST-roll sessions are split 60/40 and "
-          "78/22, so the single-contract ES leg misses 22-40%% of futures volume there (%s)" % split)
+    print("     it picks the leading contract on all FOUR MWCB days (%s)" % agrees)
+    print("     the roll curve: 93.7%% three days before, 72.8%% at the boundary, troughing at "
+          "60.4%% four days after and back to 78.0%% by six -- so the single-contract ES leg misses "
+          "6-40%% of futures volume depending where in the week a session sits (%s)" % split)
 
     # ...and the extractor now says so. Distance must be measured in BOTH directions: 2020-03-16 is
     # four days PAST the March boundary, and a forward-only measure calls it 87 days from the June
@@ -662,6 +669,7 @@ def check_roll_is_settled_by_volume():
             for d in ("2020-03-09", "2020-03-12", "2020-03-16", "2020-03-18", "2020-03-25")}
     # signed, and the sign carries the meaning: the SPLIT sessions are the ones AFTER the boundary
     warned = all(0 <= near[d] <= 7 for d in ("2020-03-12", "2020-03-16", "2020-03-18"))
+    ok &= near["2020-03-12"] == 0                 # the boundary itself, and it IS split (72.8%)
     pre = near["2020-03-09"] == -3                # before the roll: concentrated, only an INFO
     quiet = near["2020-03-25"] > 7
     ok = bool(ok and warned and pre and quiet)
