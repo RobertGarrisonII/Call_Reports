@@ -537,6 +537,99 @@ def check_the_sole_venue_window():
     return ok
 
 
+# ── measured against the ES trade tapes (mt_product_statistics cumulative `volume`) ──────────────
+# (date, SPY halt, ES last trade, ES first trade after, flag span s) -- identical for BOTH contracts,
+# because Velocity Logic stops the ES group rather than a contract.
+TAPE_HALTS = [
+    ("2020-03-16", ("09:30:01", "09:45:01"), "09:30:54.949", "09:45:01.012", 7.27),
+    ("2020-03-18", ("12:56:11", "13:11:11"), "12:57:39.704", "13:11:17.008", 5.83),
+]
+# RTH 09:30-16:00 volume, from the same tapes
+RTH_VOLUME = {("2020-03-16", "ESH0"): 1986076, ("2020-03-16", "ESM0"): 3027078,
+              ("2020-03-18", "ESH0"): 732903,  ("2020-03-18", "ESM0"): 2605122}
+
+
+def check_flag_understatement_across_days():
+    """The 140x is not a one-day artifact. Two dates, two contracts, the same two orders of magnitude.
+
+        date        flag span   actual stop   understated   ES resumes vs the equity reopen
+        2020-03-16     7.27 s       846.06 s        116x    +0.012 s
+        2020-03-18     5.83 s       817.30 s        140x    +6.0 s
+
+    The onset is exact on both: the flag is set 24 ms and 11 ms after the respective last trades.
+    It is only the CLEAR that is meaningless.
+
+    2020-03-16 also cross-validates the equity side. `MWCB_HALTS` puts the SPY halt end at 09:45:01,
+    derived from the SPY status tape; ES's first trade back is 09:45:01.012. Two independent feeds,
+    12 ms apart, on a boundary that was hand-entered before either was checked."""
+    rows, ok = [], True
+    for d, (sa, sb), last, first, flag_s in TAPE_HALTS:
+        A = pd.Timestamp(f"{d} {last}", tz=TZ); B = pd.Timestamp(f"{d} {first}", tz=TZ)
+        spy = mh.halt_windows(d)[0]
+        real = (B - A).total_seconds()
+        rows.append((d, flag_s, real, real / flag_s, (A - spy[0]).total_seconds(),
+                     (B - spy[1]).total_seconds()))
+        ok &= real / flag_s > 100 and 40 < (A - spy[0]).total_seconds() < 120
+        ok &= spy[0].strftime("%H:%M:%S") == sa and spy[1].strftime("%H:%M:%S") == sb
+    print("(15) the flag/tape gap on every day we can measure:")
+    for d, f, r, ratio, sole, reopen in rows:
+        print("     %s  flag %5.2f s   actual stop %7.2f s   understated %3.0fx   "
+              "sole-venue %.1f s   ES reopens %+.3f s" % (d, f, r, ratio, sole, reopen))
+    # the cross-validation
+    es_resume = pd.Timestamp("2020-03-16 09:45:01.012", tz=TZ)
+    spy_end = mh.halt_windows("2020-03-16")[0][1]
+    xval = abs((es_resume - spy_end).total_seconds()) < 0.05
+    ok &= xval
+    print("     2020-03-16: the ES tape resumes %.0f ms after the SPY halt end derived from the "
+          "equity status tape -- two independent feeds agreeing on a hand-entered boundary (%s) : %s"
+          % (1000 * (es_resume - spy_end).total_seconds(), xval, ok))
+    return bool(ok)
+
+
+def check_roll_is_settled_by_volume():
+    """ESM0 is the front month on both dates -- `rollover_days=8` was right -- but 03-16 is split.
+
+        date        ESH0 RTH vol   ESM0 RTH vol   front-month share
+        2020-03-16     1,986,076      3,027,078   60.4%
+        2020-03-18       732,903      2,605,122   78.0%
+
+    On an ordinary day the front month is essentially all of the volume. During this roll week it is
+    60-78%, so a single-contract ES leg misses 22-40% of the futures activity on two sessions that
+    are IN the volatile panel. That is not a bug to fix by stitching -- the two contracts are
+    different instruments with a 10-12 point carry spread, and splicing them would manufacture a
+    price jump at the seam. It is a sample fact the paper has to state."""
+    ok, shares = True, {}
+    for d in ("2020-03-16", "2020-03-18"):
+        h, m = RTH_VOLUME[(d, "ESH0")], RTH_VOLUME[(d, "ESM0")]
+        shares[d] = m / (h + m)
+        ok &= m > h                                   # ESM0 is front, as rollover_days=8 picks
+    import mstbook_loader as ml
+    picked = {d: ml.get_front_month_contract("ES", as_of_date=ml._parse_yyyymmdd(d.replace("-", "")))
+              for d in shares}
+    agrees = all(picked[d] == "ESM0" for d in shares)
+    split = 0.55 < shares["2020-03-16"] < 0.65 and 0.75 < shares["2020-03-18"] < 0.80
+    ok = bool(ok and agrees and split)
+    print("(16) front month by RTH volume: %s"
+          % ", ".join("%s ESM0 %.1f%%" % (d, 100 * s) for d, s in sorted(shares.items())))
+    print("     the calendar rule picks %s -- it agrees with the tape (%s)"
+          % (", ".join("%s=%s" % (d, c) for d, c in sorted(picked.items())), agrees))
+    print("     but the roll week is SPLIT 60/40 and 78/22, so the single-contract ES leg misses "
+          "22-40%% of futures volume on two volatile-panel sessions (%s)" % split)
+
+    # ...and the extractor now says so. Distance must be measured in BOTH directions: 2020-03-16 is
+    # four days PAST the March boundary, and a forward-only measure calls it 87 days from the June
+    # roll -- silent on exactly the session that needs the warning.
+    near = {d: ml.roll_window_days(ml._parse_yyyymmdd(d.replace("-", "")))
+            for d in ("2020-03-09", "2020-03-12", "2020-03-16", "2020-03-18", "2020-03-25")}
+    flags = all(near[d] <= 7 for d in ("2020-03-09", "2020-03-12", "2020-03-16", "2020-03-18"))
+    quiet = near["2020-03-25"] > 7
+    ok = bool(ok and flags and quiet)
+    print("     nearest roll boundary: %s -- all four MWCB dates are inside the roll week (%s) and "
+          "an ordinary session a week later is not (%s) : %s"
+          % (", ".join("%s=%dd" % (d, n) for d, n in sorted(near.items())), flags, quiet, ok))
+    return ok
+
+
 def check_calendar_spread_sanity():
     """A cheap cross-check that both contracts' limits are real: their difference is the carry."""
     h = ms.state_series(_roll_frame(ROLL, "ESH0"))["luld_lower"].dropna() * SCALE
@@ -562,7 +655,8 @@ def main():
               check_halts_are_group_level_not_contract_level,
               check_es_halt_onset_lags_the_equity_halt,
               check_futures_only_pause_is_not_swallowed, check_flag_clear_is_not_a_resume,
-              check_the_sole_venue_window, check_calendar_spread_sanity]
+              check_the_sole_venue_window, check_flag_understatement_across_days,
+              check_roll_is_settled_by_volume, check_calendar_spread_sanity]
     res = []
     for fn in checks:
         try:

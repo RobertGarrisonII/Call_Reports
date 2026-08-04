@@ -394,3 +394,49 @@ The file is **424 MB for one contract-day**, which corrects an assumption in `pr
 `mt_product_statistics` is not small. The front-month discriminators — the prior session's closing
 `volume` and the `openinterest` — are both in the FIRST rows, so a `--limit` fetch answers the roll
 question without pulling a gigabyte.
+
+## 14. Four ES tapes: the roll settled, and the flag gap confirmed on a second day
+
+`mt_product_statistics` for ESH0 and ESM0 on both 2020-03-16 and 2020-03-18.
+
+**The roll: ESM0, on both dates — the calendar rule was right.**
+
+| date | ESH0 RTH volume | ESM0 RTH volume | front-month share |
+|---|---|---|---|
+| 2020-03-16 | 1,986,076 | **3,027,078** | 60.4% |
+| 2020-03-18 | 732,903 | **2,605,122** | 78.0% |
+
+`rollover_days=8` picks ESM0 for both, and the tape agrees. But **the roll is a week, not a switch.**
+On an ordinary session the front month is essentially all of the volume; here the single-contract ES
+leg misses **22–40%** of futures activity, on two sessions that are *in* the volatile panel. "Right
+contract" and "the whole market" are different claims and only the second is what a price-discovery
+estimate assumes.
+
+Splicing is not the fix — the contracts carry a 10–12 index-point calendar spread, so a stitched
+series manufactures a jump at the seam. It is a sample fact to report, so `roll_window_days()`
+measures the distance to the nearest roll boundary **in either direction** and the extractor warns
+inside ±7 days. Direction matters: 2020-03-16 is four days *past* the March boundary, and a
+forward-only measure calls it 87 days from the June roll — silent on exactly the session that needs
+it. All four MWCB dates land inside the roll week (3, 0, 4 and 6 days); so does 2024-12-18 (6 days).
+
+Open interest rolls later than volume: ESH0 2.69 M vs ESM0 1.43 M on 03-16, then ESH0 1.59 M vs
+ESM0 2.96 M on 03-18.
+
+**The flag/tape gap, on a second date and both contracts.** §13 measured one day. Adding 03-16:
+
+| date | flag span | actual stop | understated | sole-venue window | ES reopens vs SPY |
+|---|---|---|---|---|---|
+| 2020-03-16 | 7.27 s | **846.06 s** | 116× | 53.9 s | **+0.012 s** |
+| 2020-03-18 | 5.83 s | **817.30 s** | 140× | 88.7 s | +6.0 s |
+
+The onset is exact on both — the flag is set 24 ms and 11 ms after the respective last trades — and
+both contracts stop and resume at the same instants, confirming the halt is group-level. Only the
+CLEAR is meaningless.
+
+**2020-03-16 cross-validates the equity side.** `MWCB_HALTS` puts that day's SPY halt end at
+09:45:01, derived from the equity status tape. ES's first trade back is **09:45:01.012**. Two
+independent feeds, 12 ms apart, agreeing on a boundary that was hand-entered before either was
+checked.
+
+Contracts traded while ES was the only venue: 3,698 (ESH0) + 4,132 (ESM0) on 03-16 in 53.9 s;
+1,288 + 3,927 on 03-18 in 88.7 s.

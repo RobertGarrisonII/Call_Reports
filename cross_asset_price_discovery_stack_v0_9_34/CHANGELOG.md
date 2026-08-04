@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.9.38 -- the roll settled by volume, and the flag gap confirmed on a second day
+
+Four ES tapes (ESH0 and ESM0, 2020-03-16 and 2020-03-18) close two open questions.
+
+**The roll: ESM0 on both dates, so `rollover_days=8` was right.**
+
+| date | ESH0 RTH volume | ESM0 RTH volume | front-month share |
+|---|---|---|---|
+| 2020-03-16 | 1,986,076 | **3,027,078** | 60.4% |
+| 2020-03-18 | 732,903 | **2,605,122** | 78.0% |
+
+But the roll is a WEEK, not a switch. On an ordinary session the front month is essentially all of
+the volume; here the single-contract ES leg misses **22-40%** of futures activity, on two sessions
+that are in the volatile panel. "Right contract" and "the whole market" are different claims, and
+only the second is what a price-discovery estimate assumes.
+
+Splicing is not the fix -- the contracts carry a 10-12 index-point calendar spread, so a stitched
+series manufactures a jump at the seam. So it is reported rather than corrected: new
+`roll_window_days()` measures the distance to the nearest roll boundary **in either direction**, and
+`_extract_one_session` warns inside +/-7 days with the measured shares. Direction matters --
+2020-03-16 is four days PAST the March boundary, and a forward-only measure calls it 87 days from
+the June roll, silent on exactly the session that needs it. All four MWCB dates land inside the roll
+week (3, 0, 4, 6 days), as does 2024-12-18 (6). Open interest rolls later than volume: ESH0 2.69 M
+vs ESM0 1.43 M on 03-16, reversing to 1.59 M vs 2.96 M on 03-18.
+
+**The v0.9.37 correction holds on a second date and both contracts.**
+
+| date | flag span | actual stop | understated | sole-venue window | ES reopens vs SPY |
+|---|---|---|---|---|---|
+| 2020-03-16 | 7.27 s | **846.06 s** | 116x | 53.9 s | **+0.012 s** |
+| 2020-03-18 | 5.83 s | **817.30 s** | 140x | 88.7 s | +6.0 s |
+
+The onset is exact on both -- the flag is set 24 ms and 11 ms after the respective last trades -- and
+both contracts stop and resume at identical instants, confirming the halt is group-level rather than
+per-contract. Only the CLEAR is meaningless, which is what `activity=` now fixes.
+
+**2020-03-16 cross-validates the equity side.** `MWCB_HALTS` puts that day's SPY halt end at
+09:45:01, derived from the equity status tape; ES's first trade back is 09:45:01.012. Two
+independent feeds, 12 ms apart, on a boundary hand-entered before either was checked.
+
+`test_es_product_status.py` grows to 16 checks: (15) pins the two-date flag/tape table and the
+cross-validation, (16) pins the roll shares, the calendar rule agreeing with them, and the
+bidirectional roll-window measure.
+
 ## v0.9.37 -- the CME halt flag marks the STOP, not the duration (correcting v0.9.36)
 
 `ESM0_Product_Statistics_20200318` carries the cumulative `volume` counter across 976,175 rows, so

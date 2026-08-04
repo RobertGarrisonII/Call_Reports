@@ -92,6 +92,37 @@ def get_front_month_contract(symbol: str, as_of_date: Optional[date] = None,
     raise RuntimeError(f"Could not determine front month for {symbol} as of {as_of_date}")
 
 
+def roll_window_days(as_of_date: date, rollover_days: int = 8) -> int:
+    """Calendar days to the NEAREST front-month roll boundary, in either direction (0 = the roll).
+
+    Distance in either direction, deliberately: the days AFTER a roll are the ones that need the
+    warning most. 2020-03-16 is four days past the March boundary and still carries 39.6% of its
+    volume in the old contract -- a forward-only measure reports it as 87 days from the June roll and
+    says nothing.
+
+    The roll is not a switch, it is a week. Measured from the ES trade tapes across the March 2020
+    roll, the front month carried:
+
+        2020-03-16   ESM0 3,027,078 RTH lots vs ESH0 1,986,076   ->  60.4%
+        2020-03-18   ESM0 2,605,122 RTH lots vs ESH0   732,903   ->  78.0%
+
+    On an ordinary session the front month is essentially all of the volume. Here a single-contract
+    ES leg misses 22-40% of futures activity, on two sessions that are IN the volatile panel. The
+    calendar rule picks the right contract on both days -- it is not wrong -- but "right contract"
+    and "the whole market" are different claims, and only the second is what a price-discovery
+    estimate assumes.
+
+    Splicing the two is NOT the fix: they are different instruments carrying a 10-12 index-point
+    calendar spread, so a stitched series manufactures a jump at the seam. This is a sample fact to
+    report, which is why it is a warning and not a correction."""
+    best = 10 ** 6
+    for year in (as_of_date.year - 1, as_of_date.year, as_of_date.year + 1):
+        for month, _code in FUTURES_MONTHS.items():
+            boundary = get_third_friday(year, month) - timedelta(days=rollover_days)
+            best = min(best, abs((boundary - as_of_date).days))
+    return best
+
+
 def get_contract_expiry(contract_code: str, ref_year: Optional[int] = None) -> date:
     """Expiry (third Friday) for a contract code with a single-digit year, e.g. 'ESH5'.
 
@@ -996,6 +1027,15 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
             log.warning("%s: cache read failed (%s); re-extracting", label, exc)
     contract = get_front_month_contract(cfg["es_symbol"], as_of_date=_parse_yyyymmdd(ymd),
                                         rollover_days=cfg["rollover_days"])
+    _roll_d = roll_window_days(_parse_yyyymmdd(ymd), cfg["rollover_days"])
+    if _roll_d <= 7:                          # the roll is a week, not a day (see roll_window_days)
+        log.warning("%s: %d day(s) from the %s roll boundary -- volume is SPLIT across contracts in "
+                    "this window (measured on the March 2020 roll: the front month carried 60.4%% on "
+                    "03-16 and 78.0%% on 03-18, against ~all of it on an ordinary day). %s is the "
+                    "right front month, but the single-contract leg is not the whole futures market "
+                    "here; say so in the sample appendix rather than splicing (the contracts carry a "
+                    "10-12 point calendar spread, so a stitched series jumps at the seam).",
+                    label, _roll_d, cfg["es_symbol"], contract)
     # SPY: consolidated multi-venue hybrid MBO+MBP. ES: single-venue CME order-by-order (MBO) — the
     # mt_price_level_* types are empty for futures; integer-hundredths -> index points via price_scale.
     spy = lob.reconstruct_session(ymd, "SPY", "direct", levels=cfg["levels"], interval=cfg["interval"],
