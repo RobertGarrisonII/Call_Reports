@@ -111,6 +111,80 @@ def sample_on_grid(canon: pd.DataFrame, grid: pd.DatetimeIndex, asset: str,
     return out
 
 
+def ladder_integrity(df: pd.DataFrame, asset: str = "ES", levels: int = 10) -> dict:
+    """Integrity checks for a book that is TAKEN from the venue rather than replayed.
+
+    The crossed-book invariant is the stack's primary gate, and on this leg it can no longer fail:
+    a venue-published ladder does not cross by construction, so `ES_crossed = 0.00%` on every
+    session is not evidence the futures book is right -- it is evidence the test does not apply.
+    The 2026-08-04 run reported exactly that on all 24 sessions, which left the ES leg with no
+    integrity check at all.
+
+    These are the properties a real ladder must have, that a mis-parsed or mis-scaled one will not:
+
+    ``monotone``    bid prices strictly decrease and ask prices strictly increase with depth. This
+                    is what catches a column-mapping error (levels swapped or off by one) and a
+                    partially-applied price scale -- both of which leave a book that looks fine at
+                    level 1 and is nonsense below it, and neither of which crosses.
+    ``coverage``    fraction of snapshots carrying all ``levels`` levels on both sides. A ladder
+                    that publishes only three levels is a legitimate market state; one that
+                    publishes ten on some days and three on others is a fetch problem, and the
+                    number makes the difference visible.
+    ``stale_frac``  fraction of snapshots where the ENTIRE top of book is unchanged from the
+                    previous one. The ladder is a step function so some staleness is expected, but
+                    a leg that is stale for most of a session is being carried forward from a few
+                    rows rather than sampled from a live stream -- the aggregated-path analogue of
+                    a frozen replay.
+
+    -> {'monotone_violations': int, 'monotone_frac': float, 'coverage': float,
+        'stale_frac': float, 'ok': bool, 'reasons': [str]}"""
+    rep = {"monotone_violations": 0, "monotone_frac": 1.0, "coverage": 0.0, "stale_frac": float("nan"),
+           "ok": True, "reasons": []}
+    if df is None or len(df) == 0:
+        rep["ok"] = False
+        rep["reasons"].append("%s: empty frame" % asset)
+        return rep
+
+    def col(tag, i):
+        return pd.to_numeric(df.get(f"{asset}_{tag}price_{i}"), errors="coerce").to_numpy(float)
+
+    bids = [col("bid", i) for i in range(1, levels + 1)]
+    asks = [col("ask", i) for i in range(1, levels + 1)]
+    bad = np.zeros(len(df), bool)
+    for i in range(levels - 1):
+        with np.errstate(invalid="ignore"):
+            b0, b1, a0, a1 = bids[i], bids[i + 1], asks[i], asks[i + 1]
+            bad |= np.where(np.isfinite(b0) & np.isfinite(b1), b1 >= b0, False)
+            bad |= np.where(np.isfinite(a0) & np.isfinite(a1), a1 <= a0, False)
+    rep["monotone_violations"] = int(bad.sum())
+    rep["monotone_frac"] = float(1.0 - bad.mean())
+
+    full = np.ones(len(df), bool)
+    for i in range(levels):
+        full &= np.isfinite(bids[i]) & np.isfinite(asks[i])
+    rep["coverage"] = float(full.mean())
+
+    b1, a1 = bids[0], asks[0]
+    if len(df) > 1:
+        same = (b1[1:] == b1[:-1]) & (a1[1:] == a1[:-1])
+        rep["stale_frac"] = float(np.mean(same))
+
+    if rep["monotone_violations"]:
+        rep["ok"] = False
+        rep["reasons"].append(
+            "%s: the venue ladder is NOT monotone in depth on %d of %d snapshot(s) (%.2f%%). A real "
+            "ladder always is, and this does not cross, so the crossed-book gate cannot see it -- "
+            "suspect a level column mapping or a partially applied price scale."
+            % (asset, rep["monotone_violations"], len(df), 100 * (1 - rep["monotone_frac"])))
+    if np.isfinite(rep["stale_frac"]) and rep["stale_frac"] > 0.99:
+        rep["ok"] = False
+        rep["reasons"].append(
+            "%s: the top of book is unchanged on %.1f%% of snapshots -- the leg is being carried "
+            "forward from a handful of rows rather than sampled from a live ladder."
+            % (asset, 100 * rep["stale_frac"]))
+    return rep
+
+
 def session_from_aggregated(date_str: str, product: str, product_type: str = "futures",
                             levels: int = 10, interval: str = "1s",
                             session=("09:30", "16:00"), tz: str = "America/New_York",

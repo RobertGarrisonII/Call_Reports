@@ -961,6 +961,11 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
     # union (df.attrs["halt_windows"]) is for pair estimates, which need both legs live.
     halt = _mask("halt_windows")
     rep["halt_snapshots"] = int(halt.sum())
+    # Per-leg halt counts, because the union alone hides which leg contributed. The 2026-08-04 run
+    # reported 900/900/900/901 snapshots on the four MWCB days -- the SPY windows exactly -- and
+    # there was no way to tell from the output whether the ES windows had been derived at all.
+    for _a in assets:
+        rep.setdefault("halt_by_leg", {})[_a] = int(_mask(f"halt_windows_{_a}").sum())
     for a in assets:
         halt = _mask(f"halt_windows_{a}")
         n_halt = int(halt.sum())
@@ -988,7 +993,20 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
             rep["reasons"].append(f"{a}: top is CROSSED on {frac_ex:.1%} of {n_open} snapshots "
                                   f"OUTSIDE any halt{extra} (tolerance {crossed_tol:.1%}) -- the "
                                   f"replay is dropping removals or inventing levels")
-        elif n_halt and np.isfinite(frac) and frac > crossed_tol:
+        # A leg taken from the venue ladder cannot cross, so the invariant above is vacuous for it.
+        # Check the properties a ladder must have instead (monotone depth, coverage, staleness).
+        if (df.attrs.get("book_source") == "aggregated" if hasattr(df, "attrs") else False) \
+                or df.attrs.get(f"book_source_{a}") == "aggregated":
+            try:
+                import aggregated_book as _ab
+                li = _ab.ladder_integrity(df, asset=a)
+                rep[a]["ladder"] = {k: v for k, v in li.items() if k != "reasons"}
+                if not li["ok"]:
+                    rep["ok"] = False
+                    rep["reasons"].extend(li["reasons"])
+            except Exception:
+                pass
+        if n_halt and np.isfinite(frac) and frac > crossed_tol:
             rep["reasons"].append(f"{a}: {frac:.1%} crossed overall but only {frac_ex:.2%} outside "
                                   f"the {n_halt}-snapshot halt on this leg -- the crossing "
                                   f"IS the halt (matching stops, resting orders do not), so the "
@@ -1186,6 +1204,8 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
         df.attrs["halt_reasons"] = sorted(set(df.attrs.get("halt_reasons_SPY", []))
                                           | set(df.attrs.get("halt_reasons_ES", [])))
     df.attrs["es_contract"] = contract
+    if locals().get("_es_from_ladder"):            # so session_qc knows to run the LADDER checks
+        df.attrs["book_source_ES"] = "aggregated"  # (the crossed test is vacuous on that leg)
     qc = session_qc(df, crossed_tol=float(cfg.get("crossed_tol", 0.005)))
     df.attrs["qc"] = qc
     med_spy = qc["SPY"]["median_bid"]

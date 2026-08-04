@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.9.46 -- five corrections from the first clean replication run
+
+The 2026-08-04 run extracted 24 sessions, passed every gate and recovered the 2020 ES leg. Reading
+its log turned up five things the run itself could not have reported.
+
+**Tables 5 and 7 did not use the extracted data.** STAGE 4 re-analysed the paper's PUBLISHED 3x3
+matrices -- literals in the driver -- on a run that had just written 561,624 rows, and nothing in the
+output distinguished that from an estimate on this sample. The stage now builds the panels from the
+session frames whenever they carry trade flow (`mstbook_loader.counts_from_frame` ->
+`tandem_order_flow.table5_from_sessions`), keeps the published matrices as the fallback when no
+frames exist, splits the MWCB days into their own panel, and **prints which source it used**. The
+plumbing already existed; it had simply never been connected.
+
+Note what is counted: Eq. (1) uses NEW-ORDER submissions, and the frames carry the signed TRADE
+tape. The real-data panel is therefore the same statistic on executions rather than submissions -- a
+different and better-identified object, since a submission can be cancelled before it ever meets the
+other market. The output labels it `DATA(trades)` so it is never silently read as the published
+measure.
+
+**The ES crossed-book invariant had gone vacuous.** `ES_crossed = 0.00%` on all 24 sessions reads as
+a clean futures book. It is not: since v0.9.42 that leg is TAKEN from CME's ladder, and a
+venue-published ladder cannot cross by construction. The stack's primary integrity gate stopped
+applying to the futures leg and nothing said so. New `aggregated_book.ladder_integrity()` supplies
+the checks that CAN fail on such a leg -- **monotone depth**, level coverage and staleness -- and
+`session_qc` runs them wherever the book came from the ladder. A ladder with level 2 published
+inside level 1 (a column-mapping or half-applied-scale error) still reports `crossed = 0.00%` and is
+now caught.
+
+**The halt union hid its legs.** The run printed 900/900/900/901 halt snapshots on the MWCB days --
+the SPY windows exactly -- with no column that could show whether the ES windows had been derived at
+all. On 2020-03-18 the ES leg resumes six seconds after the equity reopen, so the union should be
+larger. `session_qc` now returns `halt_by_leg` and `qc_frames` prints `{ASSET}_halt` beside the
+union, so an ES leg contributing nothing reads as a 0 rather than vanishing.
+
+**Peak memory was guessed at half its measured value.** `autoscale measure` reported **58.4 GiB**
+per worker against a built-in guess of 32, which sized THIRTEEN workers where the measurement
+implies five. Thirteen at 58 GiB is 758 GiB nominal on a 495 GiB node; that run survived only
+because the peaks did not coincide. `_PEAK_GB_GUESS` is now 76 -- the measurement with the same 1.30
+headroom `measure` recommends -- so the default is a measurement with margin rather than an estimate.
+
+**ES price limits were invisible in the QC table.** A single `luld_known` column reported the equity
+leg only, so the table read "no bands anywhere" when CME does publish limits for ES. `qc_frames` now
+reports `{ASSET}_luld_known` per leg and says when the futures bands are usable.
+
+New `test_run_corrections.py` (5 checks) pins each of these, including the case that motivates the
+ladder work: a mis-mapped depth level that does not cross and would have passed silently.
+
 ## v0.9.45 -- the Table 9 lag order is the correlation window, not a finding
 
 Asked whether STAGE 4c should be a VECM rather than an SVAR, given that 60 lags is a boundary

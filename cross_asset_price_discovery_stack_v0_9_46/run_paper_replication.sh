@@ -303,6 +303,7 @@ if have_stage 1; then
            test_halt_aware_qc.py \
            test_driver_flags.py \
            test_svar_lag_artifact.py \
+           test_run_corrections.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -482,20 +483,55 @@ if have_stage 4; then
   say "STAGE 4  Table 5 + Table 7 with the corrected nulls"
   info "reports: raw corner shares (as published), independence GIVEN the observed"
   info "marginals, the corner log odds ratio, and the frequency-matched binomial null"
-  run_show $PY - "$OUT" <<'EOF'
-import sys, warnings; warnings.simplefilter("ignore")
+  run_show $PY - "$OUT" "$FRAMES" "$MWCB" <<'EOF'
+import sys, glob, pickle, warnings; warnings.simplefilter("ignore")
 import numpy as np, pandas as pd, tandem_order_flow as tof
-out = sys.argv[1]
+out, frames_glob, mwcb = sys.argv[1], sys.argv[2], sys.argv[3]
 
-# The paper's published Table 5.II, so the correction is auditable without re-running
-# anything. Replace with your own frequency matrices (or table5_from_series on the real
-# per-bar new-order counts) once the message counts are extracted.
-panels = {"A baseline": [[21.24, 12.01, 7.73], [4.82, 6.97, 4.88], [7.86, 12.07, 21.50]],
-          "B volatile": [[24.55, 11.12, 3.52], [5.73, 9.66, 4.04], [4.65, 13.63, 20.99]],
-          "C MWCB":     [[9.96, 20.89, 6.00], [4.94, 18.06, 6.77], [2.86, 17.46, 10.68]]}
+# THE PANELS COME FROM THE EXTRACTED SESSIONS WHEN THEY ARE AVAILABLE.
+#
+# This stage used to re-analyse the paper's PUBLISHED 3x3 matrices, typed in as literals. That is a
+# useful audit of the published numbers -- and it is what runs when no frames exist -- but on a run
+# that extracted 561,624 rows it consumed none of them, while the log gave no sign that Tables 5
+# and 7 were not estimates from this sample. The two are now clearly separated and labelled.
+#
+# WHAT IS COUNTED. Eq. (1) uses NEW-ORDER buy/sell counts. The frames carry the signed TRADE tape
+# (attach_flow), not order submissions, so the real-data panel is the same statistic computed on
+# executions rather than on submissions. That is a different -- and better identified -- object:
+# a submission can be cancelled before it ever meets the other market, an execution cannot. It is
+# labelled DATA(trades) so it is never silently read as the published DATA(orders) measure.
+PUBLISHED = {"A baseline": [[21.24, 12.01, 7.73], [4.82, 6.97, 4.88], [7.86, 12.07, 21.50]],
+             "B volatile": [[24.55, 11.12, 3.52], [5.73, 9.66, 4.04], [4.65, 13.63, 20.99]],
+             "C MWCB":     [[9.96, 20.89, 6.00], [4.94, 18.06, 6.77], [2.86, 17.46, 10.68]]}
+
+def _load(gl):
+    raw = []
+    for f in sorted(glob.glob(gl or "")):
+        with open(f, "rb") as fh:
+            raw.extend(pickle.load(fh))
+    return [r if len(r) == 3 else (r[0], "benchmark", r[1]) for r in raw]
+
+panels, source = {}, "PUBLISHED (paper's Table 5.II literals; no frames found)"
+try:
+    import mstbook_loader as ml
+    sess = _load(frames_glob)
+    if sess and ml.has_trade_flow(sess):
+        # MWCB days are their own panel, not part of 'volatile' -- the halt is a different regime.
+        mw = set(x for x in mwcb.split(",") if x)
+        tagged = [(d, ("C MWCB" if d in mw else ("B volatile" if r == "volatile" else "A baseline")), f)
+                  for d, r, f in sess]
+        by = tof.table5_from_sessions(tagged, ml.counts_from_frame)
+        panels = {k: (v["frequency"] if isinstance(v, dict) and "frequency" in v else v)
+                  for k, v in by.items()}
+        source = "DATA(trades): %d extracted session(s), signed trade tape" % len(sess)
+except Exception as exc:
+    print("  (real-data Table 5 unavailable: %s -- falling back to the published matrices)" % exc)
+if not panels:
+    panels = PUBLISHED
 rows = []
-for k, M in panels.items():
-    f = pd.DataFrame(np.array(M, float), index=tof.DIR3, columns=tof.DIR3)
+for k in sorted(panels):
+    M = panels[k]
+    f = M if isinstance(M, pd.DataFrame) else pd.DataFrame(np.array(M, float), index=tof.DIR3, columns=tof.DIR3)
     d = tof.dependence_summary(f, n_bars=23400)
     rows.append({"panel": k, "PCMOF": d["PCMOF"], "PCMOF_indep": d["PCMOF_indep"],
                  "PCMOF_ratio": d["PCMOF_ratio"], "NCMOF": d["NCMOF"],
@@ -503,6 +539,7 @@ for k, M in panels.items():
                  "log_OR": d["log_OR"], "log_OR_z": d.get("log_OR_z", np.nan)})
 t5 = pd.DataFrame(rows).set_index("panel").round(3)
 print("\nTable 5 -- cross-market dependence, separated from each market's own directionality")
+print("  SOURCE: %s" % source)
 print(t5.to_string())
 print("\n  binomial null (n=505/112, one second): PCMOF = NCMOF = 0.4% per corner pair")
 print("  'indep' = independence GIVEN the observed marginals -- the benchmark that isolates")

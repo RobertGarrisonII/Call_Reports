@@ -65,6 +65,16 @@ def qc_sessions(sessions, assets=("SPY", "ES"), crossed_tol: float = 0.005) -> p
             row[f"{a}_crossed"] = rep[a]["crossed_frac"]
             row[f"{a}_crossed_open"] = rep[a].get("crossed_frac_ex_halt", float("nan"))
             row[f"{a}_med_bid"] = rep[a]["median_bid"]
+            # Per-leg halt counts. The union alone hid which leg contributed: the 2026-08-04 run
+            # printed 900/900/900/901 on the MWCB days -- the SPY windows exactly -- with no way to
+            # see whether the ES windows had been derived at all.
+            row[f"{a}_halt"] = rep.get("halt_by_leg", {}).get(a, 0)
+            # A leg taken from the venue ladder cannot cross, so {a}_crossed is vacuous for it.
+            # These are the checks that CAN fail on such a leg.
+            lad = rep[a].get("ladder")
+            if lad:
+                row[f"{a}_ladder_mono"] = lad.get("monotone_frac", float("nan"))
+                row[f"{a}_ladder_stale"] = lad.get("stale_frac", float("nan"))
         # Rule 201 state. Which sessions were short-sale restricted is a SAMPLE fact the paper has
         # to report: SSR constrains the sell side only, so a restricted day has mechanically
         # asymmetric signed order flow -- the exact quantity Tables 5 and 7 count.
@@ -73,6 +83,12 @@ def qc_sessions(sessions, assets=("SPY", "ES"), crossed_tol: float = 0.005) -> p
             msum = df.attrs.get("market_state") or _ms.summarize(df, asset=assets[0])
             row["ssr_frac"] = msum.get("ssr_frac_on", float("nan")) if msum.get("ssr_known") else float("nan")
             row["luld_known"] = msum.get("luld_known", 0.0)
+            # The equity feeds leave the band columns empty, but CME DOES publish price limits for
+            # ES -- reporting a single luld_known made the futures bands invisible and read as
+            # "no bands anywhere", which is not what the data says.
+            for a in assets[1:]:
+                sm = df.attrs.get(f"market_state_{a}") or _ms.summarize(df, asset=a)
+                row[f"{a}_luld_known"] = sm.get("luld_known", 0.0)
         except Exception:
             row["ssr_frac"] = float("nan"); row["luld_known"] = 0.0
         # a fetch failure recorded at reconstruction time is the usual cause; surface it here too
@@ -102,7 +118,7 @@ def main(argv=None) -> int:
         for c in (f"{a_}_crossed", f"{a_}_crossed_open"):
             if c in show.columns:
                 show[c] = show[c].map(lambda v: "n/a" if not np.isfinite(v) else f"{v:.2%}")
-    for c in ("ssr_frac", "luld_known"):
+    for c in ("ssr_frac", "luld_known") + tuple(f"{a}_luld_known" for a in assets[1:]):
         if c in show.columns:
             show[c] = show[c].map(lambda v: "n/r" if not np.isfinite(v) else f"{v:.0%}")
     body = ["crossed-book gate on the SAVED frames (tolerance %.2f%%)" % (100 * a.crossed_tol),
@@ -129,6 +145,12 @@ def main(argv=None) -> int:
                  "  constrained and the buy side is not. Signed order flow on these days is",
                  "  mechanically asymmetric -- report them in the sample appendix and control for",
                  "  them before reading Tables 5 and 7 as evidence of directional tandem trading."]
+    _es_luld = [c for c in tbl.columns if c.endswith("_luld_known")]
+    if _es_luld and float(tbl[_es_luld].fillna(0).to_numpy(float).max()) > 0:
+        lines += ["", "Price limits ARE reported on the futures leg (%s). Those are usable as a"
+                      % ", ".join(_es_luld),
+                  "band control on ES even though the equity LULD columns are empty -- the two are",
+                  "different disseminations, not one missing field."]
     if "luld_known" in tbl.columns and float(tbl["luld_known"].fillna(0).max()) == 0.0:
         body += ["",
                  "LULD bands: not reported by this source on any session. The columns exist and are",

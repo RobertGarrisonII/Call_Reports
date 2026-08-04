@@ -37,7 +37,13 @@ import os
 import sys
 
 _SESSION_CAP = 12          # default #sessions cap (the Liberation-Day window); callers pass their own
-_PEAK_GB_GUESS = 32        # per-worker peak RSS guess for one full day of messages on the 1s grid
+# Per-worker peak RSS for one full day of messages on the 1s grid. MEASURED at 58.4 GiB on the
+# 2026-08-04 24-session run (`autoscale.py measure`), against the 32 that had been guessed -- which
+# sized 13 workers where the measurement implies 5. Thirteen at 58 GiB is 758 GiB nominal on a
+# 495 GiB node; that run survived only because the peaks did not coincide. 76 is the measured peak
+# rounded up with the same 1.30 headroom `measure` recommends, so the default is now a measurement
+# with margin rather than an estimate. Override with PEAK_GB_GUESS.
+_PEAK_GB_GUESS = 76
 _PANEL_PEAK_GB = 1         # per-worker peak for an ALREADY-AGGREGATED session frame (~7.5 MB) + temporaries
 _PANEL_USABLE = 0.70       # share of RAM a per-session process pool may use (rest: OS, parent, page cache)
 
