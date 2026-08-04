@@ -36,7 +36,7 @@ _os.makedirs(OUTPUT_DIR, exist_ok=True)
 #: which is in the STAGE 1 gate). It drifted 22 releases once -- pinned at 0.9.20 while the
 #: CHANGELOG read 0.9.42 and every archive shipped as "v0934" -- so the check is a test, not a
 #: convention.
-__version__ = "0.9.47"
+__version__ = "0.9.48"
 
 __all__ = [
     'autoscale',

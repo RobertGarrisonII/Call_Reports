@@ -194,14 +194,33 @@ def check_roll_is_measured_not_extrapolated():
     right_rival = boundary["front"] == "ESH0" and boundary["rival"] == "ESM0"
     txt = cr.describe(reps)
     flags_split = "SPLIT sessions" in txt and "sample appendix" in txt
-    ok = exact and all_agree and right_rival and flags_split
+
+    # Volume and open interest disagree on exactly the most contested session, and the tool must
+    # say so: on 2020-03-16 OI still favours ESH0 (2.69M vs 1.43M) while volume has already moved
+    # to ESM0 (3.03M vs 1.99M). An open-interest rule would put that session on the contract
+    # carrying 39.6% of the trading -- OI is a day-stale stock of positions, volume is the flow
+    # price discovery is made of.
+    V = {("20200316", "ESH0"): 1986076, ("20200316", "ESM0"): 3027078}
+    O = {("20200316", "ESH0"): 2691609, ("20200316", "ESM0"): 1426136}
+    try:
+        cr._fetch_head = lambda ymd, p, limit=40, timeout=0: (
+            None if (ymd, p) not in V
+            else pd.DataFrame({"volume": [float(V[(ymd, p)])], "openinterest": [float(O[(ymd, p)])]}))
+        r16 = cr.measure("2020-03-16")
+    finally:
+        cr._fetch_head = real
+    crossed = r16["front_share"] > 0.5 > r16["oi_share"]
+    named = "VOLUME AND OPEN INTEREST DISAGREE" in cr.describe([r16])
+    ok = exact and all_agree and right_rival and flags_split and crossed and named
     print("(6) check_roll reproduces the four measured shares exactly: %s (%s), and the calendar "
           "rule picks the leader on all four (%s)"
           % (", ".join("%.1f%%" % s for s in shares), exact, all_agree))
     print("    the boundary day pairs %s against %s -- the deferred month, not the expired one (%s)"
           % (boundary["front"], boundary["rival"], right_rival))
-    print("    and split sessions are named with what to do about them (%s) : %s"
-          % (flags_split, ok))
+    print("    and split sessions are named with what to do about them (%s)" % flags_split)
+    print("    2020-03-16: volume %.1f%% ESM0 but open interest %.1f%% -- the two criteria pick "
+          "DIFFERENT contracts (%s), and the tool says so (%s) : %s"
+          % (100 * r16["front_share"], 100 * r16["oi_share"], crossed, named, ok))
     return ok
 
 

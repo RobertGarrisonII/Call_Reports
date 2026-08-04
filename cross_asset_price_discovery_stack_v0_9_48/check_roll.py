@@ -100,6 +100,17 @@ def measure(date_str: str, symbol: str = "ES", rollover_days: int = 8, full: boo
         ois[c] = _num(df, "openinterest")
     rep["volume"] = vols
     rep["open_interest"] = ois
+    # Open interest is reported ALONGSIDE volume, not instead of it, because the two disagree
+    # exactly where the answer matters. On 2020-03-16 open interest still favoured ESH0
+    # (2.69 M vs 1.43 M) while volume had already moved to ESM0 (3.03 M vs 1.99 M) -- an
+    # open-interest rule would have put that session on the contract carrying 39.6% of the trading.
+    # OI is a STOCK of positions settled once a day; volume is the flow of transactions that price
+    # discovery is made of. For a book-level study the flow is the criterion; OI is reported so the
+    # disagreement is visible rather than assumed away.
+    otot = np.nansum([ois.get(front, np.nan), ois.get(rival, np.nan)])
+    rep["oi_share"] = (float(ois[front] / otot)
+                       if np.isfinite(ois.get(front, np.nan)) and np.isfinite(ois.get(rival, np.nan))
+                       and otot > 0 else float("nan"))
     tot = np.nansum([vols.get(front, np.nan), vols.get(rival, np.nan)])
     if np.isfinite(vols.get(front, np.nan)) and np.isfinite(vols.get(rival, np.nan)) and tot > 0:
         rep["measured"] = True
@@ -116,16 +127,18 @@ def measure(date_str: str, symbol: str = "ES", rollover_days: int = 8, full: boo
 def describe(reps) -> str:
     lines = ["front-month check: is the contract the calendar rule picks the one with the volume?",
              ""]
-    lines.append("%-12s %-7s %-7s %-6s %14s %14s %8s %s"
-                 % ("date", "front", "rival", "offset", "front vol", "rival vol", "share", "rule ok"))
+    lines.append("%-12s %-7s %-7s %-6s %13s %13s %7s %7s %s"
+                 % ("date", "front", "rival", "offset", "front vol", "rival vol", "vol%", "OI%",
+                    "rule ok"))
     for r in reps:
-        v = r.get("volume", {})
+        v, o = r.get("volume", {}), r.get("open_interest", {})
         fv, rv = v.get(r["front"], np.nan), v.get(r["rival"], np.nan)
-        lines.append("%-12s %-7s %-7s %+6d %14s %14s %7s %s"
+        lines.append("%-12s %-7s %-7s %+6d %13s %13s %7s %7s %s"
                      % (r["date"], r["front"], r["rival"], r["roll_offset_days"],
                         "{:,}".format(int(fv)) if np.isfinite(fv) else "-",
                         "{:,}".format(int(rv)) if np.isfinite(rv) else "-",
                         ("%.1f%%" % (100 * r["front_share"])) if r["measured"] else "-",
+                        ("%.1f%%" % (100 * r["oi_share"])) if np.isfinite(r.get("oi_share", np.nan)) else "-",
                         ("yes" if r.get("rule_agrees") else "NO") if r["measured"] else "not measured"))
     bad = [r for r in reps if r["measured"] and not r.get("rule_agrees")]
     split = [r for r in reps if r["measured"] and r["front_share"] < 0.90]
@@ -142,6 +155,18 @@ def describe(reps) -> str:
         lines.append("  which carry a 10-12 point calendar spread that jumps at the seam.")
     if not bad and not split and any(r["measured"] for r in reps):
         lines.append("Every measured session is concentrated (>=90%) in the contract the rule picks.")
+    disagree = [r for r in reps if r["measured"] and np.isfinite(r.get("oi_share", np.nan))
+                and (r["front_share"] >= 0.5) != (r["oi_share"] >= 0.5)]
+    if disagree:
+        lines.append("")
+        lines.append("VOLUME AND OPEN INTEREST DISAGREE on %s."
+                     % ", ".join("%s (vol %.1f%% vs OI %.1f%%)"
+                                 % (r["date"], 100 * r["front_share"], 100 * r["oi_share"])
+                                 for r in disagree))
+        lines.append("  Open interest rolls LATER than volume -- a position must be closed to move,")
+        lines.append("  and it is settled once a day, so OI is a day-stale stock while volume is the")
+        lines.append("  flow. Price discovery happens where the trading is, so VOLUME is the")
+        lines.append("  criterion here; an OI rule would put these sessions on the quieter contract.")
     unmeasured = [r["date"] for r in reps if not r["measured"]]
     if unmeasured:
         lines.append("NOT MEASURED (and therefore not verified): %s" % ", ".join(unmeasured))

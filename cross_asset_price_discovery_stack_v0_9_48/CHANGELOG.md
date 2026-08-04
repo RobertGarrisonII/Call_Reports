@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.9.48 -- volume or open interest? Report both, and flag where they disagree
+
+Asked whether open interest would be a better front-month criterion than volume. The sample answers
+it directly, on the one session where the two criteria diverge:
+
+| 2020-03-16 | ESH0 | ESM0 | picks |
+|---|---|---|---|
+| RTH volume | 1,986,076 | **3,027,078** | ESM0 |
+| open interest | **2,691,609** | 1,426,136 | ESH0 |
+
+**Open interest rolls later than volume**, structurally: a position has to be closed to move, and
+the marginal trader moves first. So on 2020-03-16 an open-interest rule would have put the session
+on the contract carrying **39.6%** of the trading. It is also settled once a day, which makes it a
+day-stale STOCK of positions against a continuous FLOW of transactions -- the wrong resolution for a
+1-second book study whatever else is true of it.
+
+Price discovery happens where the trading is, so volume stays the criterion. `check_roll.py` now
+reports **both** shares side by side and prints an explicit warning when they pick different
+contracts, so the disagreement is visible rather than assumed away. Pinned in
+`test_run_corrections.py` check (6).
+
+On the literature: Carchano and Pardo (2009, *Journal of Futures Markets* 29(7), 684-694) compare
+five rollover criteria for stock index futures and find **no significant differences** in the
+resulting return series -- but that result is about the statistical properties of RETURNS, and does
+not license indifference at book level, where this sample shows a 60/40 volume split and a criterion
+disagreement on the same day. Practitioner convention defines the front month as the
+nearest-expiring contract with the most trading activity, and the common robust rule is to roll only
+when the deferred contract leads on volume **and** open interest -- which is what the new
+side-by-side report supports.
+
 ## v0.9.47 -- the front month is chosen on every date; its share was measured on four
 
 Asked whether the front-month calculation covers all dates or only the circuit-breaker dates. Three
