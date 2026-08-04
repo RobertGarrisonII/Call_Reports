@@ -134,6 +134,25 @@ def roll_window_days(as_of_date: date, rollover_days: int = 8) -> int:
     return best
 
 
+def adjacent_contracts(symbol: str, as_of_date: date, rollover_days: int = 8) -> tuple:
+    """(previous, front, next) quarterly codes around ``as_of_date``.
+
+    The front month is a calendar rule; the contract it is competing with depends on which side of
+    the boundary the date falls. Before the boundary the rival is the DEFERRED month (volume is
+    starting to migrate to it); after it, the rival is the one that just stopped being front and is
+    still unwinding its open interest. Both are returned so a roll measurement does not have to
+    guess which pair to compare."""
+    front = get_front_month_contract(symbol, as_of_date=as_of_date, rollover_days=rollover_days)
+    codes = list(FUTURES_MONTHS.values())                # H, M, U, Z in cycle order
+    i = codes.index(front[-2])
+    yr = int(front[-1])
+    prev_code, next_code = codes[(i - 1) % 4], codes[(i + 1) % 4]
+    prev_yr = (yr - 1) % 10 if i == 0 else yr            # H rolls back to the previous year's Z
+    next_yr = (yr + 1) % 10 if i == len(codes) - 1 else yr
+    root = symbol.upper()
+    return (f"{root}{prev_code}{prev_yr}", front, f"{root}{next_code}{next_yr}")
+
+
 def get_contract_expiry(contract_code: str, ref_year: Optional[int] = None) -> date:
     """Expiry (third Friday) for a contract code with a single-digit year, e.g. 'ESH5'.
 
@@ -1058,19 +1077,21 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                                         rollover_days=cfg["rollover_days"])
     _roll_d = roll_window_days(_parse_yyyymmdd(ymd), cfg["rollover_days"])
     if 0 <= _roll_d <= 7:                     # the roll is a week, not a day (see roll_window_days)
-        log.warning("%s: %+d day(s) from the %s roll boundary -- volume is SPLIT across contracts "
-                    "here. Measured across the March 2020 roll, the leading contract carried 72.8%% "
-                    "AT the boundary, 60.4%% four days after and 78.0%% by six, against 93.7%% three "
-                    "days before. %s is the right front month, but the "
-                    "single-contract leg is not the whole futures market on this session; say so in "
-                    "the sample appendix rather than splicing -- the contracts carry a 10-12 point "
-                    "calendar spread, so a stitched series jumps at the seam.",
-                    label, _roll_d, cfg["es_symbol"], contract)
+        log.warning("%s: %+d day(s) from the %s roll boundary, so volume is probably SPLIT across "
+                    "contracts. %s is what the calendar rule picks. THE SHARE IT CARRIES ON THIS "
+                    "SESSION IS NOT MEASURED -- run `check_roll.py --dates %s` to measure it. For "
+                    "scale, the only roll ever measured (March 2020, a crisis week) had the leading "
+                    "contract at 72.8%%/60.4%%/78.0%% at +0/+4/+6 days; whether an ordinary quarter "
+                    "rolls that slowly is unknown. Report the measured share in the sample appendix "
+                    "rather than splicing -- the contracts carry a 10-12 point calendar spread, so a "
+                    "stitched series jumps at the seam.",
+                    label, _roll_d, cfg["es_symbol"], contract, label)
     elif -3 <= _roll_d < 0:
-        log.info("%s: %d day(s) before the %s roll boundary; pre-roll sessions stay concentrated in "
-                 "the old contract (93.7%% on 2020-03-09, three days out), so %s should be nearly "
-                 "the whole market -- but it is worth confirming on a volatile session.",
-                 label, -_roll_d, cfg["es_symbol"], contract)
+        log.info("%s: %d day(s) before the %s roll boundary. Pre-roll sessions are expected to stay "
+                 "concentrated in the old contract, so %s should be nearly the whole market -- but "
+                 "that is an expectation, measured once (93.7%% on 2020-03-09), not a property of "
+                 "this session. `check_roll.py --dates %s` measures it.",
+                 label, -_roll_d, cfg["es_symbol"], contract, label)
     # SPY: consolidated multi-venue hybrid MBO+MBP. ES: single-venue CME order-by-order (MBO) — the
     # mt_price_level_* types are empty for futures; integer-hundredths -> index points via price_scale.
     spy = lob.reconstruct_session(ymd, "SPY", "direct", levels=cfg["levels"], interval=cfg["interval"],

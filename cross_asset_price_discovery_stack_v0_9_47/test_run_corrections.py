@@ -166,10 +166,49 @@ def check_table5_can_be_built_from_the_frames():
     return ok
 
 
+def check_roll_is_measured_not_extrapolated():
+    """Contract CHOICE is per-date; the volume SHARE was measured on four dates in one crisis week.
+
+    The extractor quoted those four March-2020 measurements verbatim on every session in a roll
+    window -- 2023-03-09, 2024-12-18 and 2025-06-13 among them -- which reads as a fact about those
+    sessions and is an extrapolation across three to five years from a roll conducted under duress.
+    The warning now says the share is UNMEASURED and names the tool that measures it."""
+    import check_roll as cr
+    rng_free = {("20200309", "ESH0"): 2010427, ("20200309", "ESM0"): 135318,
+                ("20200312", "ESH0"): 3136474, ("20200312", "ESM0"): 1169026,
+                ("20200316", "ESH0"): 1986076, ("20200316", "ESM0"): 3027078,
+                ("20200318", "ESH0"): 732903, ("20200318", "ESM0"): 2605122}
+    real = cr._fetch_head
+    try:
+        cr._fetch_head = lambda ymd, p, limit=40, timeout=0: (
+            None if (ymd, p) not in rng_free
+            else pd.DataFrame({"volume": [float(rng_free[(ymd, p)])], "openinterest": [1.0]}))
+        reps = [cr.measure(d) for d in ("2020-03-09", "2020-03-12", "2020-03-16", "2020-03-18")]
+    finally:
+        cr._fetch_head = real
+    shares = [round(100 * r["front_share"], 1) for r in reps]
+    exact = shares == [93.7, 72.8, 60.4, 78.0]
+    all_agree = all(r["rule_agrees"] for r in reps)
+    # the boundary day must pair the front against the DEFERRED month, not the expired one
+    boundary = next(r for r in reps if r["roll_offset_days"] == 0)
+    right_rival = boundary["front"] == "ESH0" and boundary["rival"] == "ESM0"
+    txt = cr.describe(reps)
+    flags_split = "SPLIT sessions" in txt and "sample appendix" in txt
+    ok = exact and all_agree and right_rival and flags_split
+    print("(6) check_roll reproduces the four measured shares exactly: %s (%s), and the calendar "
+          "rule picks the leader on all four (%s)"
+          % (", ".join("%.1f%%" % s for s in shares), exact, all_agree))
+    print("    the boundary day pairs %s against %s -- the deferred month, not the expired one (%s)"
+          % (boundary["front"], boundary["rival"], right_rival))
+    print("    and split sessions are named with what to do about them (%s) : %s"
+          % (flags_split, ok))
+    return ok
+
+
 def main():
     checks = [check_ladder_leg_has_an_invariant_again, check_frozen_ladder_is_caught,
               check_halt_is_reported_per_leg, check_memory_guess_is_the_measured_one,
-              check_table5_can_be_built_from_the_frames]
+              check_table5_can_be_built_from_the_frames, check_roll_is_measured_not_extrapolated]
     res = []
     for fn in checks:
         try:

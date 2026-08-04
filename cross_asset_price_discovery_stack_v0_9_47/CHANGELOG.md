@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.9.47 -- the front month is chosen on every date; its share was measured on four
+
+Asked whether the front-month calculation covers all dates or only the circuit-breaker dates. Three
+things had been conflated, and the run log presented them as one:
+
+| | scope |
+|---|---|
+| **which contract is used** (`get_front_month_contract`, a calendar rule) | **every session** |
+| **whether a session is in a roll window** (`roll_window_days`, signed) | **every session** |
+| **what share that contract actually carries** | **four dates: 2020-03-09/12/16/18** |
+
+One roll, in a crisis week. And the extractor quoted those four measurements *verbatim* on every
+session that landed in a roll window -- 2023-03-09, 2024-12-18 and 2025-06-13 in the last run --
+where nothing has been measured at all. Printed next to a session's own label it reads as a fact
+about that session; it is an extrapolation across three to five years from a roll conducted under
+duress, and an ordinary quarter may roll far more cleanly. Overclaiming in the alarmist direction
+is still overclaiming.
+
+The warning now states plainly that the share on this session is **not measured**, names the tool
+that measures it, and gives the March-2020 figures as scale with their provenance attached.
+
+New `check_roll.py` measures it for any date, cheaply. `mt_product_statistics` carries a cumulative
+`volume` counter and an `openinterest` level, and both discriminators sit in the FIRST rows -- the
+pre-open rows hold the previous session's closing totals -- so a `--limit 40` fetch settles a date
+without the ~400 MB a full contract-day costs. It reports the share, flags any session where the
+calendar rule did **not** pick the volume leader (exit 2), and lists sessions it could not measure
+rather than passing silently.
+
+    python check_roll.py --dates 2023-03-09,2024-12-18,2025-06-13
+
+New `mstbook_loader.adjacent_contracts()` returns the (previous, front, next) quarterly codes around
+a date, including the year rollback at H, so a roll comparison does not have to guess which pair to
+put side by side. Getting that wrong at the boundary matters: on 2020-03-12 the rule still returns
+the OLD contract, so the rival is the DEFERRED month -- pairing it against the expired one returned
+"not measured" for the single date most likely to be split.
+
+Verified by reproducing all four known shares exactly (93.7 / 72.8 / 60.4 / 78.0 %) through the new
+code path, in `test_run_corrections.py` check (6).
+
 ## v0.9.46 -- five corrections from the first clean replication run
 
 The 2026-08-04 run extracted 24 sessions, passed every gate and recovered the 2020 ES leg. Reading
