@@ -381,6 +381,12 @@ _MSG_QTY_COL = {"mt_add_order": "quantity", "mt_cancel_order": "previousquantity
                 # lake, on the same capture clock as the messages we replay, which is exactly the
                 # objection that retired mstbook-query as a benchmark. See validate_aggregated.py.
                 "mt_aggregated_price_update": "bidquantity_1", "mt_product_statistics": "volume",
+                # mt_product_status (no trailing S) is the VENUE STATE stream: haltreason,
+                # marketsession (PreOpen/EarlySession/CoreSession/LateSession/Closed), LULD bands and
+                # the SymbolClear trading event. It is where the circuit-breaker halt actually lives
+                # -- on 2020-03-09 five feeds publish MarketWideCircuitBreakerLevel1 at 09:34:13.0787
+                # and clear it 900.0 s later -- so the halt window is read rather than hardcoded.
+                "mt_product_status": "roundlotquantity",
                 # trade-tape hygiene (busted / corrected prints), scrubbed before aggregation:
                 "mt_trade_break": "quantity", "mt_trade_correction": "newquantity",
                 # auction (opening/closing cross) imbalance -- feature input (auction_imbalance.py):
@@ -888,7 +894,10 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
     rep: dict = {"ok": True, "reasons": [], "n_rows": int(len(df))}
     try:
         import market_halts as mh
-        halt = mh.halt_mask(df.index, date=date) if len(df) else np.zeros(0, bool)
+        # the tape wins: df.attrs["halt_windows"] is what mt_product_status.haltreason actually said
+        wins = df.attrs.get("halt_windows") if hasattr(df, "attrs") else None
+        wins = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in wins] if wins else None
+        halt = mh.halt_mask(df.index, date=date, windows=wins) if len(df) else np.zeros(0, bool)
     except Exception:                                    # never let the QC fail on the halt table
         halt = np.zeros(len(df), bool)
     rep["halt_snapshots"] = int(halt.sum())
@@ -994,6 +1003,23 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                          futures_scale=cfg["futures_scale"], start_time=cfg["start_time"],
                          end_time=cfg["end_time"], data_source=cfg["data_source"])
     df.attrs["es_contract"] = contract
+    # The halt window comes from the TAPE (mt_product_status.haltreason), not from a table of four
+    # dates I typed in. A halted market has no valid midpoint and its book is legitimately crossed,
+    # so every consumer needs the boundary -- and needs it right. One tiny query per session.
+    try:
+        st = _fetch_messages(ymd, "SPY", "direct", "mt_product_status", cfg["data_source"],
+                             tz=cfg["tz"], clock=cfg["clock"])
+        import market_halts as _mh
+        hres = _mh.windows_from_status(st, tz=cfg["tz"])
+        if hres["windows"]:
+            df.attrs["halt_windows"] = [(a.isoformat(), b.isoformat()) for a, b in hres["windows"]]
+            df.attrs["halt_reasons"] = sorted(hres["reasons"])
+            log.info("%s: %d halt window(s) from the tape: %s (%s)", label, len(hres["windows"]),
+                     ", ".join("%s-%s" % (a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S"))
+                               for a, b in hres["windows"]), ", ".join(sorted(hres["reasons"])))
+    except Exception as exc:                      # never fail a session over the status stream
+        log.warning("%s: could not read mt_product_status (%s); halt windows fall back to the "
+                    "built-in table", label, str(exc).splitlines()[0][:160])
     qc = session_qc(df, crossed_tol=float(cfg.get("crossed_tol", 0.005)))
     df.attrs["qc"] = qc
     med_spy = qc["SPY"]["median_bid"]

@@ -48,6 +48,66 @@ MWCB_HALTS = {
 }
 
 
+# ── deriving the halt from the tape, which is where it actually lives ────────────────────────────
+# mt_product_status carries `haltreason` per venue. On 2020-03-09 the five xdp_* feeds all publish
+# MarketWideCircuitBreakerLevel1 at 09:34:13.0787 ET and clear it at 09:49:13.0787 -- 900.0 s to the
+# tenth of a millisecond, matching the table below exactly. So the table is a FALLBACK, not the
+# source of truth: reading the tape covers every date rather than four, is per venue, and cannot be
+# wrong the way a hand-entered time can.
+_HALT_NULL = ("", "nan", "<NA>", "None", "NaN", "null", "NULL", "\\N")
+
+
+def windows_from_status(df, tz: str = TZ, min_seconds: float = 30.0) -> dict:
+    """Derive halt windows per feed from an ``mt_product_status`` frame (no I/O -- pass the frame).
+
+    A halt OPENS on the first row for a feed whose ``haltreason`` is populated and CLOSES on that
+    feed's next row where it is not. Anything shorter than ``min_seconds`` is dropped: single-symbol
+    LULD pauses and status churn are not market-wide events and should not blank a session.
+
+    -> {'windows': [(start, end)] consolidated, 'by_feed': {feed: [(start, end)]}, 'reasons': set}"""
+    out = {"windows": [], "by_feed": {}, "reasons": set()}
+    if df is None or len(df) == 0 or "haltreason" not in df.columns:
+        return out
+    idx = df.index
+    if getattr(idx, "tz", None) is None:
+        idx = pd.DatetimeIndex(idx).tz_localize(tz)
+    else:
+        idx = idx.tz_convert(tz)
+    reason = df["haltreason"].astype(str).str.strip()
+    halted = ~reason.str.lower().isin([t.lower() for t in _HALT_NULL])
+    feeds = df["f"].astype(str) if "f" in df.columns else pd.Series("?", index=df.index)
+
+    for feed in sorted(set(feeds)):
+        m = (feeds == feed).to_numpy()
+        t, h, r = idx[m], halted.to_numpy()[m], reason.to_numpy()[m]
+        order = np.argsort(t.values, kind="stable")
+        t, h, r = t[order], h[order], r[order]
+        spans, start, why = [], None, ""
+        for k in range(len(t)):
+            if h[k] and start is None:
+                start, why = t[k], r[k]
+            elif (not h[k]) and start is not None:
+                if (t[k] - start).total_seconds() >= min_seconds:
+                    spans.append((start, t[k]))
+                    out["reasons"].add(why)
+                start = None
+        if start is not None:                       # halted with no resume row in the fetch
+            spans.append((start, t[-1]))
+            out["reasons"].add(why)
+        if spans:
+            out["by_feed"][feed] = spans
+
+    # Consolidate: a market-wide halt stops every venue, so the union across feeds is the window the
+    # book is unmatched over. Overlapping per-feed spans (they differ by microseconds) merge into one.
+    flat = sorted((a, b) for v in out["by_feed"].values() for a, b in v)
+    for a, b in flat:
+        if out["windows"] and a <= out["windows"][-1][1]:
+            out["windows"][-1] = (out["windows"][-1][0], max(out["windows"][-1][1], b))
+        else:
+            out["windows"].append((a, b))
+    return out
+
+
 def halt_windows(date, tz: str = TZ) -> list:
     """-> [(start, end)] tz-aware Timestamps for that date, or [] if the date had no MWCB halt."""
     key = str(date)[:10].replace("/", "-")
@@ -59,11 +119,12 @@ def halt_windows(date, tz: str = TZ) -> list:
     return out
 
 
-def halt_mask(index: pd.DatetimeIndex, date=None, tz: str = TZ) -> np.ndarray:
+def halt_mask(index: pd.DatetimeIndex, date=None, tz: str = TZ, windows=None) -> np.ndarray:
     """Boolean mask, True where the timestamp falls inside a halt on that date.
 
     ``date`` defaults to the index's own first date, so a session frame needs no extra argument.
-    Returns all-False for a date with no recorded halt, which is every date but four."""
+    ``windows`` overrides the built-in table -- pass what ``windows_from_status`` derived from the
+    tape, which is authoritative and covers every date rather than the four recorded here."""
     if index is None or len(index) == 0:
         return np.zeros(0, bool)
     if not isinstance(index, pd.DatetimeIndex):
@@ -71,7 +132,7 @@ def halt_mask(index: pd.DatetimeIndex, date=None, tz: str = TZ) -> np.ndarray:
     if date is None:
         d0 = index[0]
         date = (d0.tz_convert(tz) if getattr(index, "tz", None) is not None else d0).strftime("%Y-%m-%d")
-    wins = halt_windows(date, tz=tz)
+    wins = list(windows) if windows else halt_windows(date, tz=tz)
     m = np.zeros(len(index), bool)
     if not wins:
         return m

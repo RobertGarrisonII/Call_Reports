@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.9.30 -- the halt is in the tape, so stop hardcoding it
+
+`mt_product_status` carries `haltreason` per venue, and on 2020-03-09 SPY it says exactly this:
+
+    09:34:13.0787  xdp_arca / xdp_nyse / xdp_national / xdp_chicago / xdp_american
+                   haltreason = MarketWideCircuitBreakerLevel1   (iex_deep: ReasonNotAvailable)
+    09:49:13.0787  haltreason clears, marketsession = CoreSession
+                   -> 900.0 s, to the tenth of a millisecond
+
+That is the same window `market_halts.py` has been asserting from a table I typed in by hand --
+confirmed to under a tenth of a second, which is the good news. The better news is that it makes
+the table unnecessary: `windows_from_status()` derives halt windows from the status stream, per
+venue, for **any** date rather than the four recorded.
+
+* Extraction fetches `mt_product_status` per session (one tiny query) and records the derived
+  windows on the frame as `df.attrs["halt_windows"]`. `session_qc` prefers those over the table,
+  so a halt on a date nobody anticipated is handled correctly and a hand-entered time can no longer
+  be wrong.
+* `feed_health.py` reports the halt boundary next to the gap counts, and its clean verdict now says
+  *"this date HALTED, so the book is legitimately crossed for 900 s of it -- judge the replay on the
+  rate OUTSIDE the halt"* rather than the flat "any crossing is the replay's fault", which was
+  misleading on exactly the four sessions that matter most.
+* A status blip shorter than 30 s is not treated as a halt: a single-symbol LULD pause is not a
+  market-wide event and must not blank a session.
+
+Two incidental confirmations from the same pull. The `SymbolClear` trading events at 00:18:12.6816
+and 00:24:21.6455 carry the **same nanosecond timestamps** as that date's `mt_clear_orders` rows, so
+those resets are session-init symbol clears rather than error recoveries -- consistent with them
+landing on an empty book. And `marketsession` gives authoritative session boundaries
+(PreOpen / EarlySession / CoreSession / LateSession / Closed; CoreSession opens 09:30:00.6 on ARCA,
+Closed at 16:00:00.01 on NYSE), which is a better source than a hardcoded 09:30-16:00 grid if the
+paper ever needs the exact boundary.
+
+Also available in that stream and not yet used: `luldlowerlimit` / `luldupperlimit` /
+`limituplimitdownindicator` (the LULD bands) and `shortsaleindicator` (Rule 201 state, reported as
+ShortSaleRestrictionNotInEffect throughout 2020-03-09). Both are natural controls for a
+volatility-day study.
+
 ## v0.9.29 -- STAGE 6 had never run, and a dry run could not have told you
 
 A clean v0.9.28 demo: STAGE 0 through STAGE 5 pass, all eleven gate tests pass, Tables 5/7/9 are

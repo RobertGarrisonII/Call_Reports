@@ -165,10 +165,83 @@ def check_opens_into_a_halt():
     return ok
 
 
+def check_halt_derived_from_tape():
+    """The halt window is READ from mt_product_status, not taken from a table of four dates.
+
+    Verbatim rows from the 2020-03-09 SPY status stream. Five xdp_* feeds publish
+    MarketWideCircuitBreakerLevel1 at 09:34:13.0787 ET and clear it 900.0 s later; iex_deep reports
+    the same halt as ReasonNotAvailable. The derived window matches the hardcoded table to under a
+    tenth of a second -- which is the point: the table is a fallback that the tape confirms, and
+    reading the tape covers every date rather than the four somebody typed in."""
+    rows = [
+        (1583760600608442768, "xdp_arca_integrated", ""),                 # CoreSession, running
+        (1583760853078735515, "xdp_arca_integrated", "MarketWideCircuitBreakerLevel1"),
+        (1583760853078911818, "xdp_nyse_integrated", "MarketWideCircuitBreakerLevel1"),
+        (1583760853078973092, "xdp_national_integrated", "MarketWideCircuitBreakerLevel1"),
+        (1583760853087636820, "xdp_chicago_integrated", "MarketWideCircuitBreakerLevel1"),
+        (1583760853088702470, "xdp_american_integrated", "MarketWideCircuitBreakerLevel1"),
+        (1583760853107316315, "iex_deep", "ReasonNotAvailable"),
+        (1583761753078737758, "xdp_arca_integrated", ""),
+        (1583761753102421030, "xdp_nyse_integrated", ""),
+        (1583761753103017657, "iex_deep", ""),
+        (1583784000013713665, "xdp_nyse_integrated", ""),                 # Closed
+    ]
+    df = pd.DataFrame({"f": [r[1] for r in rows], "haltreason": [r[2] for r in rows]},
+                      index=pd.to_datetime([r[0] for r in rows], utc=True).tz_convert(TZ))
+    res = mh.windows_from_status(df)
+    one = len(res["windows"]) == 1
+    a, b = res["windows"][0] if one else (None, None)
+    dur = (b - a).total_seconds() if one else -1
+    tbl = mh.halt_windows("2020-03-09")[0]
+    agrees = one and abs((a - tbl[0]).total_seconds()) < 1 and abs((b - tbl[1]).total_seconds()) < 1
+    venues = len(res["by_feed"]) == 6
+    reasons = "MarketWideCircuitBreakerLevel1" in res["reasons"]
+
+    # a short status blip is NOT a market-wide halt and must not blank a session
+    blip = pd.DataFrame({"f": ["v", "v"], "haltreason": ["LULD", ""]},
+                        index=pd.to_datetime([1583760853078735515,
+                                              1583760853078735515 + 5_000_000_000],
+                                             utc=True).tz_convert(TZ))
+    ignored = not mh.windows_from_status(blip)["windows"]
+
+    ok = one and abs(dur - 900.0) < 0.5 and agrees and venues and reasons and ignored
+    print("(7) the halt derived FROM THE TAPE: %s -> %s (%.1f s across %d venues)"
+          % (a.strftime("%H:%M:%S.%f")[:-3] if one else "?",
+             b.strftime("%H:%M:%S.%f")[:-3] if one else "?", dur, len(res["by_feed"])))
+    print("    matches the hardcoded table to <1s=%s; 900.0s=%s; reason captured=%s" %
+          (agrees, abs(dur - 900.0) < 0.5, reasons))
+    print("    a 5-second status blip is NOT treated as a halt=%s : %s" % (ignored, ok))
+    return ok
+
+
+def check_frame_attrs_override_the_table():
+    """A frame carrying tape-derived windows must be judged on those, not on the built-in table."""
+    day = "2024-12-18"                                    # NOT in the table -- no halt on record
+    idx = pd.date_range(f"{day} 09:30:00", f"{day} 16:00:00", freq="s", tz=TZ)
+    n = len(idx)
+    mid = 280 + np.zeros(n)
+    df = pd.DataFrame({"SPY_bidprice_1": mid - 0.005, "SPY_askprice_1": mid + 0.005,
+                       "ES_bidprice_1": mid * 10 - 0.25, "ES_askprice_1": mid * 10 + 0.25}, index=idx)
+    a = pd.Timestamp(f"{day} 10:00:00", tz=TZ); b = pd.Timestamp(f"{day} 10:15:00", tz=TZ)
+    win = (idx >= a) & (idx <= b)
+    df.loc[win, "SPY_askprice_1"] = df.loc[win, "SPY_bidprice_1"] - 0.02
+
+    without = ml.session_qc(df)                           # table knows no halt here -> a fault
+    df.attrs["halt_windows"] = [(a.isoformat(), b.isoformat())]
+    with_ = ml.session_qc(df)                             # tape says halted -> correct
+
+    ok = (not without["ok"]) and with_["ok"] and with_["halt_snapshots"] == int(win.sum())
+    print("(8) a halt the built-in table does not know: without tape windows the session FAILS=%s, "
+          "with them it PASSES=%s (%d halt snapshots) : %s"
+          % (not without["ok"], with_["ok"], with_["halt_snapshots"], ok))
+    return ok
+
+
 def main():
     checks = [check_halt_table, check_qc_passes_a_halt, check_qc_still_catches_a_fault,
               check_non_halt_date_unaffected, check_missing_leg_still_fatal,
-              check_opens_into_a_halt]
+              check_opens_into_a_halt, check_halt_derived_from_tape,
+              check_frame_attrs_override_the_table]
     res = []
     for fn in checks:
         try:

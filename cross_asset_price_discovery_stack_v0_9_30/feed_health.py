@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 
 _TYPES = ("mt_missing_product_messages", "mt_error", "mt_clear_orders", "mt_clear_price_levels")
+_STATUS = "mt_product_status"
 
 
 def _fetch(date_str, product, ptype, mtype, data_source, tz, clock):
@@ -62,6 +63,7 @@ def report(date_str, product, ptype="direct", data_source="apu", tz="America/New
     fault (the question is whether the replay applies them, which it does from v0.9.23)."""
     lines = [f"feed health: {product} ({ptype}) on {date_str}   session={session}   clock={clock}", ""]
     n_bad = 0
+    halt_windows = []
     for mt in _TYPES:
         df, err = _fetch(date_str, product, ptype, mt, data_source, tz, clock)
         if err:
@@ -89,13 +91,51 @@ def report(date_str, product, ptype="direct", data_source="apu", tz="America/New
             for ts, row in allday.iterrows():
                 mark = "IN SESSION" if len(insess) and ts in insess.index else "outside session"
                 lines.append(f"    {ts}  {row.get('f', '?')}  [{mark}]")
+    # The venue state stream: where the circuit-breaker halt actually is. A crossed book inside one
+    # is correct, so the boundary belongs in the health report next to the gap counts.
+    try:
+        stat, serr = _fetch(date_str, product, ptype, _STATUS, data_source, tz, clock)
+        if serr:
+            lines.append(f"{_STATUS:32s} fetch failed: {serr}")
+        elif stat.empty:
+            lines.append(f"{_STATUS:32s} (none)")
+        else:
+            import market_halts as mh
+            h = mh.windows_from_status(stat, tz=tz)
+            halt_windows = h["windows"]
+            if h["windows"]:
+                lines.append(f"{_STATUS:32s} {len(stat):>8,d} row(s)   HALT on this date:")
+                for a, b in h["windows"]:
+                    lines.append("    %s -> %s  (%.0f s, %d venue(s): %s)"
+                                 % (a.strftime("%H:%M:%S"), b.strftime("%H:%M:%S"),
+                                    (b - a).total_seconds(), len(h["by_feed"]),
+                                    ", ".join(sorted(h["reasons"]))))
+                lines.append("    A halted market does not match, so a crossed book HERE is correct.")
+                lines.append("    Exclude these snapshots from every estimate: no valid midpoint.")
+            else:
+                lines.append(f"{_STATUS:32s} {len(stat):>8,d} row(s)   no halt")
+            if "marketsession" in stat.columns:
+                ses = sorted(set(stat["marketsession"].astype(str).str.strip()) - {"", "\\N", "nan"})
+                if ses:
+                    lines.append("    market sessions seen: %s" % ", ".join(ses))
+    except Exception as exc:
+        lines.append(f"{_STATUS:32s} could not read: {type(exc).__name__}: {exc}")
+
     lines.append("")
+    if n_bad:
+        pass
     if n_bad:
         lines += [f"VERDICT: the capture is INCOMPLETE ({n_bad:,d} gap/error record(s)).",
                   "Missing packets mean missing adds, so the removals that reference them are orphans",
                   "and the levels they should have taken out rest for the remainder of the session.",
                   "A crossed book on this date is DATA loss, not a replay fault -- re-request the day",
                   "from the vendor or drop it; do not tune the reconstruction against it."]
+    elif halt_windows:
+        lines += ["VERDICT: the capture is COMPLETE -- no gaps, no decoder errors.",
+                  "This date HALTED, so the book is legitimately crossed for %d s of it. Judge the"
+                  % int(sum((b - a).total_seconds() for a, b in halt_windows)),
+                  "replay on the crossed rate OUTSIDE the halt (qc_frames reports it as crossed_open);",
+                  "crossing outside it is the replay's fault and is fixable in code."]
     else:
         lines += ["VERDICT: the capture is COMPLETE -- no gaps, no decoder errors.",
                   "A crossed book on this date is therefore the REPLAY's fault and is fixable in code."]
