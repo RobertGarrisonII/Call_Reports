@@ -50,8 +50,11 @@ _NULL = ("", "nan", "<NA>", "None", "NaN", "null", "NULL", "\\N")
 
 # shortsaleindicator vocabulary. The feeds spell the restriction several ways; anything that says
 # "InEffect" without "Not" is the restriction being ON.
-_SSR_ON = ("shortsalerestrictionineffect", "ineffect", "true", "y", "yes", "1")
-_SSR_OFF = ("shortsalerestrictionnotineffect", "notineffect", "false", "n", "no", "0")
+# 'Activated' is IEX's spelling -- on 2020-03-16 iex_deep publishes it at 09:30:00.057 while the
+# other twelve venues say ShortSaleRestrictionInEffect within the same 1.1 seconds. Unmapped it
+# returned NaN, i.e. one venue's view of a market-wide restriction silently became "unknown".
+_SSR_ON = ("shortsalerestrictionineffect", "ineffect", "activated", "true", "y", "yes", "1")
+_SSR_OFF = ("shortsalerestrictionnotineffect", "notineffect", "deactivated", "false", "n", "no", "0")
 
 
 def _clean(s: pd.Series) -> pd.Series:
@@ -71,13 +74,21 @@ def _ssr_flag(v) -> float:
     return np.nan
 
 
-def state_series(status: pd.DataFrame, tz: str = TZ) -> pd.DataFrame:
+def state_series(status: pd.DataFrame, tz: str = TZ, latch_ssr: bool = True) -> pd.DataFrame:
     """Collapse an ``mt_product_status`` frame to ONE time series of regulatory state.
 
     The stream is per venue and every venue repeats the same security-level state, so the rows are
     sorted by time and the last value of each field wins at each instant (a step function). SSR and
     the LULD bands are security-level facts, not venue opinions -- taking a venue's view would make
     the control depend on which feed happened to publish last.
+
+    ``latch_ssr`` encodes the ACTUAL RULE. Regulation SHO Rule 201 is a day-level state: once
+    triggered it stays in effect for the remainder of that day and all of the next. It does not
+    switch off intraday. Venues therefore report it with a lag, and the raw stream churns -- on
+    2020-03-16 the restriction turns on at 09:30:00.044 and `xdp_american_integrated` still reports
+    NotInEffect at 09:30:00.050 before catching up at .069. Last-value-wins would make the session's
+    state depend on which venue happened to publish last. Latching ON per calendar day is the
+    semantics of the rule; pass False only to inspect the raw disagreement.
 
     -> DataFrame indexed by event time with columns ssr, luld_lower, luld_upper, luld_indicator."""
     cols = ["ssr", "luld_lower", "luld_upper", "luld_indicator"]
@@ -96,7 +107,20 @@ def state_series(status: pd.DataFrame, tz: str = TZ) -> pd.DataFrame:
                     if src in status.columns else np.nan)
     out["luld_indicator"] = (_clean(status["limituplimitdownindicator"]).to_numpy()
                              if "limituplimitdownindicator" in status.columns else np.nan)
-    return out.sort_index()
+    out = out.sort_index()
+    if latch_ssr and out["ssr"].notna().any():
+        v = out["ssr"].to_numpy(float)
+        idxt = out.index.tz_convert(tz) if getattr(out.index, "tz", None) else out.index
+        day = np.asarray(idxt.normalize())
+        for d in pd.unique(day):
+            m = np.asarray(day == d)
+            col = v[m].copy()
+            on = np.nan_to_num(col, nan=0.0) > 0
+            if on.any():                       # NaN before the first report; latched ON from it
+                col[int(np.argmax(on)):] = 1.0
+            v[m] = col
+        out["ssr"] = v
+    return out
 
 
 def coverage(status: pd.DataFrame) -> dict:
@@ -233,10 +257,31 @@ def _selftest() -> bool:
                            "luldlowerlimit": ["", "270.00", "265.00"],
                            "luldupperlimit": ["", "290.00", "285.00"],
                            "limituplimitdownindicator": ["", "", "LimitUp"]}, index=idx)
-    st = state_series(status)
-    a = (st["ssr"].tolist()[:2] == [0.0, 1.0]) and np.isnan(st["ssr"].iloc[2])
+    raw = state_series(status, latch_ssr=False)
+    a = (raw["ssr"].tolist()[:2] == [0.0, 1.0]) and np.isnan(raw["ssr"].iloc[2])
     print("(1) SSR vocabulary: NotInEffect->0, InEffect->1, blank->NaN (not 0) : %s" % a)
     ok.append(a)
+
+    # Rule 201 is a DAY-level state: once triggered it does not switch off intraday, so a later
+    # blank -- or a lagging venue still saying NotInEffect -- must not turn it back off.
+    st = state_series(status)
+    a2 = st["ssr"].tolist() == [0.0, 1.0, 1.0]
+    churn = pd.DataFrame({"f": ["v1", "v2", "v3", "v4"],
+                          "shortsaleindicator": ["ShortSaleRestrictionNotInEffect",
+                                                 "ShortSaleRestrictionInEffect",
+                                                 "ShortSaleRestrictionNotInEffect",  # lagging venue
+                                                 "Activated"],                       # IEX spelling
+                          "luldlowerlimit": [""] * 4, "luldupperlimit": [""] * 4,
+                          "limituplimitdownindicator": [""] * 4},
+                         index=pd.to_datetime(["2020-03-16 09:30:00.011", "2020-03-16 09:30:00.044",
+                                               "2020-03-16 09:30:00.050", "2020-03-16 09:30:00.057"]
+                                              ).tz_localize(TZ))
+    lat = state_series(churn)["ssr"].tolist()
+    a3 = lat == [0.0, 1.0, 1.0, 1.0]
+    print("    latched per day: a blank after InEffect stays ON=%s; the real 2020-03-16 open "
+          "(NotInEffect, InEffect, a lagging NotInEffect, IEX 'Activated') -> %s : %s"
+          % (a2, lat, a2 and a3))
+    ok += [a2, a3]
 
     grid = pd.date_range("2020-03-09 09:30", "2020-03-09 12:00", freq="30min", tz=TZ)
     book = pd.DataFrame({"SPY_bidprice_1": 280.0, "SPY_askprice_1": 280.10}, index=grid)

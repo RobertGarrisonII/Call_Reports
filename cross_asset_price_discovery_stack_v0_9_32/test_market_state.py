@@ -151,9 +151,50 @@ def check_no_lookahead():
     return ok
 
 
+def check_real_2020_03_16_open():
+    """The real 2020-03-16 open, verbatim: thirteen venues, three spellings, one latched state.
+
+    SSR turns on at 09:30:00.044 and every venue confirms within 1.1 s -- but not in step.
+    xdp_national/nyse/chicago still say NotInEffect at .011-.012, xdp_american says NotInEffect at
+    .050 before catching up at .069, and iex_deep spells it `Activated` at .057. Last-value-wins
+    would make the session's state depend on which venue published last; unmapped, `Activated` would
+    make IEX's view of a market-wide restriction read as unknown. Rule 201 is a DAY-level state that
+    does not switch off intraday, so it latches."""
+    rows = [("2020-03-16 09:30:00.011", "xdp_national_integrated", "ShortSaleRestrictionNotInEffect"),
+            ("2020-03-16 09:30:00.012", "xdp_nyse_integrated", "ShortSaleRestrictionNotInEffect"),
+            ("2020-03-16 09:30:00.044", "xdp_arca_integrated", "ShortSaleRestrictionInEffect"),
+            ("2020-03-16 09:30:00.050", "xdp_american_integrated", "ShortSaleRestrictionNotInEffect"),
+            ("2020-03-16 09:30:00.057", "iex_deep", "Activated"),
+            ("2020-03-16 09:30:00.069", "xdp_american_integrated", "ShortSaleRestrictionInEffect"),
+            ("2020-03-16 21:04:46.150", "xdp_american_integrated", "ShortSaleRestrictionNotInEffect")]
+    st = pd.DataFrame({"f": [r[1] for r in rows], "shortsaleindicator": [r[2] for r in rows],
+                       "luldlowerlimit": [""] * len(rows), "luldupperlimit": [""] * len(rows),
+                       "limituplimitdownindicator": [""] * len(rows)},
+                      index=pd.DatetimeIndex([r[0] for r in rows]).tz_localize(TZ))
+
+    activated = ms._ssr_flag("Activated") == 1.0
+    seq = ms.state_series(st)["ssr"].tolist()
+    latched = seq == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+    grid = pd.date_range("2020-03-16 09:30:00", "2020-03-16 16:00:00", freq="s", tz=TZ)
+    book = pd.DataFrame({"SPY_bidprice_1": 240.0, "SPY_askprice_1": 240.01}, index=grid)
+    out = ms.attach_market_state(book, st)
+    rep = ms.summarize(out)
+    # on from 09:30:00.044 -> every 1s snapshot from 09:30:01 onward, i.e. essentially all of it
+    whole = rep["ssr_any"] and rep["ssr_frac_on"] > 0.999
+    ok = activated and latched and whole
+    print("(7) the real 2020-03-16 open across 13 venues:")
+    print("    'Activated' (IEX) maps to ON=%s; the lagging NotInEffect at .050 does NOT turn it "
+          "back off=%s" % (activated, latched))
+    print("    the session reads SSR-restricted for %.1f%% of its snapshots=%s : %s"
+          % (100 * rep["ssr_frac_on"], whole, ok))
+    return ok
+
+
 def main():
     checks = [check_selftest, check_real_2020_03_09_shape, check_ssr_on_is_flagged_everywhere,
-              check_unknown_is_not_zero, check_band_geometry, check_no_lookahead]
+              check_unknown_is_not_zero, check_band_geometry, check_no_lookahead,
+              check_real_2020_03_16_open]
     res = []
     for fn in checks:
         try:

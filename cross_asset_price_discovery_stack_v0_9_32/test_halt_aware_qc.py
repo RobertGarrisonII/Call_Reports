@@ -67,7 +67,7 @@ def check_halt_table():
     ok += [b, c]
     # 2020-03-16 halted AT the open; 2020-03-18 in the afternoon. A fixed "skip the first N minutes"
     # rule would have handled one and not the other -- which is why this is a table, not a heuristic.
-    d = (mh.halt_windows("2020-03-16")[0][0].strftime("%H:%M:%S") == "09:30:00"
+    d = (mh.halt_windows("2020-03-16")[0][0].strftime("%H:%M:%S") == "09:30:01"
          and mh.halt_windows("2020-03-18")[0][0].strftime("%H:%M:%S") == "12:56:11")
     print("    2020-03-16 halts at the OPEN and 2020-03-18 in the AFTERNOON, so no "
           "skip-the-first-N-minutes rule covers both : %s" % d)
@@ -135,7 +135,9 @@ def check_opens_into_a_halt():
     idx = pd.date_range(f"{day} 09:30:00", f"{day} 16:00:00", freq="s", tz=TZ)
     hm = mh.halt_mask(idx)
     head = max(60, n // 100)
-    all_halt = bool(hm[:head].all())
+    # 09:30:01 per the tape, so the 09:30:00 snapshot is genuinely OPEN -- the market traded for one
+    # second before the breaker fired. Effectively all of the head window is halt, not literally all.
+    all_halt = float(hm[:head].mean()) > 0.99
 
     # crossed ONLY during the halt -- a correct book on a day that opens into one
     crossed = hm.astype(float)
@@ -157,7 +159,8 @@ def check_opens_into_a_halt():
     skipped = "OPEN snapshots" in txt
     ok = all_halt and not structural and not single_venue and skipped
     print("(6) a session that opens into its halt (2020-03-16):")
-    print("    its first %d snapshots are 100%% halt=%s" % (head, all_halt))
+    print("    its first %d snapshots are %.1f%% halt=%s"
+          % (head, 100 * float(hm[:head].mean()), all_halt))
     print("    the structural 'wrong from the start' finding does NOT fire=%s" % (not structural))
     print("    the single-venue-crossed finding does NOT fire=%s" % (not single_venue))
     print("    the report says halt snapshots were skipped=%s" % skipped)

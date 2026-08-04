@@ -40,11 +40,15 @@ TZ = "America/New_York"
 
 # date -> [(halt_start, halt_end)] in ET. Level 1 (7% S&P 500 decline) halts are 15 minutes.
 # 2020-03-16 triggered at the opening bell, so its halt starts at 09:30:00 exactly.
+# Three of the four are now VERIFIED against mt_product_status.haltreason and corrected to it:
+# 2020-03-12 was 7 s later than the published notice time and 2020-03-16 1 s later. 2020-03-18 has
+# not been checked against the tape yet and is still the notice time -- the derived window wins
+# wherever the status stream is available, so this only matters as an offline fallback.
 MWCB_HALTS = {
-    "2020-03-09": [("09:34:13", "09:49:13")],
-    "2020-03-12": [("09:35:37", "09:50:37")],
-    "2020-03-16": [("09:30:00", "09:45:00")],
-    "2020-03-18": [("12:56:11", "13:11:11")],
+    "2020-03-09": [("09:34:13", "09:49:13")],     # tape: 09:34:13.078 -> 09:49:13.103
+    "2020-03-12": [("09:35:44", "09:50:44")],     # tape: 09:35:44     -> 09:50:44  (was 09:35:37)
+    "2020-03-16": [("09:30:01", "09:45:01")],     # tape: 09:30:01     -> 09:45:01  (was 09:30:00)
+    "2020-03-18": [("12:56:11", "13:11:11")],     # NOT yet verified against the tape
 }
 
 

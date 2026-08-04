@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.9.32 -- 2020-03-16 was short-sale restricted for the whole session
+
+The 2020-03-12 and 2020-03-16 status streams answer the question v0.9.31 raised, and they answer it
+unevenly:
+
+| date | halt (from the tape) | Rule 201 SSR | LULD |
+|---|---|---|---|
+| 2020-03-09 | 09:34:13 - 09:49:13 | not restricted | 0% coverage |
+| 2020-03-12 | 09:35:44 - 09:50:44 | **not restricted** | 0% coverage |
+| 2020-03-16 | 09:30:01 - 09:45:01 | **IN EFFECT, 100% of the session** | 0% coverage |
+
+**2020-03-16 is a short-sale-restricted session.** SSR turns on at 09:30:00.044 -- at the opening
+bell, on a limit-down gap -- and all thirteen venues confirm within 1.1 seconds. So one of the four
+MWCB days carries a one-sided constraint on sell-side flow for its entire length, and that day is in
+the volatile panel. Tables 5 and 7 count signed order flow. This has to be in the sample appendix
+and, ideally, in the specification.
+
+Reading it correctly needed two fixes, both from the real rows:
+
+* **`Activated`.** IEX spells the restriction that way (`iex_deep` at 09:30:00.057) while the other
+  twelve say `ShortSaleRestrictionInEffect`. Unmapped it returned NaN -- one venue's view of a
+  market-wide restriction silently became "unknown". Now mapped, with `Deactivated` as its pair.
+* **Latching.** Rule 201 is a DAY-level state: once triggered it holds for the remainder of that day
+  and all of the next, and does not switch off intraday. Venues report it with a lag, so the raw
+  stream churns -- `xdp_national`/`nyse`/`chicago` still say NotInEffect at 09:30:00.011-.012, and
+  `xdp_american` says NotInEffect at .050 before catching up at .069. Last-value-wins would have made
+  the session's state depend on which venue published last. `state_series` now latches ON per
+  calendar day; `latch_ssr=False` inspects the raw disagreement.
+
+**The hardcoded halt table was wrong by 7 seconds on 2020-03-12** (09:35:44 actual vs 09:35:37 from
+the published notice) and by 1 second on 2020-03-16. Both corrected, and the entries now carry the
+tape times they were verified against. 2020-03-18 is still the notice time and is marked as not yet
+verified. This only matters as an offline fallback -- the derived window wins wherever the status
+stream is available -- but it is exactly the class of error that reading the data removes.
+
+The 09:30:01 start on 2020-03-16 also means the market traded for one second before the breaker
+fired, so that session's first snapshot is genuinely open: its head window is 99.6% halt, not 100%.
+
+**LULD remains 0% covered on all three dates.** The direct venue feeds do not carry the bands on any
+of them, which now looks like a property of the source rather than of the date.
+
 ## v0.9.31 -- LULD bands and Rule 201 as session columns, with coverage measured not assumed
 
 Both fields live in `mt_product_status`, next to the halt. Neither is a result; both are mechanical
