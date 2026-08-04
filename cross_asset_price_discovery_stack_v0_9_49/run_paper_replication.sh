@@ -304,6 +304,7 @@ if have_stage 1; then
            test_driver_flags.py \
            test_svar_lag_artifact.py \
            test_run_corrections.py \
+           test_stack_audit.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -511,7 +512,7 @@ def _load(gl):
             raw.extend(pickle.load(fh))
     return [r if len(r) == 3 else (r[0], "benchmark", r[1]) for r in raw]
 
-panels, source = {}, "PUBLISHED (paper's Table 5.II literals; no frames found)"
+panels, by, source = {}, {}, "PUBLISHED (paper's Table 5.II literals; no frames found)"
 try:
     import mstbook_loader as ml
     sess = _load(frames_glob)
@@ -521,9 +522,13 @@ try:
         tagged = [(d, ("C MWCB" if d in mw else ("B volatile" if r == "volatile" else "A baseline")), f)
                   for d, r, f in sess]
         by = tof.table5_from_sessions(tagged, ml.counts_from_frame)
+        _skipped = by.pop("_skipped", [])
         panels = {k: (v["frequency"] if isinstance(v, dict) and "frequency" in v else v)
                   for k, v in by.items()}
-        source = "DATA(trades): %d extracted session(s), signed trade tape" % len(sess)
+        source = ("DATA(trades): %d of %d extracted session(s), signed trade tape"
+                  % (len(sess) - len(_skipped), len(sess)))
+        if _skipped:
+            source += " -- skipped (no trade columns): %s" % ", ".join(_skipped)
 except Exception as exc:
     print("  (real-data Table 5 unavailable: %s -- falling back to the published matrices)" % exc)
 if not panels:
@@ -532,7 +537,11 @@ rows = []
 for k in sorted(panels):
     M = panels[k]
     f = M if isinstance(M, pd.DataFrame) else pd.DataFrame(np.array(M, float), index=tof.DIR3, columns=tof.DIR3)
-    d = tof.dependence_summary(f, n_bars=23400)
+    # n_bars scales the log-OR standard error. The published matrices are single-session scale
+    # (23,400 one-second bars); a DATA panel pools its sessions, and scoring it at single-session
+    # n_bars understates the z by sqrt(n_sessions) -- ~3.2x on a ten-session panel.
+    nb = 23400 * int(by[k].get("n_sessions", 1)) if (panels is not PUBLISHED and k in by) else 23400
+    d = tof.dependence_summary(f, n_bars=nb)
     rows.append({"panel": k, "PCMOF": d["PCMOF"], "PCMOF_indep": d["PCMOF_indep"],
                  "PCMOF_ratio": d["PCMOF_ratio"], "NCMOF": d["NCMOF"],
                  "NCMOF_indep": d["NCMOF_indep"], "NCMOF_ratio": d["NCMOF_ratio"],

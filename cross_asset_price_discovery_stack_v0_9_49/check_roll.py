@@ -72,10 +72,18 @@ def _fetch_head(date_ymd: str, product: str, limit: int = 40, timeout: int = 180
 
 
 def _num(df, col):
+    """MAX of the column over the fetched rows, not the last value.
+
+    The cumulative `volume` counter RESETS at the 18:00 ET session open, and the reset can fall
+    inside the first rows on a thin pre-open. Taking the last value then compares one contract's
+    fresh post-reset counter (a few hundred lots) against the other's day-old total -- a wrong
+    ranking produced by row alignment, not by the market. The maximum is the previous session's
+    closing total on either side of the reset, so it is reset-proof; `openinterest` is a level, for
+    which the max over a few pre-open rows is equally safe."""
     if df is None or col not in df.columns:
         return np.nan
     v = pd.to_numeric(df[col].replace("\\N", np.nan), errors="coerce").dropna()
-    return float(v.iloc[-1]) if len(v) else np.nan
+    return float(v.max()) if len(v) else np.nan
 
 
 def measure(date_str: str, symbol: str = "ES", rollover_days: int = 8, full: bool = False) -> dict:
@@ -131,7 +139,7 @@ def describe(reps) -> str:
                  % ("date", "front", "rival", "offset", "front vol", "rival vol", "vol%", "OI%",
                     "rule ok"))
     for r in reps:
-        v, o = r.get("volume", {}), r.get("open_interest", {})
+        v = r.get("volume", {})
         fv, rv = v.get(r["front"], np.nan), v.get(r["rival"], np.nan)
         lines.append("%-12s %-7s %-7s %+6d %13s %13s %7s %7s %s"
                      % (r["date"], r["front"], r["rival"], r["roll_offset_days"],

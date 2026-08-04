@@ -1014,8 +1014,9 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
                                   f"replay is dropping removals or inventing levels")
         # A leg taken from the venue ladder cannot cross, so the invariant above is vacuous for it.
         # Check the properties a ladder must have instead (monotone depth, coverage, staleness).
-        if (df.attrs.get("book_source") == "aggregated" if hasattr(df, "attrs") else False) \
-                or df.attrs.get(f"book_source_{a}") == "aggregated":
+        _src_a = attrs.get(f"book_source_{a}") or (attrs.get("book_source")
+                                                   if f"{a}_bidprice_2" in df.columns else None)
+        if _src_a == "aggregated":
             try:
                 import aggregated_book as _ab
                 li = _ab.ladder_integrity(df, asset=a)
@@ -1041,12 +1042,16 @@ def _spec_parts(spec) -> tuple:
     return spec, "auto"
 
 
-def _cache_path(cache_dir: str, label: str, interval: str, levels: int, clock: str) -> str:
+def _cache_path(cache_dir: str, label: str, interval: str, levels: int, clock: str,
+                es_book_source: str = "aggregated") -> str:
     """Cache filename for one extracted session. The interval / level count / clock are part of the
     name because they change the frame: a cache hit must not silently hand back a 1s book to a run
-    that asked for 10ms."""
+    that asked for 10ms. The ES book source is part of it for the same reason -- a ladder frame and
+    a replay frame carry the same columns and pass the same shape checks, so nothing downstream
+    would notice a run with --es-book-source replay silently resuming from aggregated frames."""
     ymd = str(label).replace("-", "")
-    return os.path.join(cache_dir, f"session_{ymd}_{interval}_L{int(levels)}_{clock}.pkl")
+    tag = "" if es_book_source in ("", None) else f"_{es_book_source}"
+    return os.path.join(cache_dir, f"session_{ymd}_{interval}_L{int(levels)}_{clock}{tag}.pkl")
 
 
 def _extract_one_session(spec, cfg: dict, progress_cb=None):
@@ -1064,13 +1069,41 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
     label, regime = _spec_parts(spec)
     ymd = label.replace("-", "")
     cache_dir = cfg.get("cache_dir") or ""
-    cpath = (_cache_path(cache_dir, label, cfg["interval"], cfg["levels"], cfg["clock"])
+    cpath = (_cache_path(cache_dir, label, cfg["interval"], cfg["levels"], cfg["clock"],
+                         cfg.get("es_book_source", "aggregated"))
              if cache_dir else "")
-    if cpath and cfg.get("resume") and os.path.exists(cpath):
+    # A cache file written before the source tag existed has the legacy name. Rather than force a
+    # re-extraction of every session (hours of vendor I/O) over a rename, a legacy file is accepted
+    # IF the frame's own recorded source matches the requested one -- the frame knows what built it
+    # (attrs["book_source_ES"]; absent means the pre-v0.9.42 replay). A mismatch re-extracts: a
+    # ladder frame and a replay frame carry identical columns, so nothing downstream would notice.
+    _want_src = cfg.get("es_book_source", "aggregated")
+    _legacy = (_cache_path(cache_dir, label, cfg["interval"], cfg["levels"], cfg["clock"], "")
+               if cache_dir else "")
+    for _cp in ([cpath, _legacy] if cpath else []):
+        if not (_cp and cfg.get("resume") and os.path.exists(_cp)):
+            continue
         try:
-            df = pd.read_pickle(cpath)
+            df = pd.read_pickle(_cp)
+            _got_src = df.attrs.get("book_source_ES") if hasattr(df, "attrs") else None
+            if _got_src != _want_src:
+                if _got_src is None:
+                    # v0.9.42-45 frames: the join dropped the ES frame's attrs, so a frame from that
+                    # window cannot PROVE which source built it -- and a pre-v0.9.42 replay frame
+                    # looks exactly the same. Mixed sources in one dataset is the inconsistency the
+                    # aggregated default exists to prevent, so unknown re-extracts. One-time cost:
+                    # frames written from v0.9.46 on always carry the tag.
+                    log.warning("%s: cached frame at %s predates ES book-source tagging and cannot "
+                                "prove which source built it -- re-extracting once; the fresh frame "
+                                "is tagged and future resumes will hit", label, _cp)
+                else:
+                    log.warning("%s: cached frame at %s was built with es_book_source=%s but this "
+                                "run asked for %s -- re-extracting rather than silently reusing it "
+                                "(the two carry identical columns, so nothing downstream would "
+                                "notice)", label, _cp, _got_src, _want_src)
+                continue
             qc = session_qc(df)
-            return (label, regime, df, "reused cached %s: %d rows (%s)" % (label, len(df), cpath), None, qc)
+            return (label, regime, df, "reused cached %s: %d rows (%s)" % (label, len(df), _cp), None, qc)
         except Exception as exc:                           # a corrupt/partial cache must never win
             log.warning("%s: cache read failed (%s); re-extracting", label, exc)
     contract = get_front_month_contract(cfg["es_symbol"], as_of_date=_parse_yyyymmdd(ymd),
@@ -1232,8 +1265,12 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
     med_spy = qc["SPY"]["median_bid"]
     med_es = qc["ES"]["median_bid"]
     ratio = med_es / med_spy if np.isfinite(med_spy) and med_spy else float("nan")
-    diag = ("extracted %s (ES=%s, book=reconstruct): %d rows, flow=%s | median SPY=%.2f ES=%.2f "
-            "(ES/SPY=%.1f)" % (label, contract, len(df), cfg["with_flow"], med_spy, med_es, ratio))
+    # The ES book source goes in the completion line because the log is where a reader learns it.
+    # The 2026-08-04 run printed "book=reconstruct" on all 24 sessions while every ES leg came from
+    # the ladder -- the string was hardcoded from the pre-v0.9.42 path.
+    _src = df.attrs.get("book_source_ES", "replay")
+    diag = ("extracted %s (ES=%s, ES book=%s): %d rows, flow=%s | median SPY=%.2f ES=%.2f "
+            "(ES/SPY=%.1f)" % (label, contract, _src, len(df), cfg["with_flow"], med_spy, med_es, ratio))
     warns = []
     if np.isfinite(ratio) and ratio > 100:
         warns.append("ES/SPY median ratio %.0f looks scaled (CME raw integers); pass "

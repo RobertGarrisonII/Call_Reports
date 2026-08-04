@@ -147,10 +147,14 @@ def main(argv=None) -> int:
                  "  them before reading Tables 5 and 7 as evidence of directional tandem trading."]
     _es_luld = [c for c in tbl.columns if c.endswith("_luld_known")]
     if _es_luld and float(tbl[_es_luld].fillna(0).to_numpy(float).max()) > 0:
-        lines += ["", "Price limits ARE reported on the futures leg (%s). Those are usable as a"
-                      % ", ".join(_es_luld),
-                  "band control on ES even though the equity LULD columns are empty -- the two are",
-                  "different disseminations, not one missing field."]
+        # NOTE this block first shipped appending to `lines`, a name that does not exist in this
+        # function (it accumulates into `body`). The bug could only fire on the first run where the
+        # futures price limits actually appear -- i.e. the crash was reserved for exactly the moment
+        # the feature started working, inside the STAGE 3 gate. pyflakes found it; a test now pins it.
+        body += ["", "Price limits ARE reported on the futures leg (%s). Those are usable as a"
+                     % ", ".join(_es_luld),
+                 "band control on ES even though the equity LULD columns are empty -- the two are",
+                 "different disseminations, not one missing field."]
     if "luld_known" in tbl.columns and float(tbl["luld_known"].fillna(0).max()) == 0.0:
         body += ["",
                  "LULD bands: not reported by this source on any session. The columns exist and are",

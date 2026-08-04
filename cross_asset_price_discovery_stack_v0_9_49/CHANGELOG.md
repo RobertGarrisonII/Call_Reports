@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.9.49 -- audit: five defects, four of them recent, one a landmine in the QC gate
+
+A code audit (pyflakes sweep + a semantic pass over everything that changed since v0.9.42), with
+each finding pinned in new `test_stack_audit.py`.
+
+**(1) `qc_frames` crashed on the first run where ES price limits appear.** The futures-band notice
+added in v0.9.46 appended to `lines`, a name that does not exist in that function -- it accumulates
+into `body`. The branch only executes when `{A}_luld_known > 0`, so the NameError was reserved for
+exactly the moment the feature started working, inside the STAGE 3 gate. pyflakes found it; no run
+had, because no frame has carried ES market state yet.
+
+**(2) The extraction log lied about the ES book source.** All 24 completion lines of the 2026-08-04
+run said `book=reconstruct` while every ES leg came from the ladder -- the string was hardcoded from
+the pre-v0.9.42 path. The line now reports `attrs["book_source_ES"]`.
+
+**(3) The session cache ignored the ES book source.** A frame cached under `--es-book-source replay`
+would satisfy a resume under `aggregated` and vice versa: identical columns, identical shape checks,
+nothing downstream would notice, and the dataset would silently mix the two mechanisms the
+aggregated default exists to unify. The cache filename now carries the source, the frame's own
+recorded source is verified on read, and a frame that cannot prove its source (the v0.9.42-45
+window, where the join dropped the ES attrs) is re-extracted once with a message saying why --
+fresh frames are tagged, so the cost is paid one time.
+
+**(4) One flowless session reverted Table 5 to the published matrices.** `table5_from_sessions`
+concatenated per-session arrays without handling a `counts_fn` that returns None, so a single frame
+without trade columns threw, the STAGE 4 fallback caught it, and 23 usable sessions were discarded
+over one. The session is now the unit of failure; the skipped names travel with the result and are
+printed in the source line. Each panel also reports `n_sessions`, which fixes a second bug in the
+same stage: the log-OR z-statistic was computed at single-session `n_bars` for pooled DATA panels,
+understating it by sqrt(n_sessions) -- ~3.2x on a ten-session panel.
+
+**(5) `check_roll` read the cumulative volume across the 18:00 reset.** The head-read took the LAST
+value of the fetched rows; the counter resets at the session open, and on a thin pre-open the reset
+falls inside the head -- comparing one contract's fresh counter (hundreds of lots) against the
+other's day-old total, a front-month ranking produced by row alignment rather than the market. The
+max is the previous session's total on either side of the reset, so it is reset-proof.
+
+Also: the ladder integrity checks are scoped to the leg whose book came from the ladder (they
+previously ran against SPY's absent depth columns and failed silently), and a dead ternary in
+`fevd_correlation` referencing an undefined helper is gone.
+
+48/48 test modules pass; `test_stack_audit.py` joins the STAGE 1 gate.
+
 ## v0.9.48 -- volume or open interest? Report both, and flag where they disagree
 
 Asked whether open interest would be a better front-month criterion than volume. The sample answers

@@ -683,8 +683,7 @@ def fevd_correlation(data, spec="informational", n_lags=6, horizon=20, **kw):
     for regime, frames in groups.items():
         Xs = []; names = None; corr_idx = None
         for df in frames:
-            X, nm, ci = build_svar_frame(df, spec, n_lags=n_lags if False else 0, **_fkw(kw)) \
-                if False else build_svar_frame(df, spec, **_bkw(kw))
+            X, nm, ci = build_svar_frame(df, spec, **_bkw(kw))
             if len(X) > n_lags + 5:
                 Xs.append(X); names = nm; corr_idx = ci
         if not Xs:

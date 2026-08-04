@@ -347,13 +347,22 @@ def table5_from_sessions(sessions, counts_fn, corr_window=100):
     (the depth frame alone does NOT contain new-order side counts -- see module docstring).
     Returns {regime: table5_from_series(...)}."""
     by = {}
-    bins = {}
+    bins, skipped = {}, []
     for label, regime, df in sessions:
         arrs = counts_fn(df)
+        if arrs is None:                 # a frame without the trade columns: skip it, never the batch
+            skipped.append(str(label))
+            continue
         bins.setdefault(regime, []).append(arrs)
     for regime, lst in bins.items():
         cols = [np.concatenate([np.asarray(a[k], float) for a in lst]) for k in range(6)]
         by[regime] = table5_from_series(*cols, corr_window=corr_window)
+        by[regime]["n_sessions"] = len(lst)
+    if skipped:
+        # one flowless frame used to crash the pooled concatenate, and the caller's fallback then
+        # replaced the WHOLE table with the published matrices -- 23 usable sessions discarded over
+        # one. Skipping is the correct unit of failure; the names travel with the result.
+        by["_skipped"] = skipped
     return by
 
 
