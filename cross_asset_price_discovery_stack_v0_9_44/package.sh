@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 PY="${PY:-python3}"
 
-"$PY" check_version.py || { echo "version check FAILED -- fix before packaging" >&2; exit 1; }
+"$PY" check_version.py --strict || { echo "version check FAILED -- fix before packaging" >&2; exit 1; }
 read -r VERSION PKGDIR ARCHIVE < <("$PY" check_version.py --print-names)
 
 HERE="$(basename "$PWD")"

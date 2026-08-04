@@ -59,35 +59,49 @@ def archive_name(v: str = "") -> str:
     return "cross_asset_price_discovery_stack_v%s%s%s.zip" % (a, b, c.zfill(2))
 
 
-def check() -> bool:
-    ok = []
+def check(strict_hygiene: bool = False) -> bool:
+    """-> True if the VERSION IS CONSISTENT. Housekeeping is reported but does not decide the result.
+
+    The split matters. This started as one flat list of checks and went straight into the STAGE 1
+    correctness gate, where it aborted a replication run at minute two -- because the working
+    directory had three older release archives sitting beside the package, which is what a working
+    directory looks like. Nothing about a stale zip makes a result wrong.
+
+    So: a mismatch between `__version__`, the CHANGELOG and the directory name is a REAL defect --
+    it mislabels the artifact that leaves the machine -- and fails. Old archives lying around are
+    housekeeping, and warn. Pass ``strict_hygiene`` (or --strict) to fail on those too, which is
+    what ``package.sh`` does, because at packaging time an unswept archive really can be shipped by
+    mistake."""
+    hard, warn = [], []
     v, cv = version(), changelog_version()
     a = v == cv
     print("(1) __init__.__version__ = %s ; CHANGELOG top entry = %s : %s" % (v, cv, a))
-    ok.append(a)
+    hard.append(a)
 
     here = os.path.basename(HERE)
     b = here == package_name(v)
     print("(2) package directory is %s (want %s) : %s" % (here, package_name(v), b))
-    ok.append(b)
+    hard.append(b)
 
-    # the archive is built by the packaging step, so only its NAME is checked here
+    # the archive is built by the packaging step, so only its NAME is derived here
     print("(3) derived archive name: %s" % archive_name(v))
-    ok.append(True)
 
-    # a stale archive from a previous version sitting next to the package is how the wrong file
-    # gets shipped, so say so if one is there
     parent = os.path.dirname(HERE)
     stale = sorted(f for f in os.listdir(parent)
                    if re.match(r"cross_asset_price_discovery_stack_v\d+\.zip$", f)
                    and f != archive_name(v)) if os.path.isdir(parent) else []
-    d = not stale
-    print("(4) no stale release archive beside the package : %s%s"
-          % (d, "" if d else "  <- found " + ", ".join(stale)))
-    ok.append(d)
+    print("(4) housekeeping: %s"
+          % ("no older release archive beside the package"
+             if not stale else "older archive(s) present -- %s. Harmless for a run; sweep them "
+                               "before shipping so the wrong file cannot be picked up."
+                               % ", ".join(stale)))
+    warn.append(not stale)
 
-    print("\nversion checks -> %s" % all(ok))
-    return all(ok)
+    ok = all(hard) and (all(warn) if strict_hygiene else True)
+    print("\nversion consistency -> %s%s"
+          % (all(hard), "" if all(warn) else "   (housekeeping: %d stale archive(s), advisory)"
+             % len(stale)))
+    return ok
 
 
 def main() -> int:
@@ -95,11 +109,15 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--print-names", action="store_true",
                     help="print 'VERSION PACKAGE_DIR ARCHIVE' for a packaging script to consume")
+    ap.add_argument("--strict", action="store_true",
+                    help="also fail on housekeeping (stale archives beside the package). Used by "
+                         "package.sh; NOT by the replication gate, where a leftover zip has no "
+                         "bearing on whether a result is right")
     a = ap.parse_args()
     if a.print_names:
         print("%s %s %s" % (version(), package_name(), archive_name()))
         return 0
-    return 0 if check() else 1
+    return 0 if check(strict_hygiene=a.strict) else 1
 
 
 if __name__ == "__main__":

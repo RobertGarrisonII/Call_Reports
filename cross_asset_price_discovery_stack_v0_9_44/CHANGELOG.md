@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.9.44 -- the version check does not belong in the correctness gate
+
+v0.9.43 put `check_version.py` into the STAGE 1 gate, and it aborted a replication run at minute two:
+
+    GATE FAILED: check_version.py
+    A correction is missing or has regressed. Fix before replicating.
+
+Nothing had regressed. The working directory held three older release archives beside the package
+-- which is what a working directory looks like -- and the check treated that as a failure. A
+multi-hour run stopped over housekeeping, under a banner claiming a correction was missing.
+
+Two things were wrong, and the second is the one worth remembering.
+
+**The check conflated correctness with hygiene.** A mismatch between `__version__`, the CHANGELOG
+and the directory name is a real defect: it mislabels the artifact that leaves the machine. An old
+zip lying in a sibling directory is not. `check()` now decides its exit status on version
+consistency alone and reports stale archives as housekeeping; `--strict` restores the old behaviour
+and is what `package.sh` uses, because at packaging time an unswept archive really can be shipped by
+mistake.
+
+**It was in the wrong stage.** STAGE 1 is documented as guarding corrections "whose failure modes
+are all SILENT in the output tables" -- a reverted sequencenumber fix, a regressed Table 5 null. A
+mislabelled archive cannot make a number wrong. It is now an ADVISORY line in STAGE 0 preflight: it
+prints, the run continues, and `package.sh` gates on it where the drift is actually caused.
+
+Verified by reproducing the exact failure -- a package directory with `v0914`, `v0933` and `v0934`
+zips beside it -- and confirming STAGE 0+1 now completes.
+
 ## v0.9.43 -- one version number, enforced; and the measurement that decides rebuild-vs-ladder
 
 **The archive shipped as `v0934` for nine consecutive releases.** `__init__.__version__` sat at

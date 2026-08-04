@@ -238,6 +238,16 @@ EOF
   # unrecognized option, so a typo kills its stage the moment it is REACHED -- STAGE 6 passed
   # --n-jobs to run_analysis.py (which has no such option) and had therefore never completed on any
   # source. A dry run cannot catch it: printing a command does not parse it. One --help per tool.
+  # Version consistency is ADVISORY here, deliberately. It belongs to release hygiene, not to
+  # correctness: a mislabelled archive is a real defect but it cannot make a table wrong, and the
+  # STAGE 1 gate is reserved for corrections whose absence is SILENT in the output. Putting it in
+  # that gate aborted a run at minute two over three old zips sitting in the working directory,
+  # which is what a working directory looks like. package.sh runs it with --strict, which is where
+  # an unswept archive can actually be shipped by mistake.
+  if run_rc $PY check_version.py; then :; else
+    info "  (advisory) version metadata is inconsistent -- see above. The run continues; fix before"
+    info "  packaging, where package.sh gates on it."
+  fi
   if run_rc $PY check_driver_flags.py "$0" --quiet; then :; else
     echo "" | tee -a "$LOG"
     echo "DRIVER FLAG CHECK FAILED -- see the log. A stage would die on argparse the moment it ran." | tee -a "$LOG"
@@ -288,7 +298,6 @@ if have_stage 1; then
            test_extract_resilience.py \
            test_validate_sample.py \
            test_feed_reset.py \
-           check_version.py \
            test_validate_aggregated.py \
            test_halt_aware_qc.py \
            test_driver_flags.py \
