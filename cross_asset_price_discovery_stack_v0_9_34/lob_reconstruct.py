@@ -748,10 +748,44 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
             "Details: %s" % (date_str, product, ", ".join(critical),
                              "them" if len(critical) > 1 else "it",
                              "; ".join(f"{k}: {v}" for k, v in sorted(failed.items()))))
+    counts = {mt: int(len(f)) for mt, f in msgs.items()}
     out = reconstruct_book(msgs, asset=ml.canonical_root(product, product_type), levels=levels,
                            interval=interval, round_lot=round_lot, odd_lot_inclusive=odd_lot_inclusive,
                            session=session, tz=tz, date_str=date_str, clock=clock, price_scale=price_scale,
                            consume=True, rules=rules)
+    out.attrs["message_counts"] = counts
+
+    # A fetch that SUCCEEDS and returns zero rows was silently fine here, and that is how the four
+    # 2020 ES sessions reached the dataset: `median ES=nan (ES/SPY=nan)` on a full-length 23,401-row
+    # frame, one INFO line, no error, no QC failure -- because session_qc's crossed test needs a
+    # finite bid AND ask to have anything to compare, and an empty book has neither. The leg was
+    # missing, the frame looked right, and only the eventual `_align_books` emptiness gave it away.
+    #
+    # The guard is on the OUTPUT, not on any one message type, because which types carry a book is a
+    # property of the feed and the era: SPY is hybrid MBO+MBP, ES in 2024 is MBO-only, and whether
+    # CME's 2020 capture is the same is precisely the open question. A book with no finite top on
+    # any snapshot is refused whatever the reason, and the per-type row counts go in the message so
+    # the answer arrives with the failure instead of needing another run to find.
+    root = ml.canonical_root(product, product_type)
+    bid = pd.to_numeric(out.get(f"{root}_bidprice_1", pd.Series(dtype=float)), errors="coerce")
+    ask = pd.to_numeric(out.get(f"{root}_askprice_1", pd.Series(dtype=float)), errors="coerce")
+    n_top = int((bid.notna() & ask.notna()).sum()) if len(out) else 0
+    if n_top == 0 and strict:
+        empty = sorted(mt for mt, n in counts.items() if n == 0 and mt not in _OPTIONAL_MSG_TYPES)
+        raise ml.MessageFetchError(
+            "%s %s: the reconstructed book has a finite top on 0 of %d snapshots -- the leg is "
+            "MISSING, not thin, and returning it would put a full-length all-NaN column into the "
+            "dataset (which is how the 2020 ES sessions got there). Book-critical type(s) with zero "
+            "rows: %s. Row counts: %s. If the day really is empty for these types the feed carries "
+            "this product some other way for this era -- check mt_price_level_update / "
+            "mt_aggregated_price_update and the contract code -- rather than replaying nothing."
+            % (date_str, product, len(out), ", ".join(empty) or "(none -- rows arrived but built no "
+               "book, so suspect the product/venue filter or price_scale)",
+               ", ".join("%s=%d" % (k, v) for k, v in sorted(counts.items()))))
+    if n_top == 0:
+        log.warning("%s %s: reconstructed book is EMPTY (0 finite tops of %d snapshots); row counts: "
+                    "%s", date_str, product, len(out),
+                    ", ".join("%s=%d" % (k, v) for k, v in sorted(counts.items())))
     if failed:
         out.attrs["fetch_failed"] = dict(failed)
     return out

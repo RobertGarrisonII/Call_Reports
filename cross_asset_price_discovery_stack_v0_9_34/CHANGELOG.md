@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.9.35 -- an empty fetch is not a thin day (and the 2020 ES probe)
+
+Starting work on the missing 2020 ES leg turned up the reason nobody noticed it for four sessions.
+`strict` in `reconstruct_session` has always covered a fetch that FAILS. A fetch that **succeeds and
+returns zero rows** went straight through, and `reconstruct_book` dutifully produced a full-length
+23,401-row frame of NaN. The only symptom was an INFO line:
+
+    extracted 2020-03-09 (ES=ESH0, book=reconstruct): 23401 rows, flow=True | median SPY=279.25 ES=nan (ES/SPY=nan)
+
+`session_qc` had nothing to say either: its crossed test needs a finite bid AND ask before it has
+anything to compare, so a leg that is entirely absent passes the invariant that exists to catch a
+broken one. Four sessions reached the dataset with a missing leg, and only the eventual `_align_books`
+emptiness gave it away.
+
+`reconstruct_session` now refuses any session whose reconstructed book has a finite top on **zero**
+snapshots. The guard is on the OUTPUT, not on any particular message type, because which types carry
+a book is a property of the feed and the era -- ES being MBO-only is an observation about the 2024
+capture, and whether it holds in 2020 is exactly the open question. Hardcoding it a second time is
+the mistake being fixed. The error names the product, the date, the book-critical types that came
+back empty, the per-type row counts, and where to look next; `strict=False` still returns the frame
+for a deliberate forensic replay, with `attrs["message_counts"]` populated either way.
+
+`probe_es_2020.py` (new) settles which of the three hypotheses applies, in one run:
+
+  (A) the 2020 CME capture is price-level (MBP) rather than order-by-order, so the MBO fetch the
+      extractor issues returns nothing;
+  (B) the contract code is wrong for the era or the roll (ESH0 expires 2020-03-20, so
+      `rollover_days=8` puts 03-16 and 03-18 on ESM0);
+  (C) a symbology/venue-filter difference -- the 2020 rows carry `marketparticipant=XCME` with an
+      empty `mic`, the 2024 rows the reverse.
+
+It counts rows for every candidate message type on both candidate contracts across the four 2020
+dates, with 2024-12-18 as a control, using `--limit` so each query is cheap. We already know (C) is
+not total: `mt_product_status` for ESH0 on 20200312 returns 43 rows, so the product code, the source
+and the date are all right, and the question is narrowed to which types carry the book.
+
 ## v0.9.34 -- the futures status stream, and a correction to v0.9.33
 
 The ES `mt_product_status` tables (ESZ4 2024-12-18, ESH0 2020-03-12) break three assumptions the
