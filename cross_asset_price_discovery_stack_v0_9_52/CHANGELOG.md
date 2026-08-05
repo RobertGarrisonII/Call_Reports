@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.9.52 -- when the optimal lag is a boundary, change the question, not pmax
+
+Asked whether there is a more informative way to handle the lag length than a boundary-constrained
+criterion. There is, and the answer differs by which lag is boundary-constrained:
+
+**The Table 9 SVAR** walks toward `corr_window` (v0.9.45): d(rolling correlation) carries an MA
+term at exactly lag W, no finite p below W whitens it, and raising `--pmax` converges to the window
+rather than to the truth. **The VECM at 1s** is different: intraday dependence lives at several
+scales, so a fixed-order criterion keeps improving at a log rate essentially forever -- footnote
+17's "AIC wants 60" is this, not long memory the estimands care about.
+
+Three additions, each replacing "find p*" with a checkable property:
+
+* **`price_discovery_shares.lag_profile`** scores candidate lags by what the lag is FOR. The lag
+  exists so Omega -- which the information shares are built from -- is estimated on white
+  residuals. The profile reports, per p: BIC (reference only), the Hosking multivariate portmanteau
+  p-value (are the residuals actually white at the horizon that matters), and the ESTIMANDS
+  (CS_ES, IS_mid_ES). The decision rule it supports: the smallest p that whitens, or -- the usual
+  1s case, where nothing fully whitens -- the smallest p beyond which the estimands are flat,
+  reported WITH the profile so the flatness is shown rather than asserted. On a VECM(2) DGP: p=0
+  rejects at 1.6e-218, every p>=1 passes, and IS_mid_ES moves by <0.01 from p=1 to p=20.
+* **`correlation_svar.correlation_irf_lp`** estimates Table 9's IRF by local projections (Jorda
+  2005; Plagborg-Moller & Wolf 2021 for the population equivalence): each horizon is a direct
+  HAC-inferenced projection, so the point estimate does not depend on a lag order AT ALL --
+  `ctrl_lags` tunes efficiency only. That invariance is the testable property a
+  boundary-constrained VAR cannot offer, and it is pinned: 2 vs 12 control lags move the estimates
+  by at most 0.17 SEs across every shock and horizon.
+* **`correlation_svar.sieve_order`** -- the Lewis-Reinsel/Lütkepohl T^(1/3) ceiling for letting p
+  grow: 29 at T = 23,400. Printed by the boundary diagnosis as scale, so "the criterion proposes
+  60" reads as what it is: chasing structure a finite VAR cannot whiten, not a sample-supported
+  order.
+
+The STAGE 4c boundary warning now names all three. New `test_lag_informative.py` (5 checks) in the
+STAGE 1 gate. Citations to verify against full texts before submission: Jorda (2005, AER);
+Plagborg-Moller & Wolf (2021, Econometrica); Lewis & Reinsel (1985) / Lütkepohl for the sieve rate;
+Hosking (1980) for the multivariate portmanteau.
+
 ## v0.9.51 -- halt snapshots excluded from the ESTIMATORS, not just the QC
 
 The 2026-08-05 analysis run reported n_obs = 23,401 - lags on every session: the QC gate has

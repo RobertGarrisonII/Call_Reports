@@ -119,6 +119,72 @@ def select_lag(p1, p2, pmax=10, criterion="bic", pmin=0):
     return p_star, tab
 
 
+def portmanteau(resid, h):
+    """Multivariate Ljung-Box (Hosking) statistic on VECM residuals up to horizon ``h``.
+
+    -> (Q, df_raw, pvalue_fn) where pvalue must be computed against chi2 with
+    df = K^2 * (h - p_fitted) by the caller, who knows p. Q alone is returned so lag_profile can
+    apply the correct fitted-lag adjustment per candidate."""
+    U = np.asarray(resid, float)
+    T, K = U.shape
+    U = U - U.mean(axis=0)
+    C0 = (U.T @ U) / T
+    C0i = np.linalg.pinv(C0)
+    Q = 0.0
+    for j in range(1, int(h) + 1):
+        Cj = (U[j:].T @ U[:-j]) / T
+        Q += float(np.trace(Cj.T @ C0i @ Cj @ C0i)) / (T - j)
+    return float(T * T * Q), K
+
+
+def lag_profile(p1, p2, ps=(1, 2, 3, 5, 8, 12, 20, 30, 45, 60), lb_h=50):
+    """The lag question answered by what the lag is FOR, instead of by an information criterion.
+
+    A boundary solution (p* == pmax, criterion still falling) does not say "search further" -- on a
+    23k-observation intraday sample with dependence at several scales, a fixed-order criterion can
+    keep improving at a log-rate essentially forever, and in the Table 9 system it walks toward the
+    correlation window's MA spike, which no finite p below the window can whiten. The informative
+    question is different: the lag exists so the residual covariance Omega is estimated on WHITE
+    residuals, because Omega is what the information shares are built from. So profile, per
+    candidate p:
+
+      bic          the criterion, for reference -- not the decision rule
+      lb_p         Hosking multivariate portmanteau p-value at horizon ``lb_h``: are the residuals
+                   actually white where it matters?
+      CS_ES etc.   the ESTIMANDS. If they are flat across p while lb_p still rejects, the
+                   dependence the criterion is chasing does not load on the objects reported --
+                   which is the finding that licenses a modest p, and it is checkable, unlike
+                   "BIC said so".
+
+    The decision rule this supports: the smallest p whose residuals pass whiteness at ``lb_h``, OR
+    -- when nothing passes, the usual case at 1s -- the smallest p beyond which every estimand is
+    flat, reported WITH the profile so a referee sees the flatness rather than trusting a point
+    choice. For reference, the Lewis-Reinsel/Lütkepohl sieve rate p ~ T^(1/3) is the principled
+    ceiling for "let p grow": T=23,400 gives ~29, which is worth knowing when a criterion proposes
+    60."""
+    from scipy import stats
+    rows = []
+    for p in ps:
+        try:
+            alpha, Om, resid = _fit_vecm_fixed(p1, p2, int(p))
+            dY, X = _design_within_day(p1, p2, int(p))
+            T = len(dY)
+            ld, aic, bic, hq = _ic_row(dY, X, int(p))
+            Q, K = portmanteau(resid, lb_h)
+            dfree = K * K * max(int(lb_h) - int(p), 1)
+            lb_p = float(stats.chi2.sf(Q, dfree)) if np.isfinite(Q) else np.nan
+            cs = gonzalo_granger(alpha)
+            lo, hi, mid = hasbrouck_is(alpha, Om)
+            rows.append({"p": int(p), "n_obs": int(T), "bic": bic, "lb_stat": Q, "lb_p": lb_p,
+                         "CS_ES": float(cs[1]), "IS_mid_ES": float(mid[1]),
+                         "alpha_SPY": float(alpha[0]), "alpha_ES": float(alpha[1])})
+        except Exception:
+            rows.append({"p": int(p), "n_obs": 0, "bic": np.nan, "lb_stat": np.nan, "lb_p": np.nan,
+                         "CS_ES": np.nan, "IS_mid_ES": np.nan,
+                         "alpha_SPY": np.nan, "alpha_ES": np.nan})
+    return pd.DataFrame(rows)
+
+
 def select_lag_pooled(price_pairs, pmax=10, criterion="bic", pmin=0):
     """One lag order for a set of sessions: minimise the SUMMED criterion Σ_d IC_d(p) (the pooled
     objective for cross-session comparability). ``price_pairs`` is an iterable of (p1, p2) log-price

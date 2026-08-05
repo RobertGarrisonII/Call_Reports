@@ -303,6 +303,98 @@ def orthogonalized_irf(A, Sigma, H, ident="cholesky"):
 
 
 # ── Table 9: IRF of correlation to each shock, by regime ──────────────────────
+def sieve_order(T) -> int:
+    """The Lewis-Reinsel/Lütkepohl sieve rate ceil(T^(1/3)) -- the principled ceiling for 'let the
+    lag order grow with the sample'. A sieve VAR approximates an infinite-order system consistently
+    when p grows at this rate; a criterion proposing p far beyond it on a fixed sample is not
+    finding structure, it is chasing something a finite VAR cannot whiten (in the Table 9 system:
+    the corr_window MA spike). T=23,400 gives 29 -- context for the paper's 60."""
+    return int(np.ceil(float(max(T, 1)) ** (1.0 / 3.0)))
+
+
+def _lp_core(y, shock, Z, horizons, nw_extra=5):
+    """Local projection of y_{t+h} on shock_t with controls Z_t, Newey-West SEs. -> rows of dicts.
+
+    The property that matters here is LAG-ROBUSTNESS: theta_h is a direct projection, so it does
+    not require the system to be whitened -- controls soak up predictable variation for efficiency,
+    but omitting lags does not bias theta_h the way truncating a VAR biases every IRF step after
+    the first (Jorda 2005; Plagborg-Moller & Wolf 2021 give the population equivalence). That is
+    the answer to a boundary-constrained lag order: estimate the IRF by an object whose point
+    estimate does not depend on getting p right."""
+    y = np.asarray(y, float); shock = np.asarray(shock, float)
+    T = len(y)
+    out = []
+    for h in horizons:
+        yy = y[h:] if h else y.copy()
+        n = len(yy)
+        cols = [np.ones(n), shock[:T - h] if h else shock]
+        if Z is not None and Z.shape[1]:
+            cols.append(Z[:T - h] if h else Z)
+        Xh = np.column_stack([np.column_stack([c]) if c.ndim == 1 else c for c in cols])
+        ok = np.isfinite(yy) & np.all(np.isfinite(Xh), axis=1)
+        yy, Xh = yy[ok], Xh[ok]
+        if len(yy) <= Xh.shape[1] + 5:
+            out.append({"horizon": int(h), "theta": np.nan, "se": np.nan})
+            continue
+        b, res, *_ = np.linalg.lstsq(Xh, yy, rcond=None)
+        u = yy - Xh @ b
+        L = int(h) + int(nw_extra)                       # overlap induces MA(h) errors by design
+        XtXi = np.linalg.pinv(Xh.T @ Xh)
+        w = Xh * u[:, None]
+        S = w.T @ w
+        for j in range(1, L + 1):
+            G = w[j:].T @ w[:-j]
+            S += (1 - j / (L + 1)) * (G + G.T)
+        V = XtXi @ S @ XtXi
+        out.append({"horizon": int(h), "theta": float(b[1]), "se": float(np.sqrt(max(V[1, 1], 0)))})
+    return out
+
+
+def correlation_irf_lp(sessions, spec="informational", n_levels=10, target_qty=None,
+                       corr_method="rolling", corr_window=100, wspread_kind="cost_to_fill",
+                       extra_fn=None, horizons=range(0, 7), ctrl_lags=2):
+    """Table 9's IRF estimated by LOCAL PROJECTIONS -- the lag-robust alternative to the VAR.
+
+    Same frame, same shocks, same dependent variable as `correlation_irf`; the difference is that
+    each horizon's response is a direct HAC-inferenced projection, so the estimate does not depend
+    on a lag order at all -- `ctrl_lags` only tunes efficiency, and moving it should not move the
+    point estimates. That invariance is a CHECKABLE property (test_lag_informative pins it), unlike
+    a boundary-constrained p*. Shocks are standardized per regime so theta is per 1 SD, matching
+    the VAR table's units.
+
+    -> tidy DataFrame [regime, shock, horizon, theta, se] (x100, as in Table 9)."""
+    groups = {}
+    for item in ([("all", "all", sessions)] if isinstance(sessions, pd.DataFrame) else sessions):
+        d, r, df = item if not isinstance(sessions, pd.DataFrame) else item
+        groups.setdefault(r, []).append(df)
+    rows = []
+    for regime, frames in groups.items():
+        Xs, names, ci = [], None, None
+        for df in frames:
+            X, nm, c = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
+                                        corr_window, wspread_kind, extra_fn=extra_fn)
+            if len(X) > 50:
+                Xs.append(X); names, ci = nm, c
+        if not Xs:
+            continue
+        X = np.vstack(Xs)
+        y = X[:, ci]
+        shocks = [(j, names[j]) for j in range(X.shape[1]) if j != ci]
+        # controls: ctrl_lags lags of the full system (efficiency only -- see _lp_core)
+        Zcols = []
+        for L in range(1, int(ctrl_lags) + 1):
+            Zcols.append(np.vstack([np.full((L, X.shape[1]), np.nan), X[:-L]]))
+        Z = np.hstack(Zcols) if Zcols else None
+        for j, nm in shocks:
+            sd = np.nanstd(X[:, j])
+            sh = (X[:, j] - np.nanmean(X[:, j])) / (sd if sd > 0 else 1.0)
+            for r_ in _lp_core(y, sh, Z, horizons):
+                rows.append({"regime": regime, "shock": nm, "horizon": r_["horizon"],
+                             "theta_x100": 100 * r_["theta"] if np.isfinite(r_["theta"]) else np.nan,
+                             "se_x100": 100 * r_["se"] if np.isfinite(r_["se"]) else np.nan})
+    return pd.DataFrame(rows)
+
+
 def lag_diagnosis(p, corr_window, pmax, corr_method="rolling", tol=1) -> dict:
     """Is the selected lag order an ANSWER, or an artifact of how the dependent variable is built?
 
@@ -358,7 +450,13 @@ def lag_diagnosis(p, corr_window, pmax, corr_method="rolling", tol=1) -> dict:
                      "improving where the search stopped -- a bound, not an optimum. If the "
                      "correlation window is %s, the induced spike sits at lag %s and any pmax below "
                      "it will end here; raising pmax will walk toward the window rather than "
-                     "converge." % (int(p), int(pmax), corr_window or "?", corr_window or "?"))
+                     "converge. Two lag-robust alternatives exist: correlation_irf_lp estimates the "
+                     "same IRF by local projections, whose point estimates do not depend on a lag "
+                     "order at all, and price_discovery_shares.lag_profile shows whether the "
+                     "ESTIMANDS are flat across p while the criterion is still moving. For scale, "
+                     "the T^(1/3) sieve ceiling is p~%d on a 23,400-bar session -- a criterion "
+                     "proposing more is chasing the window."
+                     % (int(p), int(pmax), corr_window or "?", corr_window or "?", sieve_order(23400)))
     rep["ok"] = not (rep["window_artifact"] or rep["at_boundary"])
     rep["text"] = " ".join(lines) if lines else (
         "p=%d: not at the search bound and not equal to the correlation window (%s), so the lag "
