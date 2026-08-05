@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.9.55 -- the 10ms second grid, wired in and curated
+
+The driver half-expected a fine grid for four releases: `FINE_INTERVAL` was declared and STAGE 5
+looked for 10ms frames — printing "re-run STAGE 2 with --interval 10ms" when they were absent,
+which is exactly what the 2026-08-04 run did — but nothing ever extracted them and no stage list
+was curated for them. Now `--with-fine` runs a second grid beside the 1s one:
+
+* **STAGE 2b** extracts `FINE_INTERVAL` (default 10ms) frames for the sample — or a subset via
+  `--fine-dates`, the recommended first pass since the per-worker peak has never been measured at
+  this grid (the 58.4 GiB on record is a 1s number; sizing starts from a conservative
+  `FINE_PEAK_GB` guess of 96 and `autoscale.measure` prints the real peak for next time). Frames
+  land in the same interval-keyed extract cache, so they are paid for once. **Additive by
+  design**: a fine-grid failure warns and the 1s run continues.
+* **STAGE 3** QCs the fine frames against the same crossed-book invariant, WARN-ONLY — the gate
+  protects the mains; a crossed fine frame is named before STAGE 6b estimates on it.
+* **STAGE 5** picks the fine frames up for the Table 9 Epps pair (Pearson vs Hayashi–Yoshida at
+  the grid where the gap is largest) via the resolved `FINE_FRAMES` path, with the old
+  name-substitution kept as a fallback for hand-extracted frames — now guarded so an
+  interval-less pickle name can never silently hand the 1s frames to the fine stages.
+* **STAGE 6b** runs a CURATED list, not the full battery: `information_shares` (rcorr≈0.97 at 1s
+  puts the Hasbrouck bounds near [0,1]; 10ms asynchrony breaks the simultaneity — the biggest
+  inferential win), `ecm_sde` (the memo's window-level IS(S) mechanism, one of the 2026-08-05
+  report's two candidate rescues at exactly this grid), `jumps` (co-jump lead-lag: 16 of 17
+  co-jumps are "simultaneous" at 1s by construction; Lee–Mykland engages automatically), and
+  `microstructure` (staleness + noise diagnostics where both bind). What deliberately does NOT
+  run at 10ms: panel / dcc / irf / cross_impact / robustness — upwards of 99% of 10ms snapshots
+  are stale repeats of ES's coarse tick, so the 1s mains stay the estimates the paper quotes.
+  `n_lags` is not forwarded from the 1s run; `frequency_defaults` rescales it to the grid.
+* Dry-run now honours its promise on `--source extract`: placeholder frame paths let every
+  downstream stage print its command instead of the run dying at a file that was never written.
+* The manifest records the fine grid, its frames path, and the curated stage list.
+
+New gate: `test_fine_grid_stage.py` (6 checks): the two-grid dry-run flow end to end, the
+default flow unchanged without the flag, the `--fine-dates` subset, curated names cross-checked
+against `run_analysis.STAGES` (a rename would otherwise surface at hour three of a real run),
+the load-path self-match guard, and the curated list actually running 4/4 on synthetic 10ms
+frames with the sub-second path engaged. STAGE 1 is now 53 modules.
+
 ## v0.9.54 -- the contract pick verifies itself, and the log shows the split
 
 The roll machinery was three disconnected pieces: the calendar rule picked the contract on every
