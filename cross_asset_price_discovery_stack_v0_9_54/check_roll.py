@@ -119,6 +119,14 @@ def measure(date_str: str, symbol: str = "ES", rollover_days: int = 8, full: boo
     rep["oi_share"] = (float(ois[front] / otot)
                        if np.isfinite(ois.get(front, np.nan)) and np.isfinite(ois.get(rival, np.nan))
                        and otot > 0 else float("nan"))
+    # Turnover (volume / open interest) per contract: how fast the stock of positions is churning.
+    # A roll shows up here before it shows up in OI -- the DYING contract's turnover spikes as
+    # positions exit through trades while its OI is still large, so front turnover >> rival
+    # turnover on a pre-roll day and << on a post-roll day is the expected signature.
+    rep["turnover"] = {c: (float(vols[c] / ois[c])
+                           if np.isfinite(vols.get(c, np.nan)) and np.isfinite(ois.get(c, np.nan))
+                           and ois[c] > 0 else float("nan"))
+                       for c in (front, rival)}
     tot = np.nansum([vols.get(front, np.nan), vols.get(rival, np.nan)])
     if np.isfinite(vols.get(front, np.nan)) and np.isfinite(vols.get(rival, np.nan)) and tot > 0:
         rep["measured"] = True

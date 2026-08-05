@@ -91,6 +91,17 @@ def qc_sessions(sessions, assets=("SPY", "ES"), crossed_tol: float = 0.005) -> p
                 row[f"{a}_luld_known"] = sm.get("luld_known", 0.0)
         except Exception:
             row["ssr_frac"] = float("nan"); row["luld_known"] = 0.0
+        # Roll split measured at extraction (measure_roll_at_extraction): which fraction of
+        # two-contract futures volume / open interest the calendar pick actually carried, on
+        # sessions near a roll boundary. n/m (NaN) = not in a roll window, or extracted before the
+        # measurement existed, or the lake read failed -- absence is "not measured", never "fine".
+        roll = rep.get("roll") or {}
+        row["roll_off"] = roll.get("offset_days", np.nan)
+        fut = assets[1] if len(assets) > 1 else "ES"
+        row[f"{fut}_front_vol"] = roll.get("front_share", float("nan")) if roll.get("measured") else float("nan")
+        row[f"{fut}_front_oi"] = roll.get("oi_share", float("nan")) if roll.get("measured") else float("nan")
+        row["roll_rule_ok"] = (("yes" if roll.get("rule_agrees") else "NO")
+                               if roll.get("measured") else "n/m")
         # a fetch failure recorded at reconstruction time is the usual cause; surface it here too
         ff = df.attrs.get("fetch_failed") if hasattr(df, "attrs") else None
         row["fetch_failed"] = ",".join(sorted(ff)) if ff else ""
@@ -121,6 +132,11 @@ def main(argv=None) -> int:
     for c in ("ssr_frac", "luld_known") + tuple(f"{a}_luld_known" for a in assets[1:]):
         if c in show.columns:
             show[c] = show[c].map(lambda v: "n/r" if not np.isfinite(v) else f"{v:.0%}")
+    for c in tuple(f"{a_}_front_vol" for a_ in assets[1:]) + tuple(f"{a_}_front_oi" for a_ in assets[1:]):
+        if c in show.columns:
+            show[c] = show[c].map(lambda v: "n/m" if not np.isfinite(v) else f"{v:.1%}")
+    if "roll_off" in show.columns:
+        show["roll_off"] = show["roll_off"].map(lambda v: "-" if not np.isfinite(v) else "%+d" % v)
     body = ["crossed-book gate on the SAVED frames (tolerance %.2f%%)" % (100 * a.crossed_tol),
             "%d session(s) from %s" % (len(tbl), a.pickle), "", show.to_string(), ""]
     bad = tbl[~tbl["ok"]]
@@ -145,6 +161,35 @@ def main(argv=None) -> int:
                  "  constrained and the buy side is not. Signed order flow on these days is",
                  "  mechanically asymmetric -- report them in the sample appendix and control for",
                  "  them before reading Tables 5 and 7 as evidence of directional tandem trading."]
+    _fvols = [c for c in tbl.columns if c.endswith("_front_vol")]
+    if _fvols and "roll_rule_ok" in tbl.columns:
+        _fv = tbl[_fvols[0]]
+        wrong = tbl[tbl["roll_rule_ok"] == "NO"]
+        if len(wrong):
+            body += ["",
+                     "CALENDAR RULE PICKED THE MINORITY CONTRACT on: %s"
+                     % ", ".join("%s (%.1f%% of two-contract volume)" % (d, 100 * r[_fvols[0]])
+                                 for d, r in wrong.iterrows()),
+                     "  The futures leg on those sessions is the QUIETER book. Re-extract pinned to",
+                     "  the rival contract and say so in the appendix, or keep the rule and report",
+                     "  the measured share -- decide explicitly, do not let it ride."]
+        split = tbl[(tbl["roll_rule_ok"] == "yes") & (_fv < 0.90)]
+        if len(split):
+            body += ["",
+                     "ROLL-SPLIT sessions (calendar pick leads but carries <90%% of two-contract "
+                     "volume): %s"
+                     % ", ".join("%s (%.1f%%)" % (d, 100 * r[_fvols[0]]) for d, r in split.iterrows()),
+                     "  The single-contract futures leg is not the whole market on those days.",
+                     "  Report the measured share in the sample appendix; do NOT splice the",
+                     "  contracts (10-12 point calendar spread jumps at the seam)."]
+        unmeasured = tbl[(tbl["roll_off"].map(lambda v: np.isfinite(v) and -3 <= v <= 7))
+                         & (tbl["roll_rule_ok"] == "n/m")]
+        if len(unmeasured):
+            body += ["",
+                     "IN A ROLL WINDOW BUT NOT MEASURED: %s"
+                     % ", ".join(str(d) for d in unmeasured.index),
+                     "  (frame predates roll measurement at extraction, or the lake read failed).",
+                     "  Run check_roll.py --dates on these, or re-extract."]
     _es_luld = [c for c in tbl.columns if c.endswith("_luld_known")]
     if _es_luld and float(tbl[_es_luld].fillna(0).to_numpy(float).max()) > 0:
         # NOTE this block first shipped appending to `lines`, a name that does not exist in this

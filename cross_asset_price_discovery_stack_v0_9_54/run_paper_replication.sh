@@ -309,6 +309,7 @@ if have_stage 1; then
            test_halt_masked_estimation.py \
            test_lag_informative.py \
            test_analysis_inconsistencies.py \
+           test_roll_at_extraction.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi

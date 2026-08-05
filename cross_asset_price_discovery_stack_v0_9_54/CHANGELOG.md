@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.9.54 -- the contract pick verifies itself, and the log shows the split
+
+The roll machinery was three disconnected pieces: the calendar rule picked the contract on every
+session, `roll_window_days` flagged roll-week sessions on every session, and the actual volume
+share had been measured on exactly four dates — manually, and only because the March-2020
+statistics files were supplied by hand. Three sessions of the current sample sit in a roll window
+with their share never measured (2023-03-09, 2024-12-18, 2025-06-13).
+
+* **`mstbook_loader.measure_roll_at_extraction`**: any session within (−3, +7) days of the roll
+  boundary now runs the same cheap `mt_product_statistics` head-read AT EXTRACTION, for the
+  calendar pick and its rival. The log carries the measured split — **volume of each contract with
+  the front's share, open interest of each with its share, and turnover (vol/OI) per contract** —
+  plus a dedicated line when volume and OI disagree on which contract leads (OI is a day-stale
+  stock; volume is the flow price discovery is made of). Severity is graded: minority calendar
+  pick → **log.error** (the extracted ES leg is the quieter book — decide explicitly, re-extract
+  pinned to the rival or keep the rule and report the share); pick leads but <90% → **warning**
+  with the do-not-splice instruction; concentrated → info. A lake failure never kills extraction:
+  fallback warning, session proceeds unmeasured. The pick itself STAYS the calendar rule — an
+  auto-switch on a same-day volume read would make the series definition data-dependent, which is
+  worse for replication than a fixed rule with a reported coverage number.
+* **The report persists**: `df.attrs["roll_measurement"]` (full dict) and
+  `df.attrs["roll_offset_days"]` on every extracted frame; `session_qc` surfaces a `roll` block
+  and records a minority pick as a REASON without flipping `ok` (the book itself is sound, and a
+  hard fail would loop — re-extraction under the same rule repeats the same pick); the QC table
+  (`qc_frames`) gains `roll_off`, `ES_front_vol`, `ES_front_oi`, `roll_rule_ok` columns plus
+  summary blocks for wrong picks, split sessions, and in-window-but-unmeasured frames
+  (n/m — absence is "not measured", never "fine").
+* **`check_roll.measure` reports per-contract turnover** (volume / open interest): the roll shows
+  up here before it shows up in OI — the dying contract's turnover spikes as positions exit
+  through trades while its OI is still large. Same reset-proof max-read as the other counters.
+* The old extraction warnings that quoted the March-2020 shares on unmeasured sessions are gone —
+  replaced by the measurement itself, with the extrapolation text kept only as the fallback when
+  the lake is unreachable.
+
+New gate: `test_roll_at_extraction.py` (8 checks): in-window measures and logs the full split,
+out-of-window never touches the lake, minority pick is loud-but-not-fatal end to end
+(log.error → session_qc reason → QC table NO), split warns with do-not-splice, vol-vs-OI
+disagreement line, lake-failure survival, turnover arithmetic, QC table n/m semantics. STAGE 1 is
+now 52 modules.
+
 ## v0.9.53 -- the report's contradictions were mostly one bug: sessions[0]
 
 Chasing the 2026-08-05 report's three internal contradictions (§4a/b/c) found that two of them were

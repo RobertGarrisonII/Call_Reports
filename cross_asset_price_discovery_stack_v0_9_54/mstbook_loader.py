@@ -153,6 +153,97 @@ def adjacent_contracts(symbol: str, as_of_date: date, rollover_days: int = 8) ->
     return (f"{root}{prev_code}{prev_yr}", front, f"{root}{next_code}{next_yr}")
 
 
+def measure_roll_at_extraction(label, symbol: str = "ES", rollover_days: int = 8,
+                               window: tuple = (-3, 7), _measure=None):
+    """Self-verifying contract pick: measure the roll split AT EXTRACTION for in-window sessions.
+
+    The calendar rule (`get_front_month_contract`) stays the pick -- switching contracts on a
+    same-day volume read would make the series definition data-dependent, which is worse for
+    replication than a fixed rule with a reported coverage number. What changes is that the rule is
+    now CHECKED where it can be wrong: any session within ``window`` (signed days around the roll
+    boundary; -3..+7 covers both measured regimes -- pre-roll concentration and the post-roll
+    unwind) gets a head-read of `mt_product_statistics` for the front month and its rival, and the
+    log carries the measured volume and open-interest split instead of an extrapolation from the
+    one roll ever measured (March 2020, a crisis week).
+
+    -> (roll_offset_days, report_dict_or_None). None means out-of-window OR the measurement could
+    not run (no `mstwx-lakequery` on PATH, vendor error) -- extraction NEVER fails over this, it
+    just says so and falls back to the old unmeasured warning. ``_measure`` injects a stand-in for
+    `check_roll.measure` in tests.
+
+    Logging contract (all figures are the PRIOR session's closing totals from the statistics
+    stream's pre-open rows -- the cheap discriminator; see check_roll._num for why max not last):
+      * measured, calendar pick is the MINORITY contract  -> log.error (the extracted ES leg is
+        the quieter book; the session needs a decision, not a silent pass)
+      * measured, front share < 90%                       -> log.warning (SPLIT: the single-contract
+        leg is not the whole futures market; report the share, do not splice)
+      * measured, concentrated                            -> log.info
+      * volume and OI disagree on which contract leads    -> extra log.info explaining stock vs flow
+    """
+    d = _parse_yyyymmdd(str(label).replace("-", ""))
+    off = roll_window_days(d, rollover_days)
+    if not (window[0] <= off <= window[1]):
+        return off, None
+    date_str = d.strftime("%Y-%m-%d")
+    try:
+        if _measure is None:
+            import check_roll as _cr                      # lazy: check_roll imports this module
+            _measure = _cr.measure
+        rep = _measure(date_str, symbol, rollover_days)
+    except Exception as exc:
+        log.warning("%s: %+d day(s) from the roll boundary and the split could NOT be measured "
+                    "(%s). Falling back to the unmeasured warning: volume is probably split "
+                    "across contracts; run `check_roll.py --dates %s` where the lake is reachable.",
+                    label, off, str(exc).splitlines()[0][:120], date_str)
+        return off, None
+    if not rep.get("measured"):
+        log.warning("%s: %+d day(s) from the roll boundary; measurement ran but could not read "
+                    "volume for both %s and %s (%s). The share the calendar pick carries is "
+                    "UNKNOWN on this session.", label, off, rep.get("front"), rep.get("rival"),
+                    rep.get("note", ""))
+        return off, rep
+    front, rival = rep["front"], rep["rival"]
+    v, o, tr = rep["volume"], rep["open_interest"], rep.get("turnover", {})
+    fs, oi_s = rep["front_share"], rep.get("oi_share", float("nan"))
+
+    def _fmt(x):
+        return "{:,}".format(int(x)) if np.isfinite(x) else "?"
+
+    split = ("volume %s=%s (%.1f%%) vs %s=%s (%.1f%%); open interest %s=%s (%.1f%%) vs %s=%s "
+             "(%.1f%%); turnover (vol/OI) %s=%.2f vs %s=%.2f"
+             % (front, _fmt(v.get(front, np.nan)), 100 * fs,
+                rival, _fmt(v.get(rival, np.nan)), 100 * (1 - fs),
+                front, _fmt(o.get(front, np.nan)),
+                100 * oi_s if np.isfinite(oi_s) else float("nan"),
+                rival, _fmt(o.get(rival, np.nan)),
+                100 * (1 - oi_s) if np.isfinite(oi_s) else float("nan"),
+                front, tr.get(front, float("nan")), rival, tr.get(rival, float("nan"))))
+    if not rep.get("rule_agrees", True):
+        log.error("%s: THE CALENDAR RULE PICKED THE MINORITY CONTRACT: %s carries %.1f%% of the "
+                  "two-contract volume at %+d day(s) from the boundary (%s). The extracted ES leg "
+                  "is the QUIETER book. This is a sample-definition decision, not an auto-switch: "
+                  "either re-extract this session pinned to %s and say so in the appendix, or keep "
+                  "the rule and report the measured share -- but do not let it pass silently.",
+                  label, front, 100 * fs, off, split, rival)
+    elif fs < 0.90:
+        log.warning("%s: ROLL SPLIT MEASURED at %+d day(s) from the boundary: %s. The calendar "
+                    "pick %s leads but the single-contract ES leg misses %.1f%% of two-contract "
+                    "futures volume on this session. Report the measured share in the sample "
+                    "appendix; do NOT splice the contracts (10-12 point calendar spread jumps at "
+                    "the seam).", label, off, split, front, 100 * (1 - fs))
+    else:
+        log.info("%s: roll split measured at %+d day(s) from the boundary: %s. Concentrated "
+                 "(>=90%%) in the calendar pick %s -- the single-contract leg is effectively the "
+                 "whole market here.", label, off, split, front)
+    if np.isfinite(oi_s) and (fs >= 0.5) != (oi_s >= 0.5):
+        log.info("%s: volume and open interest DISAGREE on which contract leads (vol %.1f%% vs OI "
+                 "%.1f%% for %s). OI is a day-stale STOCK of positions settled once a day; volume "
+                 "is the FLOW price discovery is made of -- the leg follows volume, and the "
+                 "disagreement is recorded rather than assumed away.", label,
+                 100 * fs, 100 * oi_s, front)
+    return off, rep
+
+
 def get_contract_expiry(contract_code: str, ref_year: Optional[int] = None) -> date:
     """Expiry (third Friday) for a contract code with a single-digit year, e.g. 'ESH5'.
 
@@ -1052,6 +1143,29 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
                                   f"IS the halt (matching stops, resting orders do not), so the "
                                   f"book is correct. Exclude halt snapshots from any estimate: a "
                                   f"halted market has no valid midpoint")
+    # Roll split, when the session sat near a contract boundary and extraction measured it
+    # (measure_roll_at_extraction). Surfaced so the QC table carries the coverage number beside the
+    # integrity columns. A minority pick does NOT flip ``ok`` -- the book itself is sound and
+    # re-extracting under the same rule would produce the same pick, so a hard fail would loop --
+    # but it is recorded as a reason: which contract defines the leg is a sample decision the
+    # extraction log.error already forces, and the table must not let it pass silently either.
+    rm = attrs.get("roll_measurement")
+    if rm:
+        rep["roll"] = {"offset_days": attrs.get("roll_offset_days"),
+                       "front": rm.get("front"), "rival": rm.get("rival"),
+                       "measured": bool(rm.get("measured")),
+                       "front_share": rm.get("front_share", float("nan")),
+                       "oi_share": rm.get("oi_share", float("nan")),
+                       "rule_agrees": rm.get("rule_agrees")}
+        if rm.get("measured") and not rm.get("rule_agrees", True):
+            rep["reasons"].append(
+                "ES: calendar rule picked the MINORITY contract %s (%.1f%% of two-contract "
+                "volume vs %s) -- the leg is the quieter book; re-extract pinned to %s and say so "
+                "in the appendix, or keep the rule and report the measured share"
+                % (rm.get("front"), 100 * rm.get("front_share", float("nan")),
+                   rm.get("rival"), rm.get("rival")))
+    elif "roll_offset_days" in attrs:
+        rep["roll"] = {"offset_days": attrs.get("roll_offset_days"), "measured": False}
     return rep
 
 
@@ -1128,23 +1242,14 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
             log.warning("%s: cache read failed (%s); re-extracting", label, exc)
     contract = get_front_month_contract(cfg["es_symbol"], as_of_date=_parse_yyyymmdd(ymd),
                                         rollover_days=cfg["rollover_days"])
-    _roll_d = roll_window_days(_parse_yyyymmdd(ymd), cfg["rollover_days"])
-    if 0 <= _roll_d <= 7:                     # the roll is a week, not a day (see roll_window_days)
-        log.warning("%s: %+d day(s) from the %s roll boundary, so volume is probably SPLIT across "
-                    "contracts. %s is what the calendar rule picks. THE SHARE IT CARRIES ON THIS "
-                    "SESSION IS NOT MEASURED -- run `check_roll.py --dates %s` to measure it. For "
-                    "scale, the only roll ever measured (March 2020, a crisis week) had the leading "
-                    "contract at 72.8%%/60.4%%/78.0%% at +0/+4/+6 days; whether an ordinary quarter "
-                    "rolls that slowly is unknown. Report the measured share in the sample appendix "
-                    "rather than splicing -- the contracts carry a 10-12 point calendar spread, so a "
-                    "stitched series jumps at the seam.",
-                    label, _roll_d, cfg["es_symbol"], contract, label)
-    elif -3 <= _roll_d < 0:
-        log.info("%s: %d day(s) before the %s roll boundary. Pre-roll sessions are expected to stay "
-                 "concentrated in the old contract, so %s should be nearly the whole market -- but "
-                 "that is an expectation, measured once (93.7%% on 2020-03-09), not a property of "
-                 "this session. `check_roll.py --dates %s` measures it.",
-                 label, -_roll_d, cfg["es_symbol"], contract, label)
+    # Self-verifying pick: a session near the roll boundary MEASURES the volume/OI split between
+    # the calendar pick and its rival at extraction time (cheap head-read of mt_product_statistics)
+    # instead of quoting the one roll ever measured. The pick itself stays the calendar rule --
+    # switching on a same-day volume read would make the series definition data-dependent -- but a
+    # minority pick is now a loud log.error at extraction, not a post-hoc discovery. The full
+    # report lands in df.attrs["roll_measurement"] and the QC table.
+    _roll_d, _roll_rep = measure_roll_at_extraction(label, cfg["es_symbol"],
+                                                    cfg["rollover_days"])
     # SPY: consolidated multi-venue hybrid MBO+MBP. ES: single-venue CME order-by-order (MBO) — the
     # mt_price_level_* types are empty for futures; integer-hundredths -> index points via price_scale.
     spy = lob.reconstruct_session(ymd, "SPY", "direct", levels=cfg["levels"], interval=cfg["interval"],
@@ -1278,6 +1383,9 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
         df.attrs["halt_reasons"] = sorted(set(df.attrs.get("halt_reasons_SPY", []))
                                           | set(df.attrs.get("halt_reasons_ES", [])))
     df.attrs["es_contract"] = contract
+    df.attrs["roll_offset_days"] = int(_roll_d)
+    if _roll_rep is not None:                      # in a roll window and the measurement ran
+        df.attrs["roll_measurement"] = _roll_rep
     if locals().get("_es_from_ladder"):            # so session_qc knows to run the LADDER checks
         df.attrs["book_source_ES"] = "aggregated"  # (the crossed test is vacuous on that leg)
     qc = session_qc(df, crossed_tol=float(cfg.get("crossed_tol", 0.005)))
