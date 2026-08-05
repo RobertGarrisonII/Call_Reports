@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.9.57 -- the masked run's casualties, the halt-mask A/B, and the revised sample
+
+The 2026-08-05 halt-masked run was the first time every estimator received NaN-masked frames, and
+the periphery broke in ways the headline tables could not show. All from one report read; every
+fix pinned by `test_masked_run_casualties.py` (6 checks; STAGE 1 is now 54 modules).
+
+* **`local_projection` was all-NaN** at every horizon: `np.cumsum` over masked returns carried
+  the first NaN into every later cumulative response, so one 09:34 halt emptied the day's whole
+  LP table. Now `nancumsum` plus a gap-count prefix sum: response windows that SPAN a masked
+  return are invalidated (a window across the halt is undefined — not zero, which is what
+  nancumsum alone would silently claim); windows entirely before or after stay estimable.
+* **`lee_mykland` reported zero jumps on a crash day** (2020-03-09: n_cojump = 0 while the
+  per-day split, which runs on gap-free VECM residuals, found 24): the trailing-bipower local
+  vol used the same poisoned cumsum. Now it sums only finite products and counts them per
+  window, requires max(4, K//4) finite products before trusting sigma (local vol from a handful
+  of post-reopen bars would manufacture spurious jumps), scales the Gumbel threshold by the
+  finite-return count, and a NaN return can never itself be flagged.
+* **The legacy inference row printed coef = NaN with both t's NaN** while its wild-bootstrap p
+  survived — worse than failing loudly. `_stack_returns_ofi` now drops non-finite rows per
+  session (contemporaneous regression; nothing to splice). **The comovement table silently
+  dropped the four MWCB days** (NaN std fails the inclusion test without a trace) — Pearson now
+  uses pairwise-finite returns, and **Hayashi–Yoshida is accumulated per contiguous finite
+  segment**: compressing the NaN out would leave one interval spanning the halt whose
+  gap-return co-movement (hundreds of bp² against ~1e-4 of daily RV) would quietly push every
+  MWCB day's HY correlation to ~1.
+* **The Rigobon table now carries its own identification strength**: var-ratio spread,
+  eigenvalue separation, and an identified yes/NO verdict as table rows. The masked run printed
+  SPY←ES = −0.33 / ES←SPY = +1.01 — against every other estimator and its own previous run —
+  with nothing saying whether the rotation was identified at all; het-ID is numerical noise
+  when both legs' variances scale together (the usual case for a 0.93-correlated pair). When
+  the verdict row says NO, neither run's Rigobon numbers mean anything — including the previous
+  run's "validates the recursive ordering."
+* **`cross_impact_panel` forwards the drop-one diagnostic** (`lambda_drop1`, `drop1_flag`) into
+  the per-day panel and names flagged dates in `summary.attrs["drop1_flagged_dates"]` — the
+  2024-08-05 ES←SPY = 0.40 cell is checkable from the table it appears in.
+* **Frames were saved MASKED AT REST** (v0.9.51–56: `--save-frames` ran after `_mask_halt_rows`),
+  which silently turned `--no-halt-mask` into a no-op on reloaded frames and made the halt-mask
+  A/B impossible from a run's own artifact. The pre-mask aligned sessions are now stashed and
+  preferred at save time: the artifact is the data, not one estimation policy baked in as NaN.
+* **`ab_halt_mask.py`** (new): the attribution A/B for the collapsed headline — the exact
+  information-shares + panel-VECM estimation twice on the SAME frames, masked vs unmasked,
+  everything else fixed, with a verdict line separating "the halts were the headline" from "the
+  sample revision did it." Detects masked-at-rest input and refuses (exit 2) rather than
+  printing an A/A and calling it an A/B.
+* **The default sample is now the revised universe the analysis actually ran** — which also
+  fixes both defects the old default carried: 2026-01-19 (MLK) is out, and the one
+  weekday-mismatched pair (2025-01-07 Tue vs 2024-01-29 Mon) is replaced by 2025-01-27 Mon vs
+  2024-01-29 Mon (364 d), with 2025-08-01 / 2024-08-09 as the new tenth pair.
+  `validate_sample.py` passes the list clean; `SAMPLE_UNIVERSE.md` regenerated.
+
 ## v0.9.56 -- the DCC column by default, and the artifact flag that could never fire
 
 Asked whether `--with-dcc` should be the default. Checking the trigger answered more than the

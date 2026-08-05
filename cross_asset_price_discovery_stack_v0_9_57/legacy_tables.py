@@ -48,9 +48,16 @@ def _stack_returns_ofi(sessions, n_levels):
         r_s = np.diff(_log_mid(df, "SPY")); r_e = np.diff(_log_mid(df, "ES"))
         ofi = np.asarray(cap.order_flow_imbalance(df, "ES", n_levels), float)[1:]
         n = min(len(r_s), len(r_e), len(ofi))
-        if n < 5:
+        # finite rows only: halt-masked returns are NaN, and one NaN row through ols_naive_se /
+        # cluster_robust_ols turned the whole inference table's coef and both t's NaN on the
+        # 2026-08-05 masked run (while the wild-bootstrap p survived, which is worse than failing
+        # loudly). The regression is CONTEMPORANEOUS -- ret_t on OFI_t, no lag windows -- so
+        # dropping rows cannot splice anything.
+        okr = (np.isfinite(r_s[:n]) & np.isfinite(r_e[:n]) & np.isfinite(ofi[:n]))
+        if int(okr.sum()) < 5:
             continue
-        rs.append(r_s[:n]); re.append(r_e[:n]); of.append(ofi[:n]); day.append(np.full(n, i))
+        rs.append(r_s[:n][okr]); re.append(r_e[:n][okr]); of.append(ofi[:n][okr])
+        day.append(np.full(int(okr.sum()), i))
     return (np.concatenate(rs), np.concatenate(re), np.concatenate(of), np.concatenate(day))
 
 
@@ -61,13 +68,38 @@ def comovement_table(sessions):
         ms = _log_mid(df, "SPY"); me = _log_mid(df, "ES")
         rs = np.diff(ms); re = np.diff(me); n = min(len(rs), len(re))
         rs, re = rs[:n], re[:n]
-        if n > 5 and rs.std() > EPS and re.std() > EPS:
+        # pairwise-finite returns: with halt-masked frames rs.std() is NaN, `NaN > EPS` is False,
+        # and the four MWCB days silently VANISHED from this table on the 2026-08-05 masked run --
+        # a shrunken sample indistinguishable from a full one. Contemporaneous correlation, so the
+        # row drop cannot splice; the halt seconds simply contribute nothing.
+        okp = np.isfinite(rs) & np.isfinite(re)
+        rs, re = rs[okp], re[okp]
+        if len(rs) > 5 and rs.std() > EPS and re.std() > EPS:
             pear.append(float(np.corrcoef(rs, re)[0, 1]))
+        # HY per contiguous finite SEGMENT, summed. Compressing the NaN out and handing HY the
+        # kept timestamps would leave one interval SPANNING the halt on each leg -- and that
+        # single gap-return co-movement (a few hundred bp squared against ~1e-4 of daily RV)
+        # would dominate both the covariance and the variances, quietly pushing every MWCB day's
+        # HY correlation to ~1. Segment-wise accumulation excludes the cross-halt interval
+        # entirely, matching what the Pearson column's NaN diffs already do.
         t = np.arange(len(ms), dtype=float)
-        cov = nrc.hayashi_yoshida(t, ms, t, me)
-        rv1 = float(np.sum(np.diff(ms) ** 2)); rv2 = float(np.sum(np.diff(me) ** 2))
+        msa = np.asarray(ms, float); mea = np.asarray(me, float)
+        fin = np.isfinite(msa) & np.isfinite(mea)
+        cov = rv1 = rv2 = 0.0
+        j = 0
+        while j < len(fin):
+            if not fin[j]:
+                j += 1; continue
+            k = j
+            while k < len(fin) and fin[k]:
+                k += 1
+            if k - j > 5:
+                cov += float(nrc.hayashi_yoshida(t[j:k], msa[j:k], t[j:k], mea[j:k]))
+                rv1 += float(np.sum(np.diff(msa[j:k]) ** 2))
+                rv2 += float(np.sum(np.diff(mea[j:k]) ** 2))
+            j = k
         if rv1 > EPS and rv2 > EPS:
-            hy.append(float(cov) / np.sqrt(rv1 * rv2))
+            hy.append(cov / np.sqrt(rv1 * rv2))
     return pd.DataFrame({"legacy (Pearson)": [float(np.nanmean(pear))],
                          "upgraded (Hayashi-Yoshida)": [float(np.nanmean(hy))]},
                         index=["mean SPY/ES return corr"])
@@ -124,10 +156,27 @@ def identification_table(sessions):
     U = np.vstack(U); lab = np.array(lab)
     res = rig.rigobon_identify(U, lab, calm=uniq[0], stress=uniq[-1], names=["ES", "SPY"])
     cf, rg = res["contemp_cholesky_fwd"], res["contemp_rigobon"]
+    # IDENTIFICATION STRENGTH IN THE TABLE, not in a docstring. Het-ID pins A down only when the
+    # regimes differ in RELATIVE heteroskedasticity; when both legs' variances scale up together
+    # under stress (the usual case for a ~0.93-correlated pair), M = Omega_v Omega_b^{-1} is near
+    # cI, its eigenvalues nearly coincide, and the eigenvectors -- hence the signs and magnitudes
+    # of the "identified" matrix -- are numerical noise. The 2026-08-05 run printed SPY<-ES = -0.33
+    # / ES<-SPY = +1.01 (against every other estimator AND its own previous run) with nothing in
+    # the output saying whether the rotation was identified at all; the previous run's "Rigobon
+    # validates the recursive ordering" carried the same silence. The verdict row makes both
+    # readable: when it says 'no', neither run's Rigobon numbers mean anything -- do not quote.
+    cov = rig.regime_residual_cov(U, lab)
+    diag = rig.identification_diagnostic(cov, names=["ES", "SPY"])
+    verdict = "yes" if diag["identified"] else "NO -- do not quote the het-ID column"
     return pd.DataFrame(
-        {"legacy (Cholesky, futures 1st)": [cf.loc["SPY", "ES"], cf.loc["ES", "SPY"]],
-         "upgraded (Rigobon het-ID)": [rg.loc["SPY", "ES"], rg.loc["ES", "SPY"]]},
-        index=["SPY <- ES (contemp)", "ES <- SPY (contemp)"])
+        {"legacy (Cholesky, futures 1st)": [cf.loc["SPY", "ES"], cf.loc["ES", "SPY"],
+                                            np.nan, np.nan, ""],
+         "upgraded (Rigobon het-ID)": [rg.loc["SPY", "ES"], rg.loc["ES", "SPY"],
+                                       diag["var_ratio_spread"], res["eig_separation"], verdict]},
+        index=["SPY <- ES (contemp)", "ES <- SPY (contemp)",
+               "var-ratio spread (max/min - 1; ~0 = common-scale, unidentified)",
+               "eigenvalue separation (identification strength)",
+               "identified (relative het present)"])
 
 
 # ── assembler ─────────────────────────────────────────────────────────────────

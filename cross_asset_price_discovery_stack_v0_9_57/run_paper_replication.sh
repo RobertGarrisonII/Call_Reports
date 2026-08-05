@@ -133,8 +133,13 @@ QC_ACTION="warn"      # warn | drop | raise -- what to do with a session whose b
 # on an abbreviated session), and it extracted to `median SPY=nan ES=6913.75`.
 #
 # Pass --paper-sample to restore the published 2014-2017 universe verbatim.
-VOLATILE="2024-12-18,2026-06-05,2025-10-10,2024-09-03,2025-04-03,2024-08-05,2024-07-24,2025-01-07,2023-03-09,2026-01-19"
-BASELINE="2023-12-20,2025-06-13,2024-10-18,2023-09-05,2024-04-04,2023-08-07,2023-07-19,2024-01-29,2022-03-24,2025-01-13"
+# Revised 2026-08-05 (v0.9.57) to the universe the first full analysis actually ran, which also
+# fixes both defects the old default carried: 2026-01-19 (MLK -- NYSE closed, one-legged frame)
+# is gone, and the one weekday-mismatched pair (2025-01-07 Tue vs 2024-01-29 Mon) is replaced by
+# 2025-01-27 Mon vs 2024-01-29 Mon (364 d). New pair: 2025-08-01 Fri vs 2024-08-09 Fri (357 d).
+# validate_sample.py passes this list clean: all pairs same weekday, 350-371 d apart.
+VOLATILE="2024-12-18,2026-06-05,2025-10-10,2024-09-03,2025-04-03,2024-08-05,2024-07-24,2025-01-27,2023-03-09,2025-08-01"
+BASELINE="2023-12-20,2025-06-13,2024-10-18,2023-09-05,2024-04-04,2023-08-07,2023-07-19,2024-01-29,2022-03-24,2024-08-09"
 MWCB="2020-03-09,2020-03-12,2020-03-16,2020-03-18"
 # the published sample, Appendix Table A.1 (--paper-sample)
 PAPER_VOLATILE="2015-03-18,2015-10-02,2016-01-08,2016-01-27,2016-06-24,2015-08-21,2015-08-24,2015-09-01,2016-01-13,2016-01-20"
@@ -333,6 +338,7 @@ if have_stage 1; then
            test_analysis_inconsistencies.py \
            test_roll_at_extraction.py \
            test_fine_grid_stage.py \
+           test_masked_run_casualties.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi

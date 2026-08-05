@@ -161,12 +161,22 @@ def cross_impact_panel(sessions, assets=("SPY", "ES"), n_levels=10, hac_lags=10,
                                  min_rest_steps=min_rest_steps)
         for a in range(len(assets)):
             for b in range(len(assets)):
+                # the drop-one leverage diagnostic ships IN the panel: a surprising cell (the
+                # 2024-08-05 ES<-SPY = 0.40 is the live case) is checkable from the table itself
+                # -- lambda_drop1 far from lambda, or drop1_flag True, says one co-movement
+                # observation carries the estimate. drop1_flag is per-DAY (any cell moved by more
+                # than its SE and half its size), so it repeats across the day's four rows.
                 rows.append({"date": str(date), "regime": regime,
                              "return": assets[a], "ofi": assets[b],
                              "type": "own" if a == b else "cross",
-                             "lambda": ci["Lambda"][a, b], "t": ci["t"][a, b]})
+                             "lambda": ci["Lambda"][a, b], "t": ci["t"][a, b],
+                             "lambda_drop1": ci["Lambda_drop1"][a, b],
+                             "drop1_flag": bool(ci["drop1_flag"])})
     panel = pd.DataFrame(rows)
     summary = panel.groupby(["regime", "type"])["lambda"].agg(["mean", "std", "count"])
+    if bool(panel["drop1_flag"].any()):
+        flagged = sorted(panel.loc[panel["drop1_flag"], "date"].unique())
+        summary.attrs["drop1_flagged_dates"] = flagged
     return panel, summary
 
 

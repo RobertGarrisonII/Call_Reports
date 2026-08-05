@@ -40,7 +40,14 @@ def local_projection(y, shock, controls=None, state=None, horizons=range(0, 16),
     """Cumulative LP IRF of price (cumsum of return y) to a unit `shock`.
     If `state` given, returns the IRF at s_lo / s_hi (standardized state)."""
     y = np.asarray(y, float); shock = np.asarray(shock, float); T = len(y)
-    cumy = np.concatenate([[0.0], np.cumsum(y)])             # response_h(t)=cumy[t+h+1]-cumy[t]
+    # Halt-masked returns are NaN, and np.cumsum propagates the FIRST NaN to every later element --
+    # so one early halt (2020-03-09: 09:34) turned every cumulative response of the day NaN and the
+    # whole LP table came back empty (the 2026-08-05 masked run). nancumsum keeps the running sum
+    # finite; the gap-count prefix sum then invalidates exactly the response windows that SPAN a
+    # masked return -- a window across the halt is undefined (not zero, which is what nancumsum
+    # alone would silently say), while windows entirely before or after stay estimable.
+    cumy = np.concatenate([[0.0], np.nancumsum(y)])          # response_h(t)=cumy[t+h+1]-cumy[t]
+    ngap = np.concatenate([[0], np.cumsum(~np.isfinite(y))])
     s = None if state is None else (np.asarray(state, float) - np.nanmean(state)) / (np.nanstd(state) + EPS)
     rng = np.random.default_rng(seed); rows = []
     def _nan_row(h):
@@ -59,7 +66,8 @@ def local_projection(y, shock, controls=None, state=None, horizons=range(0, 16),
         if controls is not None:
             cols.append(np.asarray(controls)[t])
         X = np.column_stack(cols)
-        ok = np.all(np.isfinite(X), axis=1) & np.isfinite(Yh)
+        spans_gap = (ngap[t + h + 1] - ngap[t]) > 0          # response window crosses the halt
+        ok = np.all(np.isfinite(X), axis=1) & np.isfinite(Yh) & ~spans_gap
         Xh, Yhh = X[ok], Yh[ok]; m = Xh.shape[0]; ncol = Xh.shape[1]
         if m < ncol + 2:                                     # too few finite obs at this horizon
             rows.append(_nan_row(h)); continue

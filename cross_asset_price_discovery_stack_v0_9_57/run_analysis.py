@@ -281,8 +281,14 @@ def load_sessions(args):
         LOG.info("Loaded %d session(s) from %s", len(raw), args.pickle)
         sessions = _attach_regimes(raw, args.volatile)
         sessions = _resample_to_interval(sessions, args.interval)        # honor --interval on loaded frames
-        return _mask_halt_rows(_align_books(sessions, enabled=not args.no_align_books),
-                               enabled=not getattr(args, "no_halt_mask", False))
+        aligned = _align_books(sessions, enabled=not args.no_align_books)
+        # Keep the PRE-MASK frames for --save-frames. Saving the masked list (v0.9.51-56 behaviour)
+        # baked the NaN into the artifact: a later --no-halt-mask diagnosis on such a pickle was a
+        # silent no-op, and the halt-mask A/B (ab_halt_mask.py) became impossible from the very
+        # file a run hands its successor. Masking is cheap and re-applied on every load; the frames
+        # at rest should be the data, not one estimation policy applied to it.
+        args._premask_sessions = aligned
+        return _mask_halt_rows(aligned, enabled=not getattr(args, "no_halt_mask", False))
     if args.source == "extract":
         import mstbook_loader as ml          # CLI path: mstbook-query + mstwx-lakequery (no SQL/Athena)
         extract_dates = _extraction_universe(args)
@@ -315,8 +321,9 @@ def load_sessions(args):
         # the results rather than left in the scrollback of a multi-hour log.
         if rep.get("failed") or rep.get("degraded"):
             _write_extract_report(rep, args)
-        return _mask_halt_rows(_align_books(sessions, enabled=not args.no_align_books),
-                               enabled=not getattr(args, "no_halt_mask", False))
+        aligned = _align_books(sessions, enabled=not args.no_align_books)
+        args._premask_sessions = aligned                    # pre-mask frames for --save-frames
+        return _mask_halt_rows(aligned, enabled=not getattr(args, "no_halt_mask", False))
     raise ValueError(args.source)
 
 
@@ -863,10 +870,13 @@ def run_stages(sessions, args, ts=None, t0=None):
     # 85 minutes of extraction with nothing downstream able to start.
     if args.save_frames and sessions:
         fpath = os.path.join(run_dir, f"frames_{args.interval}.pkl")
+        # PRE-MASK frames when available: the artifact must be the data, not this run's masking
+        # policy baked in as NaN (which made --no-halt-mask a silent no-op on reloaded frames).
+        to_save = getattr(args, "_premask_sessions", None) or sessions
         with open(fpath, "wb") as fh:
-            pickle.dump([(str(d), r, f) for d, r, f in sessions], fh, protocol=4)
-        LOG.info("Session frames -> %s  (%d session(s), the List[(date, regime, df)] shape "
-                 "--source load expects)", fpath, len(sessions))
+            pickle.dump([(str(d), r, f) for d, r, f in to_save], fh, protocol=4)
+        LOG.info("Session frames -> %s  (%d session(s), pre-mask, the List[(date, regime, df)] "
+                 "shape --source load expects)", fpath, len(to_save))
 
     # the resulting tables — one CSV per analysis output
     table_files = export_tables(results, tables_dir)

@@ -145,21 +145,33 @@ def lee_mykland(r, K=None, alpha=0.01):
     if n < K + 2:
         return {"L": np.full(n, np.nan), "jump_idx": np.array([], int),
                 "jump_sign": np.array([], int), "threshold": np.inf, "n_jumps": 0, "K": K}
-    prod = np.abs(r[:-1]) * np.abs(r[1:])                  # |r_{j}||r_{j+1}|
-    csum = np.concatenate([[0.0], np.cumsum(prod)])        # len n
+    # NaN-robust trailing bipower. Halt-masked returns are NaN; the old cumsum carried the first
+    # NaN through every later local-vol window, so sigma_hat was NaN for the rest of the day, every
+    # comparison |L| > thr came back False, and a CRASH day reported zero jumps (the 2026-08-05
+    # masked run: 2020-03-09, n_cojump = 0 while the per-day split -- which runs on gap-free VECM
+    # residuals -- found 24). Sum only the finite bipower products and count them per window; a NaN
+    # return can never itself be a jump (L stays NaN there), and right after the reopen the window
+    # is required to hold at least max(4, K//4) finite products before sigma_hat is trusted --
+    # local vol from a handful of post-reopen bars would otherwise manufacture spurious jumps.
+    prod = np.abs(r[:-1]) * np.abs(r[1:])                  # |r_{j}||r_{j+1}| (NaN where either is)
+    pfin = np.isfinite(prod)
+    csum = np.concatenate([[0.0], np.cumsum(np.where(pfin, prod, 0.0))])   # len n
+    ccnt = np.concatenate([[0], np.cumsum(pfin)])
     hi = np.arange(n)                                      # use products strictly before i
     lo = np.maximum(0, hi - K)
     s = csum[np.minimum(hi, n - 1)] - csum[lo]
-    cnt = np.minimum(hi, n - 1) - lo
-    sig2 = s / np.maximum(cnt - 2, 1)                      # ~ (1/(K-2)) sum |r||r|  ~ mu1^2 sigma^2 dt
+    cnt = ccnt[np.minimum(hi, n - 1)] - ccnt[lo]
     with np.errstate(invalid="ignore", divide="ignore"):
+        sig2 = s / np.maximum(cnt - 2, 1)                  # ~ (1/(K-2)) sum |r||r|  ~ mu1^2 sigma^2 dt
+        sig2 = np.where(cnt >= max(4, K // 4), sig2, np.nan)
         L = r / np.sqrt(sig2)
     L[:K] = np.nan
-    ln = math.log(n); a2 = math.sqrt(2.0 * ln)
+    n_eff = int(np.isfinite(r).sum())                      # Gumbel scaling on the tested count
+    ln = math.log(max(n_eff, 3)); a2 = math.sqrt(2.0 * ln)
     Cn = a2 / MU1 - (math.log(math.pi) + math.log(ln)) / (2.0 * MU1 * a2)
     Sn = 1.0 / (MU1 * a2)
     thr = Cn + Sn * (-math.log(-math.log(1.0 - alpha)))    # Gumbel quantile
-    jmask = np.abs(L) > thr
+    jmask = np.where(np.isfinite(L), np.abs(L) > thr, False)
     idx = np.where(jmask)[0]
     return {"L": L, "jump_idx": idx, "jump_sign": np.sign(r[idx]).astype(int),
             "threshold": float(thr), "n_jumps": int(idx.size), "K": K}
