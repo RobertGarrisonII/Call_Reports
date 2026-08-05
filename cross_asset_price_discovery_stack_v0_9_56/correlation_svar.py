@@ -446,6 +446,22 @@ def lag_diagnosis(p, corr_window, pmax, corr_method="rolling", tol=1) -> dict:
                      "it, because it keeps the rolling window." % (int(p), int(corr_window)))
     if pmax and int(p) >= int(pmax):
         rep["at_boundary"] = True
+        if corr_window and int(corr_window) > int(pmax):
+            # The artifact's REALISTIC form. p* == corr_window can only fire when the search can
+            # reach the window -- but with the defaults (pmax=12, corr_window=100) it never can,
+            # so gating the DCC remedy on that equality made the escape hatch unreachable in
+            # exactly the configuration everyone runs. A boundary hit with the window's spike
+            # sitting beyond the search IS the window artifact, observed from below: the
+            # criterion climbs to its own edge walking toward lag W (the 2026-08-04 run: p=12=
+            # pmax, BIC still falling monotonically). Flag it as such, not merely as a bound.
+            rep["window_artifact"] = True
+            lines.append("SELECTED LAG p=%d IS THE SEARCH BOUND (pmax=%d) WITH corr_window=%d "
+                         "BEYOND IT -- the window artifact seen from below. d(rolling correlation) "
+                         "puts an MA spike at exactly lag %d; a search capped at %d cannot reach "
+                         "it, so the criterion improves all the way to its own edge. Raising pmax "
+                         "walks toward the window, not toward the truth. Quote the DCC column, "
+                         "whose recursive conditional correlation has no box to difference."
+                         % (int(p), int(pmax), int(corr_window), int(corr_window), int(pmax)))
         lines.append("SELECTED LAG p=%d IS THE SEARCH BOUND (pmax=%d), so the criterion was still "
                      "improving where the search stopped -- a bound, not an optimum. If the "
                      "correlation window is %s, the induced spike sits at lag %s and any pmax below "

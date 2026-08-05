@@ -70,21 +70,31 @@ def _load(args):
     return out
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Table 9 on Pearson vs Hayashi-Yoshida d-correlation")
+def build_parser():
+    """Public so the default surface is testable -- v0.9.56 flipped --with-dcc to DEFAULT ON, and
+    a silent regression of that default would resurrect the unreachable-escape-hatch bug."""
+    ap = argparse.ArgumentParser(description="Table 9 on Pearson, Hayashi-Yoshida and DCC d-correlation")
     ap.add_argument("--source", choices=["demo", "load"], default="demo")
     ap.add_argument("--pickle", default="", help="glob for a List[(date[,regime],df)] pickle")
     ap.add_argument("--volatile", default="", help="comma-separated YYYY-MM-DD marked volatile")
     ap.add_argument("--spec", default="informational", help="standard | weighted | informational")
     ap.add_argument("--corr-window", type=int, default=100,
                     help="bars in the correlation window (paper: 100)")
-    ap.add_argument("--with-dcc", action="store_true",
-                    help="add a third column using the DCC conditional correlation. Pearson and HY "
-                         "differ in how they treat asynchronicity but BOTH difference a fixed "
-                         "corr-window box, which puts an MA term at exactly lag W and makes the "
-                         "selected lag order track the window rather than the data "
-                         "(test_svar_lag_artifact.py). DCC is recursive, has no box, and is the "
-                         "column to quote when the lag caution fires.")
+    # DEFAULT ON since v0.9.56. It was opt-in, auto-triggered by STAGE 4c only when the selected
+    # lag EQUALLED corr_window -- a condition the default configuration makes unreachable (a
+    # search capped at pmax=12 can never land on 100), so the remedy for an artifact that fires
+    # on every real run was gated behind a trigger that never could. The column costs one DCC fit
+    # per estimator block; --no-dcc opts out.
+    ap.add_argument("--with-dcc", dest="with_dcc", action="store_true", default=True,
+                    help="add a third column using the DCC conditional correlation (DEFAULT). "
+                         "Pearson and HY differ in how they treat asynchronicity but BOTH "
+                         "difference a fixed corr-window box, which puts an MA term at exactly "
+                         "lag W and makes the selected lag order track the window rather than "
+                         "the data (test_svar_lag_artifact.py). DCC is recursive, has no box, "
+                         "and is the column to quote when the lag caution fires.")
+    ap.add_argument("--no-dcc", dest="with_dcc", action="store_false",
+                    help="skip the DCC column (saves one DCC fit per estimator block; the lag "
+                         "caution then has no lag-robust column to point at)")
     ap.add_argument("--n-lags", default="6",
                     help="fixed integer, or an information criterion: bic | aic | hq. "
                          "A criterion is resolved ONCE on the pooled SVAR frame and the chosen "
@@ -103,7 +113,11 @@ def main(argv=None):
     ap.add_argument("--n-demo-bars", type=int, default=6000)
     ap.add_argument("--demo-refresh", type=float, default=0.3,
                     help="demo only: per-bar quote refresh probability (1.0 = synchronous)")
-    a = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
     warnings.simplefilter("ignore")
 
     sessions = _load(a)

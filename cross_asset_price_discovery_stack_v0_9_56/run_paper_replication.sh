@@ -30,8 +30,10 @@
 #
 #   4. Delta-rho is a grid-sampled Pearson correlation, which the Epps effect
 #      attenuates -- by an amount that depends on trading intensity, itself a
-#      regressor in Eq. (5). STAGE 5 reports Table 9 on both that and the
-#      Hayashi-Yoshida correlation, with the difference as the artifact estimate.
+#      regressor in Eq. (5). STAGE 5 reports Table 9 on that, on the
+#      Hayashi-Yoshida correlation (Epps-robust, difference = artifact estimate),
+#      and on the DCC conditional correlation (lag-robust: both rolling measures
+#      difference a fixed W-bar box, which puts an MA spike at exactly lag W).
 #
 #   5. The SVAR lag length was a stated compromise, not a choice: footnote 17
 #      records AIC pointing at 60 lags and 6 being used because the full model
@@ -102,7 +104,10 @@ CORR_WINDOW=100
 N_LAGS="bic"          # integer, or an information criterion: bic | aic | hq
 PMAX=12
 N_LAGS_INT=""        # resolved integer, filled in by STAGE 4c
-T9_DCC=""            # "--with-dcc", set by STAGE 4c if the lag order tracks the corr window
+# (the old T9_DCC escape hatch is gone: run_table9_both_ways includes the DCC column BY DEFAULT
+# since v0.9.56 -- the auto-trigger required p* == corr_window, which a search capped at pmax=12
+# can never produce against a 100-bar window, so the remedy was gated behind an unreachable
+# condition. --no-dcc on run_table9_both_ways opts back out.)
 STAGES="0,1,2,3,4,5,6,7"
 DRY=0
 QUICK=0
@@ -758,15 +763,16 @@ EOF
             N_LAGS_INT=1
           fi
           if [ "$LAG_ART" = "1" ]; then
-            info "WARNING: p EQUALS --corr-window (${CORR_WINDOW}). That is an artifact, not a"
-            info "finding: dCorr is the difference of a ${CORR_WINDOW}-bar rolling correlation, so it"
-            info "carries an MA term at exactly lag ${CORR_WINDOW} and the criterion is locating it."
-            info "On simulated data with a CONSTANT correlation and iid liquidity this reproduces"
-            info "exactly (test_svar_lag_artifact.py). Re-run STAGE 5 with --with-dcc: the DCC"
-            info "conditional correlation has no fixed-width box to difference and returns p*~1 on"
-            info "that same data. NOTE that 'both ways' does NOT fix this on its own -- Pearson and"
-            info "HY differ on asynchronicity but both difference the same ${CORR_WINDOW}-bar box."
-            T9_DCC="--with-dcc"
+            info "WARNING: the selected lag TRACKS --corr-window (${CORR_WINDOW}) -- either p equals"
+            info "the window, or p sits at the search bound with the window's MA spike beyond it"
+            info "(the realistic form: dCorr is the difference of a ${CORR_WINDOW}-bar rolling"
+            info "correlation, so the spike is at lag ${CORR_WINDOW} exactly, and a bounded search"
+            info "climbs to its own edge walking toward it; test_svar_lag_artifact.py reproduces"
+            info "p*=W on constant-correlation data). QUOTE THE DCC COLUMN in Table 9 -- STAGE 5"
+            info "estimates it by default since v0.9.56: the DCC conditional correlation is"
+            info "recursive, has no fixed-width box to difference, and returns p*~1 on that same"
+            info "data. 'Both ways' alone does NOT fix this -- Pearson and HY differ on"
+            info "asynchronicity but both difference the same ${CORR_WINDOW}-bar box."
           fi
           if [ "$LAG_EDGE" = "1" ] || { [ "$N_LAGS_INT" -ge "$PMAX" ] 2>/dev/null; }; then
             info "WARNING: p == pmax, so the criterion is still improving at the edge of the search."
@@ -784,16 +790,16 @@ EOF
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 5 — Table 9 both ways, at both aggregations
+# STAGE 5 — Table 9 three ways, at both aggregations
 #
 # Attenuation grows as the bar shrinks, so the ten-millisecond specification is
 # where the Pearson/HY gap should be largest.
 # ══════════════════════════════════════════════════════════════════════════════
 if have_stage 5; then
-  say "STAGE 5  Table 9 on Pearson AND Hayashi-Yoshida d-correlation"
+  say "STAGE 5  Table 9 three ways: Pearson, Hayashi-Yoshida, and DCC d-correlation"
+  # The DCC column is run_table9_both_ways' DEFAULT (v0.9.56): the two rolling measures share the
+  # corr-window MA artifact, and DCC is the lag-robust column the 4c caution points at.
   T9ARGS="--spec informational --n-lags ${N_LAGS} --pmax ${PMAX} --n-boot ${N_BOOT} --out-dir ${OUT}"
-  # set by STAGE 4c when the selected lag turned out to equal the correlation window
-  [ -n "${T9_DCC:-}" ] && T9ARGS="$T9ARGS ${T9_DCC}"
   [ -n "$NJ" ] && T9ARGS="$T9ARGS --n-jobs $NJ"
   if [ "$SOURCE" = "demo" ]; then
     # shellcheck disable=SC2086

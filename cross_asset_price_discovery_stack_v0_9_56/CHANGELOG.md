@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.9.56 -- the DCC column by default, and the artifact flag that could never fire
+
+Asked whether `--with-dcc` should be the default. Checking the trigger answered more than the
+question: **the automatic escape hatch was unreachable in the shipped configuration.** STAGE 4c
+set `--with-dcc` only when `lag_diagnosis` reported `window_artifact`, and that fired only when
+the selected lag EQUALLED `corr_window` — but a search capped at `pmax=12` can never land on a
+100-bar window. The case that actually happens (the 2026-08-04 run: p = 12 = pmax, BIC still
+falling monotonically — the window's MA spike observed from below) produced only a boundary note
+and a manual "re-run STAGE 5 with --with-dcc" instruction. The remedy for an artifact that fires
+on every real run was gated behind a condition the defaults made impossible.
+
+* **`run_table9_both_ways`: the DCC column is now DEFAULT ON** (`--no-dcc` opts out; the old
+  `--with-dcc` still parses as a no-op). Table 9 always ships three dependent-variable
+  constructions side by side: rolling Pearson (the paper's spec), rolling Hayashi–Yoshida
+  (Epps-robust; the Pearson gap is the artifact estimate), and the DCC conditional correlation —
+  the lag-robust column, since both rolling measures difference the same fixed W-bar box (MA
+  spike at exactly lag W) while the DCC recursion has no box and returns p*≈1 on
+  constant-correlation data. Caveat carried with it: DCC is model-filtered and inherits the GARCH
+  fit's pathologies (the near-integrated persistence found on 2026-08-05); read it beside
+  `run_dcc`'s realized-correlation cross-check. The parser moved to a public `build_parser()` so
+  the default surface is pinned by test.
+* **`lag_diagnosis`: a boundary hit with the window beyond the search is now flagged as the
+  window artifact** (`p* == pmax < corr_window` ⇒ `window_artifact=True`, with text naming the
+  spike's location and the DCC remedy), not merely as a bound. Precision preserved: a boundary
+  hit with the window INSIDE the search (the criterion could have reached lag W and chose the
+  bound instead) stays boundary-only — that is a different problem and is not blamed on the
+  window.
+* **Driver**: the `T9_DCC` plumbing is gone (nothing to trigger — the column is always there);
+  STAGE 5's banner reads "Table 9 three ways"; 4c's artifact warning now covers both forms of
+  the artifact and says "quote the DCC column" instead of prescribing a manual re-run.
+
+Pinned in `test_svar_lag_artifact.py` (now 6 checks): p*=12=pmax under a 100-bar window flags as
+the artifact seen from below with the DCC remedy named; window-inside-the-search stays
+boundary-only; `--with-dcc` defaults ON, `--no-dcc` opts out, the old flag still parses. A bare
+default demo run prints the Pearson / HY / DCC / Delta table.
+
 ## v0.9.55 -- the 10ms second grid, wired in and curated
 
 The driver half-expected a fine grid for four releases: `FINE_INTERVAL` was declared and STAGE 5

@@ -142,6 +142,37 @@ def check_the_estimator_warns():
     return ok
 
 
+def check_boundary_below_the_window_is_the_artifact():
+    """v0.9.56: the artifact's REALISTIC form is flagged, and the remedy is on by default.
+
+    The old trigger required p* == corr_window exactly -- but with the shipped defaults
+    (pmax=12, corr_window=100) a bounded search can never land on the window, so the one
+    configuration everyone runs could never fire the flag: the 2026-08-04 run hit p=12=pmax with
+    BIC still falling (the spike observed from below) and got only a boundary note plus a manual
+    're-run with --with-dcc' instruction. Two fixes, both pinned here: a boundary hit with the
+    window beyond the search is now flagged as the window artifact, and the DCC column no longer
+    needs a trigger at all because run_table9_both_ways estimates it BY DEFAULT."""
+    below = cs.lag_diagnosis(12, corr_window=100, pmax=12, corr_method="rolling")
+    fires = below["window_artifact"] and below["at_boundary"]
+    says = "BEYOND" in below["text"] and "DCC" in below["text"]
+    # precision: a boundary hit with the window INSIDE the search is NOT the window artifact --
+    # the criterion could have reached lag W=20 and chose the bound instead, a different problem
+    inside = cs.lag_diagnosis(40, corr_window=20, pmax=40, corr_method="rolling")
+    precise = inside["at_boundary"] and not inside["window_artifact"]
+    import run_table9_both_ways as t9
+    ap = t9.build_parser()
+    on = ap.parse_args([]).with_dcc is True
+    off = ap.parse_args(["--no-dcc"]).with_dcc is False
+    compat = ap.parse_args(["--with-dcc"]).with_dcc is True     # old flag still accepted
+    ok = fires and says and precise and on and off and compat
+    print("(6) p*=12=pmax under corr_window=100 is flagged as the window artifact seen from below "
+          "(%s) and the text names the DCC remedy (%s); a boundary with the window inside the "
+          "search stays boundary-only (%s)" % (fires, says, precise))
+    print("    run_table9_both_ways: --with-dcc defaults ON (%s), --no-dcc opts out (%s), the old "
+          "flag still parses (%s) : %s" % (on, off, compat, ok))
+    return ok
+
+
 def check_vecm_is_not_the_alternative():
     """The Table 9 variables are stationary, so there is nothing to cointegrate -- and the VECM
     the price system DOES need is already in the stack, on the right object."""
@@ -166,6 +197,7 @@ def check_vecm_is_not_the_alternative():
 def main():
     checks = [check_lag_equals_the_window, check_dcc_does_not_do_this,
               check_large_window_collapses_instead, check_the_estimator_warns,
+              check_boundary_below_the_window_is_the_artifact,
               check_vecm_is_not_the_alternative]
     res = []
     for fn in checks:
