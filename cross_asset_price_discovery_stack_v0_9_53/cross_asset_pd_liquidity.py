@@ -148,12 +148,13 @@ def liquidity_conditional_vecm(mid_spy, mid_es, state, n_lags=5,
     """
     p1 = np.log(np.asarray(mid_spy, float)); p2 = np.log(np.asarray(mid_es, float))
     s = np.asarray(state, float)
-    ok = np.isfinite(p1) & np.isfinite(p2) & np.isfinite(s)
-    p1, p2, s = p1[ok], p2[ok], s[ok]
+    # no NaN compression: compressing (p1, p2, s) before differencing splices the last pre-halt
+    # price to the reopen price -- the halt gap becomes one pseudo-return in exactly the estimator
+    # the masking was built for. Diff on the raw grid; drop non-finite ROWS of the design instead.
     if criterion is not None:
         n_lags, _ = pds.select_lag(p1, p2, pmax=pmax, criterion=criterion)
-    s = (s - s.mean()) / (s.std() + EPS)
-    z = (p1 - p2); z = z - z.mean()
+    s = (s - np.nanmean(s)) / (np.nanstd(s) + EPS)
+    z = (p1 - p2); z = z - np.nanmean(z)
     dp1 = np.diff(p1); dp2 = np.diff(p2); T = len(dp1)
     ec = z[n_lags:T]; sc = s[n_lags:T]
     cols = [np.ones(T - n_lags), ec, ec * sc]
@@ -161,19 +162,21 @@ def liquidity_conditional_vecm(mid_spy, mid_es, state, n_lags=5,
         cols.append(dp1[n_lags - L:T - L]); cols.append(dp2[n_lags - L:T - L])
     X = np.column_stack(cols)
     dY = np.column_stack([dp1[n_lags:T], dp2[n_lags:T]])
+    ok = np.all(np.isfinite(dY), axis=1) & np.all(np.isfinite(X), axis=1)
+    dY, X = dY[ok], X[ok]
     B, resid = pds._ols(dY, X)
     alpha = B[1, :].copy(); delta = B[2, :].copy()
     Omega = np.cov(resid, rowvar=False, bias=True)
     XtXinv = np.linalg.inv(X.T @ X)
     t_delta = [delta[k] / (np.sqrt((resid[:, k] ** 2).mean() * XtXinv[2, 2]) + EPS) for k in range(2)]
 
-    sq = {q: float(np.quantile(s, q)) for q in quantiles}
+    sq = {q: float(np.nanquantile(s, q)) for q in quantiles}   # s carries NaN in masked windows
     by_state = {}
     for q, sv in sq.items():
         a = alpha + delta * sv
         _, _, ismid = pds.hasbrouck_is(a, Omega); cs = pds.gonzalo_granger(a)
         by_state[q] = {f"CS_{names[1]}": cs[1], f"IS_mid_{names[1]}": ismid[1], "s_value": sv}
-    return {"alpha": alpha, "delta": delta,
+    return {"alpha": alpha, "delta": delta, "n_obs": int(dY.shape[0]),
             "t_delta_spy": t_delta[0], "t_delta_es": t_delta[1],
             "shares_by_state": by_state}
 

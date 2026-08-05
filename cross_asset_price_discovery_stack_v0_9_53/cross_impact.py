@@ -51,7 +51,30 @@ def impact_regression(R, O, hac_lags=10):
         R2[a] = 1.0 - np.sum(u ** 2) / (ss + EPS)
     with np.errstate(divide="ignore", invalid="ignore"):
         tstat = Lam / np.where(SE > EPS, SE, np.nan)
-    return {"Lambda": Lam, "SE": SE, "t": tstat, "R2": R2}
+    # Single-observation sensitivity. High-frequency impact OLS is exposed to one colossal
+    # co-movement observation -- a halt-reopen seam, a flash print -- carrying a coefficient on its
+    # own: the 2026-08-05 run's 2020-days cross-impact reversal (ES<-SPY jumping from ~0 to ~0.3)
+    # is the motivating case, estimated halt-included at the time. Refit with the single largest
+    # |OFI x return| co-movement removed; `drop1_frac` is the relative coefficient move. A material
+    # gap says one observation carries the estimate -- the number to check before interpreting any
+    # surprising cell, and it ships with the matrix rather than requiring a post-mortem.
+    infl = np.max(np.abs(O), axis=1) * np.max(np.abs(R), axis=1)
+    keep = np.ones(T, bool)
+    if T > 50:
+        keep[int(np.argmax(infl))] = False
+    Lam1 = np.zeros((K, K))
+    X1 = X[keep]
+    for a in range(K):
+        b1 = np.linalg.lstsq(X1, R[keep, a], rcond=None)[0]
+        Lam1[a, :] = b1[1:]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        drop1 = np.abs(Lam - Lam1) / np.where(np.abs(Lam) > EPS, np.abs(Lam), np.nan)
+    # flag only when the move is large RELATIVE TO THE COEFFICIENT *and* larger than its SE -- a
+    # true-zero cell moves by epsilon/epsilon otherwise and the relative measure alone cries wolf
+    move = np.abs(Lam - Lam1)
+    flag = bool(np.any((move > SE) & (move > 0.5 * np.abs(Lam)) & np.isfinite(SE)))
+    return {"Lambda": Lam, "SE": SE, "t": tstat, "R2": R2,
+            "Lambda_drop1": Lam1, "drop1_frac": drop1, "drop1_flag": flag}
 
 
 # ── Schneider-Lillo no-dynamic-arbitrage symmetry test ────────────────────────

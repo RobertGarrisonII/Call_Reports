@@ -335,7 +335,12 @@ def run_liquidity_curves(sessions, args):
 def run_information_shares(sessions, args):
     mids = rb._mid_sessions(sessions)
     per_day = pds.estimate_sample(mids, n_lags=args.n_lags)
+    _v = per_day["ec_valid"] if "ec_valid" in per_day.columns else pd.Series(True, index=per_day.index)
     res = {"per_day": per_day, "mean_CS_ES": float(per_day.CS_ES.mean()),
+           # the mean over days whose error correction actually points at the equilibrium; on
+           # ec_valid=False days CS is a quotient of same-signed alphas, not a share
+           "mean_CS_ES_ec_valid": float(per_day.loc[_v, "CS_ES"].mean()) if _v.any() else float("nan"),
+           "n_ec_invalid": int((~_v).sum()),
            "mean_IS_mid_ES": float(per_day.IS_mid_ES.mean())}
     if len({r for _, r, _ in sessions}) >= 2:
         try: res["regime_test"] = pds.compare_regimes(per_day, metric="CS_ES")
@@ -378,26 +383,66 @@ def run_cross_impact(sessions, args):
     return {"panel": panel, "regime_summary": summary}
 
 def run_dcc(sessions, args):
-    _, _, df = sessions[0]
-    r = np.column_stack([np.diff(np.log(ca._mid(df, "SPY"))), np.diff(np.log(ca._mid(df, "ES")))])
-    fit = dg.dcc_garch_x(r)
-    return {"dcc_a": float(fit["dcc_a"]), "dcc_b": float(fit["dcc_b"]),
-            "persistence": float(fit["dcc_a"] + fit["dcc_b"]), "mean_rho": float(np.mean(fit["rho"]))}
+    # ALL sessions, not sessions[0]. The 2026-08-05 headline (mean_rho 0.357 against a realized
+    # correlation of 0.82, persistence pinned at the boundary) was a single-session fit -- and the
+    # single session was 2020-03-09, a circuit-breaker day estimated halt-included at the time.
+    # Returns are differenced PER SESSION before stacking, so no overnight pseudo-return crosses a
+    # day boundary; the realized correlation of the same stacked returns is reported beside
+    # mean_rho so a 0.357-vs-0.82 divergence is visible in the output rather than in a post-mortem.
+    rs = []
+    for _d, _r, df in sessions:
+        r = np.column_stack([np.diff(np.log(ca._mid(df, "SPY"))), np.diff(np.log(ca._mid(df, "ES")))])
+        rs.append(r[np.all(np.isfinite(r), axis=1)])   # halt-masked rows drop; no splice (diff first)
+    R = np.vstack([x for x in rs if len(x)]) if rs else np.zeros((0, 2))
+    fit = dg.dcc_garch_x(R)
+    realized = float(np.corrcoef(R[:, 0], R[:, 1])[0, 1]) if len(R) > 10 else float("nan")
+    out = {"dcc_a": float(fit["dcc_a"]), "dcc_b": float(fit["dcc_b"]),
+           "persistence": float(fit["dcc_a"] + fit["dcc_b"]), "mean_rho": float(np.mean(fit["rho"])),
+           "realized_corr": realized, "n_sessions": len(rs)}
+    if np.isfinite(realized) and abs(out["mean_rho"] - realized) > 0.2:
+        out["warning"] = ("mean_rho differs from the realized correlation of the SAME returns by "
+                          "%.2f with persistence %.4f -- near-integrated recursion, path likely "
+                          "initialization-dominated; do not use rho_t as the comovement exhibit "
+                          "before investigating" % (abs(out["mean_rho"] - realized), out["persistence"]))
+    return out
 
 def run_irf(sessions, args):
-    _, _, df = sessions[0]
+    # sessions[0] is kept for the LP exhibit but NAMED now: the 2026-08-05 headline FEVD (ret_ES
+    # 30.6% "from SPY flow") was silently this single session, and sorted-first is 2020-03-09 -- a
+    # circuit-breaker day, halt-included at the time, whose cross-impact matrix (which identifies
+    # B; this FEVD is NOT Cholesky) carried the reopen seam as a leverage point. The headline FEVD
+    # is now the per-regime MEDIAN across sessions; the single-session matrix stays, labelled.
+    d0, _, df = sessions[0]
     fc = args._freq
     H = range(0, 6) if args.quick else fc["horizons"]            # frequency-scaled (quick caps for speed)
     nb = 60 if args.quick else 300
     lp = irfm.local_projection_irf(df, impulse="ES", response="SPY",
                                    state=ca.relative_depth_state(df, args.n_levels),
-                                   horizons=H, n_lags=args.n_lags, n_boot=nb,
-                                   block=fc["block"], min_rest_steps=fc["min_rest_steps"])
-    sv = irfm.structural_vecm_irf(df, horizons=H, n_lags=args.n_lags,
+                                   horizons=H, n_lags=args.n_lags, n_levels=args.n_levels,
+                                   n_boot=nb, block=fc["block"],
+                                   min_rest_steps=fc["min_rest_steps"])
+    sv = irfm.structural_vecm_irf(df, horizons=H, n_lags=args.n_lags, n_levels=args.n_levels,
                                   min_rest_steps=fc["min_rest_steps"])
-    fevd = irfm.fevd_from_irf(sv["return_irf"], H=max(H))
+    fevd0 = irfm.fevd_from_irf(sv["return_irf"], H=max(H))
+    per = {}
+    for _dd, rr, dfx in sessions:
+        try:
+            svx = irfm.structural_vecm_irf(dfx, horizons=H, n_lags=min(int(args.n_lags), 12),
+                                           n_levels=args.n_levels,
+                                           min_rest_steps=fc["min_rest_steps"])
+            per.setdefault(rr, []).append(irfm.fevd_from_irf(svx["return_irf"], H=max(H)))
+        except Exception:
+            continue
+    by_regime = {}
+    for rr, mats in per.items():
+        M = np.median(np.stack(mats), axis=0)
+        M = M / np.maximum(M.sum(axis=1, keepdims=True), 1e-12)   # rows re-sum to 1 after median
+        by_regime[rr] = pd.DataFrame(M, index=["ret_SPY", "ret_ES"], columns=["OFI_SPY", "OFI_ES"])
+    f0 = pd.DataFrame(fevd0, index=["ret_SPY", "ret_ES"], columns=["OFI_SPY", "OFI_ES"])
     return {"local_projection": lp,
-            "fevd": pd.DataFrame(fevd, index=["ret_SPY", "ret_ES"], columns=["OFI_SPY", "OFI_ES"])}
+            "fevd": by_regime.get("benchmark", f0),
+            "fevd_by_regime": by_regime,
+            "fevd_session0": f0, "fevd_session0_date": str(d0)}
 
 def run_robustness(sessions, args):
     out = {}

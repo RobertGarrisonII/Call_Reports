@@ -105,7 +105,10 @@ def select_lag(p1, p2, pmax=10, criterion="bic", pmin=0):
     ``table`` is a DataFrame indexed by p with logdet/aic/bic/hqic. p=0 means a pure error-correction
     model (no lagged differences); n_lags here is the VECM lag, one less than the levels-VAR order."""
     p1 = np.asarray(p1, float); p2 = np.asarray(p2, float)
-    ok = np.isfinite(p1) & np.isfinite(p2); p1, p2 = p1[ok], p2[ok]
+    # NaN (halt-masked rows) flows through to the design, whose finite-row mask drops the halt, the
+    # seam and the contaminated lag windows. Compressing here instead SPLICES the last pre-halt
+    # price to the reopen price -- the exact defect v0.9.51 removed from jump_robust, which had
+    # survived here and in three sibling call sites.
     rows = []
     for p in range(max(0, pmin), pmax + 1):
         dY, X = _design_within_day(p1, p2, p, start=pmax)
@@ -279,14 +282,22 @@ def estimate_day(mid_spy, mid_es, n_lags=5, names=("SPY", "ES"), use_log=True,
     the ``n_lags`` field."""
     f = np.log if use_log else (lambda x: np.asarray(x, float))
     p1, p2 = f(np.asarray(mid_spy, float)), f(np.asarray(mid_es, float))
-    ok = np.isfinite(p1) & np.isfinite(p2); p1, p2 = p1[ok], p2[ok]
+    # no NaN compression: the design's finite-row mask excludes the halt without splicing the seam
     if criterion is not None:
         n_lags, _ = select_lag(p1, p2, pmax=pmax, criterion=criterion)
-    alpha, Omega, _ = _fit_vecm_fixed(p1, p2, n_lags)
+    alpha, Omega, resid = _fit_vecm_fixed(p1, p2, n_lags)
     lo, hi, mid = hasbrouck_is(alpha, Omega)
     cs = gonzalo_granger(alpha); mis = lien_shrestha_is(alpha, Omega)
-    out = {"alpha_spy": alpha[0], "alpha_es": alpha[1], "n_obs": p1.shape[0] - n_lags,
-           "n_lags": int(n_lags)}
+    # ``ec_valid``: is the day's error correction pointed AT the equilibrium? With z = p1 - p2 the
+    # system corrects when kappa = alpha_ES - alpha_SPY > 0. Several calm sessions in the
+    # 2026-08-05 run have both alphas the same sign (e.g. 2023-08-07: +0.052/+0.111) -- both legs
+    # moving AWAY from the basis -- and the Gonzalo-Granger share, a ratio of those alphas, is then
+    # an arbitrary number that averages into "mean_CS_ES" as if it meant something. The flag does
+    # not delete the row; it lets the caller (and the reader of the per-day table) separate days
+    # where CS is a price-discovery share from days where it is a quotient of noise.
+    kappa = float(alpha[1] - alpha[0])
+    out = {"alpha_spy": alpha[0], "alpha_es": alpha[1], "n_obs": int(len(resid)),
+           "n_lags": int(n_lags), "kappa": kappa, "ec_valid": bool(kappa > 0)}
     for j, nm in enumerate(names):
         out.update({f"IS_lo_{nm}": lo[j], f"IS_hi_{nm}": hi[j], f"IS_mid_{nm}": mid[j],
                     f"MIS_{nm}": mis[j], f"CS_{nm}": cs[j]})
@@ -307,7 +318,7 @@ def estimate_sample(sessions, n_lags=5, names=("SPY", "ES"), criterion=None, pma
         pairs = []
         for _label, _regime, m_spy, m_es in sessions:
             a = f(np.asarray(m_spy, float)); b = f(np.asarray(m_es, float))
-            ok = np.isfinite(a) & np.isfinite(b); pairs.append((a[ok], b[ok]))
+            pairs.append((a, b))                 # NaN flows to the design mask; compression splices
         chosen, pooled_tab = select_lag_pooled(pairs, pmax=pmax, criterion=criterion)
     rows = []
     for label, regime, m_spy, m_es in sessions:
@@ -372,13 +383,12 @@ def panel_vecm(sessions, n_lags=5, names=("SPY", "ES"), criterion=None, pmax=10)
         pairs = []
         for _l, _r, m_spy, m_es in sessions:
             a = np.log(np.asarray(m_spy, float)); b = np.log(np.asarray(m_es, float))
-            ok = np.isfinite(a) & np.isfinite(b); pairs.append((a[ok], b[ok]))
+            pairs.append((a, b))                 # NaN flows to the design mask; compression splices
         n_lags, _ = select_lag_pooled(pairs, pmax=pmax, criterion=criterion)
     dYs, ECs, Ds, Ls, Gs = [], [], [], [], []
     for _gi, (label, regime, m_spy, m_es) in enumerate(sessions):
         p1 = np.log(np.asarray(m_spy, float)); p2 = np.log(np.asarray(m_es, float))
-        ok = np.isfinite(p1) & np.isfinite(p2); p1, p2 = p1[ok], p2[ok]
-        z = (p1 - p2); z = z - z.mean()                   # day FE on EC level
+        z = (p1 - p2); z = z - np.nanmean(z)              # day FE on EC level (NaN-aware)
         dp1 = np.diff(p1); dp2 = np.diff(p2); T = len(dp1)
         dYs.append(np.column_stack([dp1[n_lags:T], dp2[n_lags:T]]))
         ECs.append(z[n_lags:T])
@@ -386,8 +396,18 @@ def panel_vecm(sessions, n_lags=5, names=("SPY", "ES"), criterion=None, pmax=10)
         lag = [np.ones(T - n_lags)]
         for L in range(1, n_lags + 1):
             lag.append(dp1[n_lags - L:T - L]); lag.append(dp2[n_lags - L:T - L])
-        Ls.append(np.column_stack(lag))
-        Gs.append(np.full(T - n_lags, _gi))               # session id for day-clustered SEs
+        # finite rows only, PER SESSION and before stacking: halt-masked rows are NaN, and the
+        # inline design here does not go through _design_within_day's mask. Filtering after the
+        # lag columns are built drops the halt, the seam, and every lag window touching either.
+        _dYi = np.column_stack([dp1[n_lags:T], dp2[n_lags:T]])
+        _Li = np.column_stack(lag)
+        _oki = (np.all(np.isfinite(_dYi), axis=1) & np.isfinite(z[n_lags:T])
+                & np.all(np.isfinite(_Li), axis=1))
+        dYs[-1] = _dYi[_oki]
+        ECs[-1] = ECs[-1][_oki]
+        Ds[-1] = Ds[-1][_oki]
+        Ls.append(_Li[_oki])
+        Gs.append(np.full(int(_oki.sum()), _gi))          # session id for day-clustered SEs
     dY = np.vstack(dYs); ec = np.concatenate(ECs); D = np.concatenate(Ds); Lall = np.vstack(Ls)
     groups = np.concatenate(Gs)
     X = np.column_stack([ec, ec * D, Lall])               # [ z , z*D , const+lags ]
@@ -413,7 +433,7 @@ def panel_vecm(sessions, n_lags=5, names=("SPY", "ES"), criterion=None, pmax=10)
     pv = (lambda t: float(2.0 * _stats.t.sf(abs(t), df=G - 1))) if (G and G > 1) else (lambda t: float("nan"))
     ti_spy = alpha_int[0] / (se[0] + EPS); ti_es = alpha_int[1] / (se[1] + EPS)
     return {"alpha_benchmark": alpha_base, "alpha_volatile": alpha_vol,
-            "alpha_interaction": alpha_int, "n_lags": int(n_lags),
+            "alpha_interaction": alpha_int, "n_lags": int(n_lags), "n_obs": int(dY.shape[0]),
             "t_interaction_spy": ti_spy, "t_interaction_es": ti_es,
             "se_interaction_spy": se[0], "se_interaction_es": se[1],
             "p_interaction_spy": pv(ti_spy), "p_interaction_es": pv(ti_es),

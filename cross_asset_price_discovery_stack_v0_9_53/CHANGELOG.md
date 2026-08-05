@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.9.53 -- the report's contradictions were mostly one bug: sessions[0]
+
+Chasing the 2026-08-05 report's three internal contradictions (§4a/b/c) found that two of them were
+largely a single defect, and the report's own hypotheses about them were wrong:
+
+* **`run_irf` and `run_dcc` estimated their headline objects on `sessions[0]` alone** — and
+  sorted-first is **2020-03-09**, a circuit-breaker day, estimated halt-included at the time. The
+  contradictory headline FEVD (ret_ES 30.6% "from SPY flow") and the anomalous DCC
+  (mean_rho 0.357 against a realized correlation of 0.82) were both single-crash-day estimates
+  presented as panel results. `run_dcc` now pools ALL sessions (differenced per session — no
+  overnight pseudo-return), reports the realized correlation of the same stacked returns beside
+  `mean_rho`, and warns in its own output when they diverge by >0.2. `run_irf` now reports the
+  per-regime MEDIAN FEVD across sessions as the headline and keeps the single-session matrix
+  labelled by date (`fevd_session0`, `fevd_session0_date`).
+* **Two corrections to the report itself**, recorded there: (a) the FEVD is NOT Cholesky-ordered —
+  its B is identified from the cross-impact matrix, so "re-run under the Rigobon rotation" was the
+  wrong prescription; (b) the 2020 cross-impact reversal cannot be "ladder-built 2020 vs MBO-built
+  2022–26" — all 24 sessions are ladder-built. The live suspects are the halt-reopen seam and
+  genuine crisis bidirectionality, and this release separates them.
+* **Five surviving NaN-compression splice sites removed** (`select_lag`, `estimate_day`,
+  `estimate_sample`, `panel_vecm` in price_discovery_shares; `liquidity_conditional_vecm` in
+  cross_asset_pd_liquidity): each compressed NaN out of the prices BEFORE differencing, splicing
+  the last pre-halt price to the reopen price — the exact defect v0.9.51 removed from
+  `jump_robust`, re-manufacturing the halt seam inside the estimators the halt masking was built
+  for. All five now let NaN flow to a finite-ROW design mask; `panel_vecm` and
+  `liquidity_conditional_vecm` gained per-session masks on their inline designs and report
+  `n_obs`, so the no-splice row accounting is checkable from the output.
+* **`impact_regression` drop-one leverage diagnostic** (`Lambda_drop1`, `drop1_frac`,
+  `drop1_flag`): refit without the single largest |OFI × return| co-movement; flag when any
+  coefficient moves by more than its SE *and* half its own size. On synthetic data one injected
+  seam observation manufactures λ(ES←SPY)≈0.17–0.23 from a true zero and the diagnostic exposes
+  it; clean data stays quiet. This is the instrument for contradiction (b): if the 2020
+  bidirectionality is one reopen print, the flag says so in the same table.
+* **`ec_valid` per-day flag** (κ = α_ES − α_SPY > 0) in `estimate_day`/`estimate_sample`: on days
+  where both alphas share a sign (2023-08-07, 2023-12-20) both legs move AWAY from the basis and
+  Gonzalo–Granger CS is a quotient of noise, not a share. The driver now also reports
+  `mean_CS_ES_ec_valid` and `n_ec_invalid`.
+* **`run_irf` now forwards `--n-levels`** to `local_projection_irf`/`structural_vecm_irf` (both
+  silently used their 10-level default).
+
+New gate: `test_analysis_inconsistencies.py` (8 checks) pins the row accounting at all five
+former splice sites, the seam-free `select_lag` logdet, the `ec_valid` flag on a non-correcting
+day, the drop-one diagnostic both ways, `run_dcc` pooling with its warning contract, and
+`run_irf`'s median-by-regime + dated single-session labelling. STAGE 1 is now 51 modules.
+
 ## v0.9.52 -- when the optimal lag is a boundary, change the question, not pmax
 
 Asked whether there is a more informative way to handle the lag length than a boundary-constrained

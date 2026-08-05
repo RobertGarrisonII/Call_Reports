@@ -147,3 +147,41 @@ recursive ordering is a better exhibit than either identification alone.
    co-jump lead-lag (16 of 17 co-jumps are "simultaneous" at 1 s — unresolvable by construction).
 5. **Look at the DCC-X fit** (integrated persistence, mean_rho far below realized).
 6. Soften memo §3's window-level wording until (4) runs.
+
+
+---
+
+## Corrections and resolutions (added 2026-08-05, v0.9.53)
+
+Working through §4's contradictions produced two corrections to this report's own hypotheses and a
+set of code fixes.
+
+**Correction to (a):** I suspected the FEVD's "recursive ordering." The FEVD is **not** Cholesky —
+its B is identified from the cross-impact matrix. The real problem was worse: `run_irf` computed
+the headline FEVD on **`sessions[0]` alone**, which sorted-first is **2020-03-09** — a
+circuit-breaker day, estimated halt-included at the time, whose cross-impact matrix carried the
+reopen seam as a leverage point. The 30.6% was one contaminated crash day presented as a headline.
+It is now the per-regime median across all sessions, with the single-session matrix retained and
+labelled by date.
+
+**Correction to (b):** I suggested the 2020 cross-impact reversal might be "ladder-built 2020 vs
+MBO-built 2022–2026." Impossible — **all 24 sessions used the ladder** (aggregated has been the
+default since v0.9.42). The live suspects are the halt/reopen seam inside the pre-v0.9.51
+estimations, and genuine crisis bidirectionality. Two things now separate them: the halt-masked
+re-run, and a **drop-one leverage diagnostic** in `impact_regression` (refit without the single
+largest |OFI×return| co-movement; flag when the coefficient moves by more than its SE and half its
+own size). On synthetic data one injected seam observation manufactures λ(ES←SPY)=0.23 from a true
+zero, and the diagnostic exposes it.
+
+**On (c):** the DCC was also a **single-session fit on 2020-03-09**, halt-included, which is most
+of the mystery. `run_dcc` now pools all sessions (differenced per session — no overnight
+pseudo-returns), reports the realized correlation of the same returns beside `mean_rho`, and warns
+in its own output when the two diverge by more than 0.2 with near-integrated persistence.
+
+**Also fixed while here:** five surviving NaN-compression sites (`select_lag`, `estimate_day`,
+`estimate_sample`, `panel_vecm`, `liquidity_conditional_vecm`) spliced the halt seam back into
+exactly the estimators the halt masking was built for — the same defect removed from `jump_robust`
+in v0.9.51, found by pattern-sweeping for it. And per-day CS now carries an `ec_valid` flag
+(κ = α_ES − α_SPY > 0): on days where both alphas share a sign — 2023-08-07, 2023-12-20 among them
+— CS is a quotient of noise, and `mean_CS_ES_ec_valid` reports the mean over days where it is a
+share.
