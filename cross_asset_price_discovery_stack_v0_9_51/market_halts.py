@@ -327,6 +327,66 @@ def describe_cross_asset(rep: dict) -> str:
     return "\n".join(lines) if lines else "no halt on either leg"
 
 
+def mask_frame(df, assets=("SPY", "ES"), tz: str = TZ):
+    """NaN each leg's market columns inside THAT LEG's halt windows. -> (masked copy, report).
+
+    This is the estimation-side counterpart of the QC-side ``halt_mask``: the QC gate has excluded
+    halt snapshots from its crossed-rate arithmetic since v0.9.26, but none of the ESTIMATORS ever
+    did -- the 2026-08-05 analysis run fit every VECM, information share, OFI regression and jump
+    statistic on n_obs = 23,401 - lags, halt included. A halted market has no valid midpoint, both
+    legs are stale for 900 s, and the reopen gap enters the jump statistics as one giant "return"
+    (2020-03-16: 44% of the day's common-factor QV under truncation vs 10.8% under Lee-Mykland --
+    the gap, not jumps).
+
+    Masking with NaN, AFTER alignment, is deliberate on both counts:
+
+      * NaN rather than dropping rows: dropping splices the pre-halt price to the reopen price, so
+        the 900 s halt move becomes one 1-second observation -- the seam is worse than the halt.
+        NaN propagates through diff/lag construction, so a finite-row design mask then drops the
+        halt, the seam, AND every observation whose lag window touches either. That is the correct
+        exclusion, and it happens at one choke point per estimator instead of per stage.
+      * After alignment: ``_align_books`` forward-fills, so masking before it would be refilled
+        with the stale pre-halt quote -- silently undoing the exclusion.
+
+    Per leg, not the union: the ES leg halts ~1 minute after SPY and resumes with it (measured in
+    TAPE_SEMANTICS §13-16), so masking SPY over the ES-only window would discard the sole-venue
+    minute on the one leg that was trading. Pair estimators lose those rows anyway (their design
+    needs both legs finite), which IS the union -- applied by construction, not by fiat.
+
+    Windows resolve exactly as in session_qc: the leg's own attrs (present-but-empty is a positive
+    "did not halt"), else the union attr, else the built-in MWCB table for the frame's date.
+    Regulatory-state columns (_ssr, _luld_*) are NOT masked -- Rule 201 stays in force through a
+    halt, and the state is the point of those columns."""
+    rep = {a: 0 for a in assets}
+    if df is None or len(df) == 0:
+        return df, rep
+    attrs = df.attrs if hasattr(df, "attrs") else {}
+    out = df.copy()
+    out.attrs = dict(attrs)
+    _MARKET = ("price", "quantity", "mid", "nbbo", "trade", "vwap", "px", "ofi")
+    for a in assets:
+        key = f"halt_windows_{a}"
+        wins = attrs[key] if key in attrs else attrs.get("halt_windows")
+        wins = [(pd.Timestamp(x), pd.Timestamp(y)) for x, y in wins] if wins else None
+        if wins is None and key in attrs:            # positive empty: this leg did not halt
+            continue
+        m = halt_mask(out.index, windows=wins, tz=tz)
+        if not m.any():
+            continue
+        cols = [c for c in out.columns if c.startswith(f"{a}_")
+                and any(t in c.lower() for t in _MARKET)
+                and not c.lower().endswith(("_ssr",)) and "_luld" not in c.lower()]
+        for c in cols:
+            v = out[c].to_numpy()
+            if np.issubdtype(np.asarray(v).dtype, np.number):
+                v = v.astype(float)
+                v[m] = np.nan
+                out[c] = v
+        rep[a] = int(m.sum())
+    out.attrs["halt_masked"] = dict(rep)
+    return out, rep
+
+
 def halt_windows(date, tz: str = TZ) -> list:
     """-> [(start, end)] tz-aware Timestamps for that date, or [] if the date had no MWCB halt."""
     key = str(date)[:10].replace("/", "-")

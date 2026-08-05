@@ -61,7 +61,14 @@ def _design_within_day(p1, p2, n_lags, start=None):
     for L in range(1, n_lags + 1):
         cols.append(dp1[s - L:T - L]); cols.append(dp2[s - L:T - L])
     dY = np.column_stack([dp1[s:T], dp2[s:T]])
-    return dY, np.column_stack(cols)
+    X = np.column_stack(cols)
+    # Finite rows only. Halt snapshots arrive as NaN (market_halts.mask_frame), and NaN propagates
+    # through the diffs and every lag column, so this single mask drops the halt, the halt/reopen
+    # seam, and every observation whose lag window touches either -- for the VECM, both information
+    # shares, Gonzalo-Granger, lag selection, the windowed panel and the jump split, all of which
+    # come through this function. Before it existed a single NaN poisoned the whole OLS instead.
+    ok = np.all(np.isfinite(dY), axis=1) & np.all(np.isfinite(X), axis=1)
+    return dY[ok], X[ok]
 
 def _fit_vecm_fixed(p1, p2, n_lags):
     dY, X = _design_within_day(p1, p2, n_lags)

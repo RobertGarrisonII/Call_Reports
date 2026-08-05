@@ -169,6 +169,30 @@ def _extraction_universe(args):
     return None
 
 
+def _mask_halt_rows(sessions, enabled=True, assets=("SPY", "ES")):
+    """NaN each leg's market columns inside its halt windows, AFTER alignment (ffill would refill
+    them before it). See market_halts.mask_frame for the full reasoning; the short version is that
+    the QC gate has excluded halt snapshots since v0.9.26 and the estimators never did -- every
+    stage of the 2026-08-05 run fit the four MWCB days halt-included. The stages need no changes:
+    their design masks drop non-finite rows, which after this is exactly the halt, the reopen seam,
+    and any lag window touching either."""
+    if not enabled:
+        LOG.warning("halt masking DISABLED (--no-halt-mask): halted snapshots -- where neither leg "
+                    "has a valid midpoint -- will enter every estimator. Diagnosis only.")
+        return sessions
+    import market_halts as mh
+    out = []
+    for d, r, df in sessions:
+        masked, rep = mh.mask_frame(df, assets=assets)
+        if any(rep.values()):
+            LOG.info("session %s: halt-masked %s row(s) -- excluded from every estimator (the halt "
+                     "has no valid midpoint; the QC gate already excluded these, the estimators "
+                     "now do too)", str(d),
+                     ", ".join("%s=%d" % (a, n) for a, n in rep.items() if n))
+        out.append((d, r, masked))
+    return out
+
+
 def _align_books(sessions, assets=("SPY", "ES"), enabled=True):
     """Forward-fill each session onto its grid so a row where one asset did not update carries
     its last quote rather than NaN. SPY and ES are joined on non-aligned quote times, so without
@@ -257,7 +281,8 @@ def load_sessions(args):
         LOG.info("Loaded %d session(s) from %s", len(raw), args.pickle)
         sessions = _attach_regimes(raw, args.volatile)
         sessions = _resample_to_interval(sessions, args.interval)        # honor --interval on loaded frames
-        return _align_books(sessions, enabled=not args.no_align_books)
+        return _mask_halt_rows(_align_books(sessions, enabled=not args.no_align_books),
+                               enabled=not getattr(args, "no_halt_mask", False))
     if args.source == "extract":
         import mstbook_loader as ml          # CLI path: mstbook-query + mstwx-lakequery (no SQL/Athena)
         extract_dates = _extraction_universe(args)
@@ -290,7 +315,8 @@ def load_sessions(args):
         # the results rather than left in the scrollback of a multi-hour log.
         if rep.get("failed") or rep.get("degraded"):
             _write_extract_report(rep, args)
-        return _align_books(sessions, enabled=not args.no_align_books)
+        return _mask_halt_rows(_align_books(sessions, enabled=not args.no_align_books),
+                               enabled=not getattr(args, "no_halt_mask", False))
     raise ValueError(args.source)
 
 
@@ -682,6 +708,11 @@ def parse_args(argv=None):
                         "source validate_aggregated.py already benchmarks the replay against) or "
                         "from the message replay ('replay': order-level detail, but the message "
                         "family differs by era and must be selected at run time)")
+    p.add_argument("--no-halt-mask", action="store_true",
+                   help="do NOT exclude halt snapshots from the estimators. A halted market has no "
+                        "valid midpoint, so this is for diagnosis only -- with it, the four MWCB "
+                        "days carry 900 mechanical snapshots into every VECM, IS, OFI and jump "
+                        "estimate, and the reopen gap books as a jump")
     p.add_argument("--no-align-books", action="store_true",
                    help="do not forward-fill each book onto the grid; alignment fixes unaligned SPY/ES "
                         "rows that otherwise NaN-poison the OFI-based stages (cross-impact, structural IRF)")

@@ -283,7 +283,14 @@ def continuous_jump_information_shares(mid_spy, mid_es, n_lags=5, method="trunca
     estimate local vol. c (truncation) and alpha (Lee-Mykland FWER) are the size knobs."""
     f = np.log if use_log else (lambda x: np.asarray(x, float))
     p1, p2 = f(np.asarray(mid_spy, float)), f(np.asarray(mid_es, float))
-    ok = np.isfinite(p1) & np.isfinite(p2); p1, p2 = p1[ok], p2[ok]
+    # Do NOT compress the NaN out of the prices before differencing. Doing so splices the last
+    # pre-halt price to the first reopen price, and the whole 900 s halt move becomes ONE
+    # one-second "return" -- which the truncation estimator then books as a jump (2020-03-16: 44%
+    # of the day's common-factor QV, vs 10.8% under Lee-Mykland; the gap, not jumps). NaN flows
+    # through the VECM design instead, whose finite-row mask drops the halt, the seam and the
+    # contaminated lag windows together. Residuals come back gap-free; the one remaining caveat is
+    # that a Lee-Mykland local-vol window spanning the excision mixes pre- and post-halt volatility,
+    # a second-order effect against booking the halt itself as a jump.
     alpha_v, _, resid = pds._fit_vecm_fixed(p1, p2, n_lags)
     rx, ry = resid[:, 0], resid[:, 1]
 

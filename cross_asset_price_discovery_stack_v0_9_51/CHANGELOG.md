@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.9.51 -- halt snapshots excluded from the ESTIMATORS, not just the QC
+
+The 2026-08-05 analysis run reported n_obs = 23,401 - lags on every session: the QC gate has
+excluded halt snapshots from its crossed-rate arithmetic since v0.9.26, and no estimator ever did.
+On the four MWCB days that put 900 snapshots with no valid midpoint inside every VECM, information
+share, OFI regression and jump statistic -- and the reopen gap entered the jump split as one giant
+"return" (2020-03-16: 44% of the day's common-factor QV under truncation vs 10.8% under
+Lee-Mykland; the gap, not jumps).
+
+Three small pieces, one choke point each:
+
+* **`market_halts.mask_frame`** NaNs each leg's market columns inside THAT LEG's halt windows.
+  NaN rather than dropping rows, because dropping splices the last pre-halt price to the reopen
+  price and the whole 900 s move becomes ONE 1-second observation -- the seam is worse than the
+  halt. AFTER alignment, because `_align_books` forward-fills and would silently refill a mask
+  applied before it. PER LEG rather than the union, because the ES sole-venue minute (§9.4 of the
+  memo) must stay live on the leg that was trading -- pair estimators lose those rows anyway
+  through their own both-legs-finite masks, which IS the union, by construction. Regulatory-state
+  columns are not masked: Rule 201 stays in force through a halt.
+* **`price_discovery_shares._design_within_day`** keeps finite rows only. NaN propagates through
+  the diffs and every lag column, so this one mask drops the halt, the seam, and every observation
+  whose lag window touches either -- for the VECM, both information shares, Gonzalo-Granger, lag
+  selection, the windowed panel and the jump split, all of which pass through this function.
+  (Previously a single NaN poisoned the whole OLS.)
+* **`jump_robust`** no longer compresses NaN out of the prices before differencing -- the
+  compression was the seam manufacturer. One stated second-order caveat: a Lee-Mykland local-vol
+  window spanning the excision mixes pre- and post-halt volatility.
+
+`run_analysis` applies the mask after alignment on both source paths and logs per-session masked
+counts; `--no-halt-mask` is the diagnosis-only escape hatch. `cross_impact`, `ecm_sde` and the DCC
+path already filter finite rows after differencing, so they inherit the exclusion with no changes.
+
+New `test_halt_masked_estimation.py` (6 checks, STAGE 1 gate): exact per-leg mask counts; the
+sole-venue minute staying live; the design dropping exactly halt-diffs + lag-contaminated rows
+(922 = 902 + 20 on the fixture); a clean VECM whose largest residual is 1.3 bps against a 200-bp
+reopen gap (the seam return does not exist); and the headline reproduction -- common-factor jump
+fraction 98.5% unmasked vs 0.3% masked on a synthetic halt day, which is 2020-03-16's 44%-vs-10.8%
+discrepancy, closed.
+
+The four MWCB days' numbers in the 2026-08-05 report predate this fix; re-run them
+(`--source load` on the cached frames) before quoting.
+
 ## v0.9.50 -- Rule 201: why there is no dummy, and what stands in for one
 
 Asked how short sale restrictions are handled and whether a control is needed. The honest audit
