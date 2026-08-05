@@ -580,6 +580,10 @@ def main_cli(argv=None):
             if getattr(args, "upgraded_skip", None):
                 a.skip = list(args.upgraded_skip)
             a.output_dir = os.path.join(args.output_dir or ".", "upgraded")
+            # carry the PRE-MASK frames through: load_sessions stashed them on THIS driver's args,
+            # and the fresh namespace would otherwise fall back to saving the masked in-memory
+            # list -- a masked-at-rest frames_<interval>.pkl under upgraded/, logged as pre-mask
+            a._premask_sessions = getattr(args, "_premask_sessions", None)
             LOG.info("UPGRADED: re-floored analysis in-process on %d sessions -> %s",
                      len(sessions), a.output_dir)
             up = ra.run_stages(sessions, a)

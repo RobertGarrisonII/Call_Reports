@@ -118,7 +118,16 @@ def check_cojumps_detected_and_seam_not_a_jump():
 
 
 def check_legacy_inference_and_comovement():
-    sessions = [("2020-03-09", "volatile", mh.mask_frame(_book_session())[0]),
+    # The masked MWCB day gets INDEPENDENT legs (corr ~0) while the clean day is common-factor
+    # (corr ~0.96). The old comovement code silently dropped the masked day (NaN std fails the
+    # inclusion test) and would report the clean day's ~0.96 alone -- the discriminating
+    # assertion is therefore that the mean sits near the AVERAGE, which requires the masked day
+    # to be inside. (The review workflow proved the previous version of this check passed
+    # against the pre-fix code; this version does not.)
+    rng = np.random.default_rng(31)
+    n = 7000
+    indep = (rng.normal(0, 2e-5, n), rng.normal(0, 2e-5, n))
+    sessions = [("2020-03-09", "volatile", mh.mask_frame(_book_session(eps=indep))[0]),
                 ("2024-07-24", "benchmark", _book_session(day="2024-07-24", seed=11, halt=None))]
     tab = legacy.inference_table(sessions, n_levels=1, quick=True)
     row = tab.iloc[0]
@@ -126,38 +135,49 @@ def check_legacy_inference_and_comovement():
            and np.isfinite(row["upgraded t (day-cluster)"]))
     # the masked day contributes its non-halt rows: n_obs must sit strictly between one clean
     # session and two, and the day count must still be 2
-    n = int(row["n_obs"])
-    partial = (6999 < n < 2 * 6999) and int(row["n_days"]) == 2
+    nobs = int(row["n_obs"])
+    partial = (6999 < nobs < 2 * 6999) and int(row["n_days"]) == 2
     com = legacy.comovement_table(sessions)
     pear = float(com.iloc[0, 0]); hy = float(com.iloc[0, 1])
     both_in = np.isfinite(pear) and np.isfinite(hy)
-    # segment-wise HY must NOT be dominated by the reopen gap: on a common-factor DGP both
-    # estimators sit well below 1 and near each other
-    sane = 0.5 < pear <= 1.0 and 0.5 < hy <= 1.0 and abs(pear - hy) < 0.2
-    ok = fin and partial and both_in and sane
+    # near the two-day average (~0.48), NOT the clean day alone (~0.96): the masked day is in.
+    # And segment-wise HY tracks Pearson instead of being pushed toward 1 by the reopen gap.
+    included = pear < 0.75 and hy < 0.75
+    sane = abs(pear - hy) < 0.25
+    ok = fin and partial and both_in and included and sane
     print("(3) legacy on masked frames: inference coef/t finite (%s) with n_obs=%d over 2 days "
-          "(%s); comovement keeps the MWCB day, Pearson=%.3f HY=%.3f, no gap domination (%s) : %s"
-          % (fin, n, partial, pear, hy, sane, ok))
+          "(%s); comovement mean Pearson=%.3f HY=%.3f near the 2-day average -- the masked day "
+          "is INCLUDED (%s), no gap domination (%s) : %s"
+          % (fin, nobs, partial, pear, hy, included, sane, ok))
     return ok
 
 
-def _structural_sessions(rel_het=True, n=6000, per_regime=2):
+def _structural_sessions(rel_het=True, n=6000, per_regime=2, mask_het_day=False):
     """Frames whose returns follow A y = eps with known A, regime-specific shock variances.
-    Order (ES, SPY) to match identification_table. C = I - A: C[SPY,ES]=0.45, C[ES,SPY]=0.15."""
+    Order (ES, SPY) to match identification_table. C = I - A: C[SPY,ES]=0.45, C[ES,SPY]=0.15.
+    With ``mask_het_day`` the FIRST volatile session carries the halt and is masked -- and it is
+    the ONLY session carrying the relative heteroskedasticity, so a code path that drops the
+    whole day (the plain-.mean() demeaning bug) collapses the identifying variation."""
     g_spy_es, g_es_spy = 0.45, 0.15
     A = np.array([[1.0, -g_es_spy], [-g_spy_es, 1.0]])     # rows/cols: [ES, SPY]
     P = np.linalg.inv(A)
     out = []
     k = 0
-    for reg, scale in (("benchmark", [2e-5, 2e-5]),
-                       ("volatile", [6e-5, 3e-5] if rel_het else [6e-5, 6e-5])):
-        for _ in range(per_regime):
+    for reg, scales in (("benchmark", [[2e-5, 2e-5]] * per_regime),
+                        ("volatile", ([[6e-5, 3e-5]] + [[2.2e-5, 2.2e-5]] * (per_regime - 1))
+                         if (rel_het and mask_het_day) else
+                         [[6e-5, 3e-5] if rel_het else [6e-5, 6e-5]] * per_regime)):
+        for j, scale in enumerate(scales):
             rng = np.random.default_rng(100 + k); k += 1
             eps = rng.normal(0, 1, (n, 2)) * np.asarray(scale)
             y = eps @ P.T                                   # columns [r_ES, r_SPY]
             day = "2024-0%d-1%d" % ((k % 8) + 1, k % 7)
-            out.append((day, reg, _book_session(day="2024-07-24", seed=200 + k, halt=None,
-                                                eps=(y[:, 1], y[:, 0]), n=n)))
+            hlt = ("10:00:00", "10:14:59") if (mask_het_day and reg == "volatile" and j == 0) else None
+            df = _book_session(day="2024-07-24", seed=200 + k, halt=hlt,
+                               eps=(y[:, 1], y[:, 0]), n=n)
+            if hlt is not None:
+                df, _ = mh.mask_frame(df)
+            out.append((day, reg, df))
     return out, g_spy_es, g_es_spy
 
 
@@ -165,7 +185,7 @@ def check_rigobon_strength_is_in_the_table():
     sessions, g_spy_es, g_es_spy = _structural_sessions(rel_het=True)
     tab = legacy.identification_table(sessions)
     has_rows = all(any(key in str(i) for i in tab.index)
-                   for key in ("var-ratio spread", "eigenvalue separation", "identified"))
+                   for key in ("var-ratio spread", "relative eigenvalue gap", "identified"))
     rg = tab["upgraded (Rigobon het-ID)"]
     est_se = float(rg.iloc[0]); est_es = float(rg.iloc[1])
     recovered = abs(est_se - g_spy_es) < 0.08 and abs(est_es - g_es_spy) < 0.08
@@ -173,11 +193,22 @@ def check_rigobon_strength_is_in_the_table():
     weak_sessions, _, _ = _structural_sessions(rel_het=False)
     tab2 = legacy.identification_table(weak_sessions)
     no = "NO" in str(tab2["upgraded (Rigobon het-ID)"].iloc[-1])
-    ok = has_rows and recovered and yes and no
+    # THE MASKED-DAY PIN (review finding): the relative het lives ONLY in a halt-masked volatile
+    # day. Plain-.mean() demeaning turns that whole day NaN, regime_residual_cov drops it, the
+    # spread collapses and the verdict flips to NO -- with nanmean the day's finite rows stay in
+    # and the system remains identified with the right coefficients.
+    m_sessions, _, _ = _structural_sessions(rel_het=True, mask_het_day=True, per_regime=2)
+    tab3 = legacy.identification_table(m_sessions)
+    rg3 = tab3["upgraded (Rigobon het-ID)"]
+    masked_yes = str(rg3.iloc[-1]).strip().startswith("yes")
+    masked_rec = abs(float(rg3.iloc[0]) - g_spy_es) < 0.10
+    ok = has_rows and recovered and yes and no and masked_yes and masked_rec
     print("(4) Rigobon table: strength rows present (%s); with RELATIVE het recovers "
-          "SPY<-ES=%.3f (true %.2f) ES<-SPY=%.3f (true %.2f) and says identified (%s); with "
-          "common-scale regimes the verdict row says NO (%s) : %s"
-          % (has_rows, est_se, g_spy_es, est_es, g_es_spy, yes, no, ok))
+          "SPY<-ES=%.3f (true %.2f) ES<-SPY=%.3f (true %.2f) and says identified (%s); "
+          "common-scale says NO (%s); het carried by a MASKED day survives the mask "
+          "(identified=%s, SPY<-ES=%.3f) : %s"
+          % (has_rows, est_se, g_spy_es, est_es, g_es_spy, yes, no,
+             masked_yes, float(rg3.iloc[0]), ok))
     return ok
 
 

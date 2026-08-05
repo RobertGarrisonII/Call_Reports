@@ -117,6 +117,17 @@ def main(argv=None) -> int:
     n_vol = sum(1 for _d, r, _f in sessions if r == "volatile")
     print("loaded %d session(s) (%d volatile / %d benchmark), n_lags=%d"
           % (len(sessions), n_vol, len(sessions) - n_vol, a.n_lags))
+    if n_vol == 0 or n_vol == len(sessions):
+        # panel_vecm's ec*D interaction column is identically zero (or collinear with ec) with a
+        # one-regime sample, and the fit dies in a LinAlgError spew instead of an explanation.
+        # The usual cause: a 2-tuple pickle with --volatile omitted (everything labels benchmark),
+        # or a --volatile list that matches no stored dates (typo / format mismatch).
+        print("\nDEGENERATE REGIME SPLIT: %d of %d sessions are volatile. The A/B needs both "
+              "regimes -- pass --volatile with dates that appear in the pickle (YYYY-MM-DD; "
+              "loaded dates: %s%s)." % (n_vol, len(sessions),
+                                        ", ".join(d for d, _r, _f in sessions[:6]),
+                                        ", ..." if len(sessions) > 6 else ""))
+        return 2
     if _masked_at_rest(sessions):
         print("\nINPUT FRAMES ARE MASKED AT REST -- the halt NaN is baked into this pickle "
               "(saved by a v0.9.51-56 analysis run), so an unmasked arm is impossible from it "

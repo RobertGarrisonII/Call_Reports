@@ -151,7 +151,14 @@ def identification_table(sessions):
     U, lab = [], []
     for _, reg, df in sessions:                                  # paper order: FUTURES (ES) first
         rs = np.diff(_log_mid(df, "SPY")); re = np.diff(_log_mid(df, "ES"))
-        n = min(len(rs), len(re)); rs, re = rs[:n] - rs[:n].mean(), re[:n] - re[:n].mean()
+        n = min(len(rs), len(re))
+        # nanmean, NOT .mean(): on a halt-masked day a plain mean is NaN and demeaning poisons the
+        # ENTIRE day's rows -- regime_residual_cov then silently drops the whole day, so the four
+        # MWCB days (the stress observations het-ID depends on) vanished wholesale from the regime
+        # covariances, deflating the very strength diagnostic added below. The per-row halt NaN is
+        # handled downstream by regime_residual_cov's finite-row filter; contemporaneous
+        # covariance, so the row drop cannot splice.
+        rs, re = rs[:n] - np.nanmean(rs[:n]), re[:n] - np.nanmean(re[:n])
         U.append(np.column_stack([re, rs])); lab += [reg] * n     # reduced-form innovations (demeaned)
     U = np.vstack(U); lab = np.array(lab)
     res = rig.rigobon_identify(U, lab, calm=uniq[0], stress=uniq[-1], names=["ES", "SPY"])
@@ -168,14 +175,19 @@ def identification_table(sessions):
     cov = rig.regime_residual_cov(U, lab)
     diag = rig.identification_diagnostic(cov, names=["ES", "SPY"])
     verdict = "yes" if diag["identified"] else "NO -- do not quote the het-ID column"
+    # display the RELATIVE eigenvalue gap -- the statistic the verdict actually thresholds
+    # (> 0.10). The absolute gap res["eig_separation"] scales with the overall calm-to-stress
+    # variance ratio, so it can read large (or tiny) purely from common scale -- exactly the
+    # regime the verdict exists to flag -- and a reader reconciling a big "separation" with a NO
+    # verdict would conclude the verdict is a bug and quote the column anyway.
     return pd.DataFrame(
         {"legacy (Cholesky, futures 1st)": [cf.loc["SPY", "ES"], cf.loc["ES", "SPY"],
                                             np.nan, np.nan, ""],
          "upgraded (Rigobon het-ID)": [rg.loc["SPY", "ES"], rg.loc["ES", "SPY"],
-                                       diag["var_ratio_spread"], res["eig_separation"], verdict]},
+                                       diag["var_ratio_spread"], diag["rel_eig_gap"], verdict]},
         index=["SPY <- ES (contemp)", "ES <- SPY (contemp)",
                "var-ratio spread (max/min - 1; ~0 = common-scale, unidentified)",
-               "eigenvalue separation (identification strength)",
+               "relative eigenvalue gap (verdict thresholds this > 0.10)",
                "identified (relative het present)"])
 
 

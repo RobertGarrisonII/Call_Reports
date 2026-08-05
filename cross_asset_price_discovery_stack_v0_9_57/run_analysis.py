@@ -873,10 +873,12 @@ def run_stages(sessions, args, ts=None, t0=None):
         # PRE-MASK frames when available: the artifact must be the data, not this run's masking
         # policy baked in as NaN (which made --no-halt-mask a silent no-op on reloaded frames).
         to_save = getattr(args, "_premask_sessions", None) or sessions
+        _variant = "pre-mask" if getattr(args, "_premask_sessions", None) else \
+            "as-estimated (no pre-mask list on args -- masked-at-rest if masking ran)"
         with open(fpath, "wb") as fh:
             pickle.dump([(str(d), r, f) for d, r, f in to_save], fh, protocol=4)
-        LOG.info("Session frames -> %s  (%d session(s), pre-mask, the List[(date, regime, df)] "
-                 "shape --source load expects)", fpath, len(to_save))
+        LOG.info("Session frames -> %s  (%d session(s), %s, the List[(date, regime, df)] "
+                 "shape --source load expects)", fpath, len(to_save), _variant)
 
     # the resulting tables — one CSV per analysis output
     table_files = export_tables(results, tables_dir)

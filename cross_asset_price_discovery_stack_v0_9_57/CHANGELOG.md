@@ -50,6 +50,36 @@ fix pinned by `test_masked_run_casualties.py` (6 checks; STAGE 1 is now 54 modul
   2024-01-29 Mon (364 d), with 2025-08-01 / 2024-08-09 as the new tenth pair.
   `validate_sample.py` passes the list clean; `SAMPLE_UNIVERSE.md` regenerated.
 
+### v0.9.57 post-review fixes (same release, found by an adversarial review of the diff)
+
+An 11-agent review pass over the v0.9.57 diff (three lenses, refutation-mode verification, with
+executed reproductions) confirmed five defects the deterministic suite had missed — including one
+in the code this release itself added:
+
+* **`identification_table` still demeaned with plain `.mean()`** — NaN on any masked day, so the
+  ENTIRE day's rows went NaN and `regime_residual_cov` silently dropped it: the four MWCB days
+  (the stress observations het-ID depends on) vanished wholesale from the regime covariances,
+  deflating the very strength diagnostic this release added (reproduced: the verdict flips NO
+  purely because the crash days were dropped). Now `np.nanmean`; the masked-day pin is in the
+  gate test, with the relative het deliberately carried ONLY by a masked day.
+* **The strength row displayed the wrong statistic**: the absolute eigenvalue gap, which scales
+  with the overall calm-to-stress variance ratio and can read large (or tiny) purely from common
+  scale — while the verdict thresholds the RELATIVE gap. A reader reconciling a big "separation"
+  with a NO verdict would conclude the verdict is the bug. The row now shows `rel_eig_gap` and
+  names the threshold.
+* **`run_contagion --upgraded` still wrote masked-at-rest frames**: it builds a fresh
+  `parse_args([])` namespace that never carried `_premask_sessions`, so `upgraded/frames_*.pkl`
+  had the NaN baked in while the log claimed pre-mask. The premask list is now passed through,
+  and the save-site log states which variant it actually wrote instead of asserting "pre-mask"
+  unconditionally.
+* **`ab_halt_mask` crashed with a LinAlgError spew on a degenerate regime split** (no volatile
+  sessions — a 2-tuple pickle without --volatile, or a --volatile list matching nothing). It now
+  explains the problem, prints the loaded dates, and exits 2.
+* **The comovement test check could not fail against the old code** (the old code's silent
+  MWCB-day drop produced the same passing numbers). The masked day now carries independent legs
+  (corr ≈ 0) so the assertion is on the two-day AVERAGE — which requires the masked day to be
+  inside. The stale repo-root copy of SAMPLE_UNIVERSE.md was also refreshed.
+
 ## v0.9.56 -- the DCC column by default, and the artifact flag that could never fire
 
 Asked whether `--with-dcc` should be the default. Checking the trigger answered more than the
