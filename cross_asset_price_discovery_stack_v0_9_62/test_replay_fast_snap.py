@@ -55,7 +55,8 @@ def _rich_messages(n_secs=180, adds_per_sec=400, n_feeds=3, seed=11):
     t_add = np.sort(rng.uniform(0, n_secs, n))
     life = rng.exponential(8.0, n)
     t_end = np.minimum(t_add + life, n_secs - 1e-3)
-    end_kind = rng.choice([0, 1, 2], size=n, p=[0.70, 0.15, 0.15])   # cancel / trade+leaves / trade-legacy
+    # cancel / trade leaves=0 / trade legacy-decrement / trade PARTIAL leaves / trade leaves>size
+    end_kind = rng.choice([0, 1, 2, 3, 4], size=n, p=[0.62, 0.12, 0.12, 0.10, 0.04])
     feeds = rng.integers(0, n_feeds, n)
     side = rng.integers(0, 2, n)
     mid = 500.0 + np.cumsum(rng.normal(0, 0.001, n))
@@ -82,10 +83,20 @@ def _rich_messages(n_secs=180, adds_per_sec=400, n_feeds=3, seed=11):
             parts.append((t_end[i], "mt_trade",
                           {"f": f, "price": price[i], "quantity": qty[i], "leavesquantity": 0.0,
                            "orderreferencenumber": str(i)}))
-        else:
+        elif k == 2:
             parts.append((t_end[i], "mt_trade",
                           {"f": f, "price": price[i], "quantity": qty[i],
                            "leavesquantity": np.nan, "orderreferencenumber": str(i)}))
+        elif k == 3:                                 # PARTIAL fill with a leaves CORRECTION:
+            parts.append((t_end[i], "mt_trade",     # leaves != size - qty exercises the
+                          {"f": f, "price": price[i], "quantity": 100.0,   # trade_leaves_corrected
+                           "leavesquantity": max(qty[i] - 150.0, 100.0),   # branch of set_remaining
+                           "orderreferencenumber": str(i)}))
+        else:                                        # leaves GREATER than the resting size: the
+            parts.append((t_end[i], "mt_trade",     # rejection branch (trade_leaves_gt_size)
+                          {"f": f, "price": price[i], "quantity": 10.0,
+                           "leavesquantity": qty[i] + 500.0,
+                           "orderreferencenumber": str(i)}))
     # modifies: re-price 5% of adds mid-life
     for i in range(0, n, 20):
         tm = t_add[i] + 0.4 * life[i]
@@ -113,8 +124,21 @@ def _rich_messages(n_secs=180, adds_per_sec=400, n_feeds=3, seed=11):
                       {"f": "mbp0", "side": "Ask" if j % 2 else "Bid",
                        "price": np.round((500.0 + rng.normal(0, 0.3)) / 0.01) * 0.01,
                        "quantity": float(rng.integers(0, 5) * 100)}))
-    # one mid-session clear of feed0
+    # duplicate adds (re-add an existing ref), NaN-quantity referenced trades, and NaN refless
+    for i in range(0, n, 61):
+        tt = min(t_add[i] + 0.1, n_secs - 1e-3)
+        parts.append((tt, "mt_add_order",
+                      {"f": f"feed{feeds[i]}", "side": "Ask" if side[i] else "Bid",
+                       "price": price[i] + 0.01, "quantity": qty[i],
+                       "orderreferencenumber": str(i)}))                    # dup_add path
+    for i in range(3, n, 97):
+        tt = min(t_add[i] + 0.15, n_secs - 1e-3)
+        parts.append((tt, "mt_trade",
+                      {"f": f"feed{feeds[i]}", "price": price[i], "quantity": np.nan,
+                       "leavesquantity": np.nan, "orderreferencenumber": str(i)}))  # NaN qty, known ref
+    # one mid-session clear of feed0, and an MBP wholesale clear late in the session
     parts.append((n_secs * 0.6, "mt_clear_orders", {"f": "feed0", "quantity": np.nan}))
+    parts.append((n_secs * 0.8, "mt_clear_price_levels", {"f": "mbp0", "quantity": np.nan}))
 
     parts.sort(key=lambda x: x[0])
     by_type: dict = {}
@@ -144,11 +168,11 @@ def check_equivalence_everywhere():
         a = _build(interval, legacy=True, odd_lot=odd_lot)
         b = _build(interval, legacy=False, odd_lot=odd_lot)
         same = a.equals(b) and dict(a.attrs["lob_stats"]) == dict(b.attrs["lob_stats"])
-        used = a.attrs["lob_stats"].get("trade_no_ref_displayed", 0) > 0 \
-            and a.attrs["lob_stats"].get("trade_undisplayed", 0) > 0 \
-            and a.attrs["lob_stats"].get("mbp_level_events", 0) > 0 \
-            and a.attrs["lob_stats"].get("feed_clears", 0) > 0 \
-            and a.attrs["lob_stats"].get("trade_leaves_corrected", 0) >= 0
+        st = a.attrs["lob_stats"]
+        used = all(st.get(k, 0) > 0 for k in
+                   ("trade_no_ref_displayed", "trade_undisplayed", "mbp_level_events",
+                    "feed_clears", "trade_leaves_corrected", "trade_leaves_gt_size",
+                    "dup_add", "trade_nan_qty", "modify_reprioritized"))
         print("    %-5s odd_lot=%-5s frames+stats identical=%s (paths exercised: %s)"
               % (interval, odd_lot, same, used))
         ok = ok and same and used
@@ -169,6 +193,68 @@ def check_auto_mode_and_progress():
     ok = auto and live
     print("(2/3) auto mode: 1s->%s, 10ms(120k pts)->%s (%s); mid-replay progress callbacks fire "
           "(%d beats) : %s" % (a.attrs["snap_path"], b.attrs["snap_path"], auto, len(beats), ok))
+    return ok
+
+
+def check_review_regressions():
+    """The three defects the adversarial review of this change confirmed, pinned exactly."""
+    t0 = pd.Timestamp(f"{DAY} 09:30:00", tz=TZ).tz_convert("UTC").value
+
+    def idx(ts):
+        return pd.to_datetime((np.asarray(ts, float) * 1e9).astype(np.int64) + t0,
+                              utc=True).tz_convert(TZ)
+
+    def build(msgs, legacy, **kw):
+        return lob.reconstruct_book({k: v.copy() for k, v in msgs.items()}, asset="SPY",
+                                    levels=10, interval="1s", session=("09:30", "09:32"), tz=TZ,
+                                    date_str=DAY.replace("-", ""), clock="receipt",
+                                    legacy_snap=legacy, **kw)
+
+    # (a) a NaN-quantity trade must not poison the ladder: after a later feed clear the phantom
+    # price must be GONE on the fast path (it rested in plist forever before the fix)
+    m = {"mt_add_order": pd.DataFrame(
+            {"f": ["A", "B"], "side": ["Bid", "Bid"], "price": [10.00, 9.99],
+             "quantity": [100.0, 200.0], "orderreferencenumber": ["o1", "o2"],
+             "sequencenumber": [0, 1]}, index=idx([1.0, 2.0])),
+         "mt_trade": pd.DataFrame(
+            {"f": ["A"], "price": [10.00], "quantity": [np.nan], "leavesquantity": [np.nan],
+             "orderreferencenumber": ["o1"], "sequencenumber": [2]}, index=idx([5.0])),
+         "mt_clear_orders": pd.DataFrame(
+            {"f": ["A"], "quantity": [np.nan], "sequencenumber": [3]}, index=idx([30.0]))}
+    fa = build(m, legacy=False); le = build(m, legacy=True)
+    nan_ok = (fa.equals(le)
+              and fa["SPY_bidprice_1"].iloc[-1] == 9.99
+              and fa["SPY_bidquantity_1"].iloc[-1] == 200.0
+              and fa.attrs["lob_stats"].get("trade_nan_qty", 0) > 0)
+
+    # (b) HEAD-faithful partial-fill residual: refless displayed print 80@10.00 consumes the
+    # level to 20; a partial fill of 50 drives it to -30, which must PERSIST and offset the next
+    # add -- final displayed quantity 70, the pre-optimization (v0.9.60) value, on both paths
+    m2 = {"mt_add_order": pd.DataFrame(
+             {"f": ["A", "A"], "side": ["Bid", "Bid"], "price": [10.00, 10.00],
+              "quantity": [100.0, 100.0], "orderreferencenumber": ["o1", "o3"],
+              "sequencenumber": [0, 3]}, index=idx([1.0, 40.0])),
+          "mt_trade": pd.DataFrame(
+             {"f": ["A", "A"], "price": [10.00, 10.00], "quantity": [80.0, 50.0],
+              "leavesquantity": [np.nan, np.nan],
+              "orderreferencenumber": ["ghost", "o1"], "sequencenumber": [1, 2]},
+             index=idx([10.0, 20.0]))}
+    fb = build(m2, legacy=False); lb = build(m2, legacy=True)
+    head_ok = (fb.equals(lb) and fb["SPY_bidquantity_1"].iloc[-1] == 70.0)
+
+    # (c) round_lot=0 never auto-selects the fast path, and the NBBO stays real
+    m3 = {"mt_add_order": pd.DataFrame(
+             {"f": ["A", "A"], "side": ["Bid", "Ask"], "price": [10.00, 10.05],
+              "quantity": [500.0, 500.0], "orderreferencenumber": ["b", "s"],
+              "sequencenumber": [0, 1]}, index=idx([1.0, 1.5]))}
+    fc = build(m3, legacy=None, round_lot=0)
+    rl0_ok = (fc.attrs["snap_path"] == "legacy"
+              and fc["SPY_nbbo_bid"].iloc[-1] == 10.00 and fc["SPY_nbbo_ask"].iloc[-1] == 10.05)
+
+    ok = nan_ok and head_ok and rl0_ok
+    print("(6) review regressions pinned: NaN trade cannot poison the ladder past a clear (%s); "
+          "partial-fill residual keeps the v0.9.60 quantity 70.0 (%s); round_lot=0 auto-forces "
+          "legacy with a real NBBO (%s) : %s" % (nan_ok, head_ok, rl0_ok, ok))
     return ok
 
 
@@ -227,6 +313,7 @@ def check_status_tool():
 def main():
     checks = [check_equivalence_everywhere,
               check_auto_mode_and_progress,
+              check_review_regressions,
               check_heartbeat_writer,
               check_status_tool]
     res = []

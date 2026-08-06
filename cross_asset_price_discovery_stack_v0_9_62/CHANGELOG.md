@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.9.62 -- three replay defects the adversarial review caught before real data could
+
+An 8-agent review pass over the v0.9.61 hot-path diff (three lenses, refutation-mode verification
+with executed end-to-end reproductions against both the new code and pre-optimization git HEAD)
+confirmed five findings. If you extracted with v0.9.61, re-extract the fine grids with this.
+
+* **A NaN trade quantity poisoned the fast path for the rest of the session** (high). A null
+  quantity + null leavesquantity on `mt_trade` -- a realistic vendor null -- reached the level
+  arithmetic unguarded; under incremental tracking a NaN in the consolidated aggregate can never
+  satisfy `<= EPS` again, so the price rested in the sorted list forever, and after a feed clear
+  the fast path reported a PHANTOM best bid at the poisoned price while the legacy path
+  recovered. Reproduced end to end: 91 of 121 grid rows diverged. Non-finite sizes are now
+  refused at the choke point (counted: `level_nonfinite_refused`), and NaN-quantity trades are
+  counted (`trade_nan_qty`) and treated as matched-but-unquantifiable -- which also repairs a
+  latent pre-existing bug (the OLD code put NaN into the ladder itself on such prints).
+* **The refactor silently changed partial-fill semantics vs v0.9.60** (high). The historical
+  `reduce()` partial branch never popped a level driven to <= EPS or negative -- possible
+  exactly on crash-day-shaped tapes (a refless displayed print consumes displayed size while
+  the resting order's recorded size stays stale) -- and that residual offset future adds at the
+  same price. The refactored choke point deleted it, changing ladder quantities on such tapes on
+  BOTH in-tree paths, which is why the legacy-vs-fast gate could not see it (the reviewers
+  compared against git HEAD). Restored exactly via `keep_zero`: the residual persists in the
+  venue map, contributes zero to the displayed ladder (the same `<= EPS` skip `consolidated()`
+  always applied), and the pinned reproduction now yields the v0.9.60 quantity on both paths.
+* **`round_lot=0` blanked the fast-path NBBO** (medium): with a zero threshold the round-lot
+  membership test never transitions, the per-venue lists stay empty, and both NBBO columns came
+  back NaN while legacy computed real prices. Degenerate `round_lot <= 0` now auto-forces the
+  legacy path.
+* **The equivalence gate had vacuous coverage** (medium): `trade_leaves_corrected >= 0` is
+  always true, and the synthetic stream never exercised the leaves-correction, leaves>size,
+  dup-add, or `mt_clear_price_levels` branches. The stream now drives every one of them plus
+  NaN-quantity trades; every counter is asserted STRICTLY positive; and the three review
+  reproductions are pinned verbatim as check (6).
+
+56 gate modules, all passing.
+
 ## v0.9.61 -- the 10ms pulls were not hung: the snapshot was O(whole book), in silence
 
 The first two-grid run went quiet at the fine pulls. Two defects, one visible and one structural:

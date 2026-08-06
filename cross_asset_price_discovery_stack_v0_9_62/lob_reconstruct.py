@@ -147,12 +147,31 @@ class _Book:
     def _lv(self, feed, side):
         return self.bid[feed] if side == 0 else self.ask[feed]      # side: 0=Bid, 1=Ask (int codes)
 
-    def _setlv(self, feed, side, price, new):
-        """THE level-mutation choke point: set (feed, side, price) to ``new`` (<=EPS deletes) and
-        keep the consolidated aggregates in step. Every mutation path funnels here."""
+    def _setlv(self, feed, side, price, new, keep_zero=False):
+        """THE level-mutation choke point: set (feed, side, price) to ``new`` (<=EPS deletes,
+        UNLESS ``keep_zero``) and keep the consolidated aggregates in step. Every mutation path
+        funnels here.
+
+        ``keep_zero`` replicates the one historical exception: ``reduce()``'s partial-fill branch
+        never popped, so a level driven to <=EPS (or negative -- possible when a refless displayed
+        print consumed displayed size while the resting order's recorded size stayed stale, the
+        crash-day shape) PERSISTED in the venue map and offset future adds at that price. The
+        v0.9.61 review proved deleting it changes ladder quantities on exactly those tapes, so
+        the residual is kept; the ladder itself never shows it, because the effective
+        consolidated contribution below is zero for any size <= EPS -- the same skip
+        ``consolidated()`` has always applied.
+
+        A non-finite ``new`` is REFUSED (counted, state unchanged): a NaN from a null trade
+        quantity used to poison the venue level, and under incremental tracking a NaN in
+        ``cons`` could never satisfy ``<= EPS`` again, leaving a phantom price in the sorted
+        list for the rest of the session (review finding; the legacy rebuild recovered after a
+        feed clear, the fast path did not)."""
+        if not np.isfinite(new):
+            self.stats["level_nonfinite_refused"] += 1
+            return
         lv = self._lv(feed, side)
         old = lv.get(price, 0.0)
-        if new <= EPS:
+        if new <= EPS and not keep_zero:
             if old:
                 del lv[price]
             new = 0.0
@@ -160,11 +179,11 @@ class _Book:
             lv[price] = new
         if new == old or not self.track:
             return
-        # effective (odd-lot-filtered) consolidated contribution of THIS venue level
-        if self.oli:
-            d = new - old
-        else:
-            d = (new if new >= self.rlot else 0.0) - (old if old >= self.rlot else 0.0)
+        # effective consolidated contribution of THIS venue level: zero at <=EPS (consolidated()
+        # always skipped those, and keep_zero can now store them), zero under the odd-lot filter
+        _eo = old if (old > EPS and (self.oli or old >= self.rlot)) else 0.0
+        _en = new if (new > EPS and (self.oli or new >= self.rlot)) else 0.0
+        d = _en - _eo
         if d:
             c = self.cons[side]
             prev = c.get(price, 0.0)
@@ -180,9 +199,10 @@ class _Book:
                 c[price] = cur
                 if prev <= EPS:
                     insort(self.plist[side], price)
-        # per-venue Reg NMS round-lot membership (for the NBBO columns)
-        was_rl = old >= self.rlot
-        is_rl = new >= self.rlot
+        # per-venue Reg NMS round-lot membership (for the NBBO columns); <=EPS stored residuals
+        # (keep_zero) are never candidates
+        was_rl = old >= self.rlot and old > EPS
+        is_rl = new >= self.rlot and new > EPS
         if was_rl != is_rl:
             rl = self.rlp[side]
             lst = rl.get(feed)
@@ -232,13 +252,17 @@ class _Book:
         o = self.orders.get((feed, ref))
         if o is None:
             return False
+        if not np.isfinite(qty):                    # null trade quantity: nothing quantifiable to
+            self.stats["trade_nan_qty"] += 1        # decrement; the ref matched, so it is handled
+            return True
         side, price, size = o
         lv = self._lv(feed, side)
         if size - qty <= EPS:
             self._setlv(feed, side, price, lv.get(price, 0.0) - size)
             self.orders.pop((feed, ref), None)
         else:
-            self._setlv(feed, side, price, lv.get(price, 0.0) - qty)
+            # keep_zero: the historical partial-fill branch never popped -- see _setlv
+            self._setlv(feed, side, price, lv.get(price, 0.0) - qty, keep_zero=True)
             o[2] = size - qty
         return True
 
@@ -304,7 +328,7 @@ class _Book:
         # a trade's `side` field is aggressor-coded on these feeds, so reducing that side strands the
         # consumed (opposite-side) order and crosses the book -- see reduce_at_price.
         lv = self._lv(feed, side)
-        if price in lv:
+        if np.isfinite(qty) and price in lv:
             self._setlv(feed, side, price, lv[price] - qty)
 
     def reduce_at_price(self, feed, price, qty):
@@ -315,7 +339,9 @@ class _Book:
         consumed side unambiguously. Returns the side reduced (0=Bid, 1=Ask), or -1 if `price` is on
         neither displayed side (a hidden / midpoint / non-displayed odd-lot print, which removes
         nothing and so cannot strand anything)."""
-        if not np.isfinite(price):
+        if not np.isfinite(price) or not np.isfinite(qty):
+            if not np.isfinite(qty):
+                self.stats["trade_nan_qty"] += 1
             return -1
         bid = self._lv(feed, 0); ask = self._lv(feed, 1)
         on_bid = bid.get(price, 0.0) > EPS
@@ -633,7 +659,9 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
     # difference between minutes and hours. legacy_snap=None (default) picks by grid size;
     # True/False forces (the equivalence gate replays both and requires identical output).
     if legacy_snap is None:
-        legacy_snap = len(grid_ns) < 100_000
+        # round_lot <= 0 degenerates the Reg NMS membership test (every absent level "qualifies"),
+        # which the incremental rlp tracking cannot represent -- the legacy rebuild handles it
+        legacy_snap = len(grid_ns) < 100_000 or round_lot <= 0
     book = _Book(round_lot=round_lot, odd_lot_inclusive=odd_lot_inclusive, track=not legacy_snap)
     book.stats["rule_apply_clears"] = int(_R["apply_clears"])
     book.stats["rule_use_leaves"] = int(_R["use_leaves"])
