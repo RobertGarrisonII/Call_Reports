@@ -349,6 +349,7 @@ if have_stage 1; then
            test_roll_at_extraction.py \
            test_fine_grid_stage.py \
            test_masked_run_casualties.py \
+           test_pull_once.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -391,6 +392,46 @@ if have_stage 2; then
         info "session cache: ${CACHE_DIR} (resume=$([ "$RESUME" -eq 1 ] && echo yes || echo no))"
         info "  a day already extracted there is reused, not re-fetched -- so a run that dies"
         info "  partway costs only the missing days on the retry. --no-cache disables it."
+      fi
+      # ── PULL ONCE, PROCESS TWICE ────────────────────────────────────────────
+      # When both grids are on, the whole fine sample is wanted, and the coarse interval is an
+      # integer multiple of the fine one (1s / 10ms = 100), the FINE extraction runs FIRST and the
+      # coarse frames are DERIVED from it (derive_frames.py): the coarse grid points are a subset
+      # of the fine grid and each book row is the state at its timestamp, so the derivation is
+      # exact for book/state columns and sum-exact for flow (final post-close bar documented).
+      # The derived frames fill the coarse session cache -- never overwriting a direct cache --
+      # so the coarse invocation below becomes cache hits instead of a second vendor pull.
+      # --verify-existing compares derived vs direct wherever a direct cache already exists, so a
+      # populated cache validates the equivalence on the real feed before it is ever relied on.
+      # A fine-side failure falls through: the coarse invocation still extracts directly.
+      FINE_DONE=0
+      if [ "$WITH_FINE" -eq 1 ] && [ -z "$FINE_DATES" ] && \
+         [ "$($PY -c "from run_analysis import interval_seconds as s; c,f=s('$INTERVAL'),s('$FINE_INTERVAL'); print(1 if c>f and abs(c/f-round(c/f))<1e-9 else 0)" 2>/dev/null || echo 0)" = "1" ]; then
+        info "PULL ONCE: extracting ${FINE_INTERVAL} books first; ${INTERVAL} frames are DERIVED from them"
+        N_ALL="$(echo "$VOLATILE,$BASELINE,$MWCB" | tr ',' '\n' | grep -c . || echo 1)"
+        AS_FINE="$(PEAK_GB_GUESS="${FINE_PEAK_GB:-96}" $PY autoscale.py workers --sessions "$N_ALL" 2>/dev/null || echo 1)"
+        # shellcheck disable=SC2086
+        if run_show $PY autoscale.py measure -- $PY run_analysis.py --source extract \
+            --dates "${VOLATILE},${BASELINE},${MWCB}" \
+            --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
+            --interval "$FINE_INTERVAL" --n-levels 10 --max-workers "$AS_FINE" \
+            --qc-action "$QC_ACTION" $CACHE_FLAGS \
+            --output-dir "$OUT" --save-dataset --only extract; then
+          FINE_FRAMES="$(find "${OUT}" -name "frames_${FINE_INTERVAL}.pkl" 2>/dev/null \
+                         | xargs -r ls -1t 2>/dev/null | head -1 || true)"
+        fi
+        if [ -z "${FINE_FRAMES:-}" ] && [ "$DRY" -eq 1 ]; then
+          FINE_FRAMES="${OUT}/frames_${FINE_INTERVAL}.pkl"   # placeholder: dry-run prints commands
+        fi
+        if [ -n "${FINE_FRAMES:-}" ]; then
+          FINE_DONE=1
+          run_show $PY derive_frames.py --pickle "$FINE_FRAMES" --target "$INTERVAL" \
+              --fine-interval "$FINE_INTERVAL" --cache-dir "$CACHE_DIR" --levels 10 \
+              --clock receipt --verify-existing \
+            || info "derivation reported issues (see above) -- direct caches were kept; the coarse extraction below re-pulls whatever the cache is missing"
+        else
+          info "fine extraction produced no frames -- falling back to a direct ${INTERVAL} pull"
+        fi
       fi
       # shellcheck disable=SC2086
       run_show $PY autoscale.py measure -- $PY run_analysis.py --source extract \
@@ -440,7 +481,10 @@ fi
 # paper's mains must never die over its microscope. The frames land in the same
 # interval-keyed extract cache, so a later run reuses them like any other day.
 # ══════════════════════════════════════════════════════════════════════════════
-FINE_FRAMES=""
+# preserve, don't reset: STAGE 2's pull-once path may already have extracted the fine frames
+# (and derived the coarse ones from them) -- clearing the variable here made STAGE 2b re-brand
+# that as "no frames" and stages 3/5/6b lost the fine grid entirely
+FINE_FRAMES="${FINE_FRAMES:-}"
 if [ "$WITH_FINE" -eq 1 ] && have_stage 2; then
   case "$SOURCE" in
     demo)
@@ -459,6 +503,10 @@ if [ "$WITH_FINE" -eq 1 ] && have_stage 2; then
       ;;
     extract)
       say "STAGE 2b reconstruct the ${FINE_INTERVAL} session books (fine grid)"
+      if [ "${FINE_DONE:-0}" -eq 1 ]; then
+        info "already extracted in STAGE 2 (pull once, process twice): $FINE_FRAMES"
+        info "  the ${INTERVAL} frames this run analyzed were DERIVED from these -- one vendor pull."
+      else
       FDATES="${FINE_DATES:-${VOLATILE},${BASELINE},${MWCB}}"
       N_FINE="$(echo "$FDATES" | tr ',' '\n' | grep -c . || echo 1)"
       # ~100x the rows of a 1s frame, and the per-worker peak has never been MEASURED at this
@@ -489,6 +537,7 @@ if [ "$WITH_FINE" -eq 1 ] && have_stage 2; then
       elif [ "$DRY" -eq 0 ]; then
         info "FINE-GRID EXTRACTION PRODUCED NO FRAMES -- continuing without it; the 1s run is"
         info "  unaffected. STAGE 5's Epps pair and STAGE 6b will be skipped this run."
+      fi
       fi
       ;;
   esac

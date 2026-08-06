@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.9.60 -- pull once, process twice
+
+The two-grid runs paid the vendor twice: STAGE 2 fetched and replayed every session's messages for
+the 1s books, STAGE 2b fetched and replayed the SAME messages for the 10ms books -- 10-25 minutes
+of vendor I/O per session per grid, the dominant cost of a fresh extraction. The redundancy was
+structural: the 1s grid points are a strict subset of the 10ms grid, and a book row is the state
+at-or-before its timestamp, so the coarse frame is EXACTLY derivable from the fine one.
+
+* **`derive_frames.py`** (new): column-aware derivation. Book and market-state columns by row
+  selection (exact -- the coarse row IS the fine row at the same timestamp); flow counts/volumes
+  by summing left-labeled sub-bins (exact); `*_trade_px` last-non-NaN (exact); `*_trade_vwap`
+  recombined volume-weighted on signed volumes (exact when every print is signed; the
+  approximation when unsigned prints exist is MEASURED, not assumed -- see verification). One
+  documented boundary case: the final 16:00:00 bar's flow can undercount post-close prints
+  relative to a direct extraction (the fine grid ends at 16:00:00.010); book columns unaffected.
+* **Cache semantics mirror the extractor**: derived frames land in the same interval-keyed
+  session cache under the same `_cache_path` naming, only when they pass `session_qc`, and an
+  existing directly-extracted cache is NEVER overwritten.
+* **`--verify-existing`**: wherever a direct coarse cache already exists, the derived frame is
+  compared against it -- book/state exact, flow sums exact (final bar reported separately), vwap
+  deviation measured. On a workbench with a populated 1s cache this validates the equivalence on
+  the real feed for every session before derivation is ever relied on. Exit 3 on real mismatch.
+* **Driver**: when both grids are on, the full fine sample is wanted (`--fine-dates` unset), and
+  the coarse interval is an integer multiple of the fine one, STAGE 2 now extracts the FINE
+  frames first, derives + caches the coarse ones, and the coarse invocation becomes cache hits --
+  one vendor pull for both grids. STAGE 2b reports the reuse instead of re-extracting. Any
+  fine-side failure falls through to the old direct coarse pull; `--fine-dates` subsets and
+  `--no-fine` keep the old behaviour entirely. Fixed while wiring: STAGE 2b's section reset
+  `FINE_FRAMES` unconditionally, which would have re-branded the pull-once frames as "none
+  produced" and cost stages 3/5/6b the fine grid.
+
+New gate: `test_pull_once.py` (5 checks): bit-exactness against an independently built direct
+frame from the same synthetic event stream; misalignment refused both ways; cache naming /
+never-overwrite / qc gating; the verify CLI catching a corrupted cell (exit 3) and passing a
+clean cache (exit 0); and the driver's pull-once ordering with both fallbacks. STAGE 1 is now
+55 modules.
+
 ## v0.9.59 -- silence the roll measurement's per-fetch FutureWarning
 
 One line, caught reading the first live two-grid run's log: `check_roll._num` replaced the Athena
