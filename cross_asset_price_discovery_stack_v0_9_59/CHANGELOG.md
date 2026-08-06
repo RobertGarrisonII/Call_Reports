@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9.59 -- silence the roll measurement's per-fetch FutureWarning
+
+One line, caught reading the first live two-grid run's log: `check_roll._num` replaced the Athena
+NULL sentinel "\\N" before `pd.to_numeric` -- redundant (errors="coerce" already coerces it) and,
+on pandas >= 2.2, the source of a FutureWarning about silent object->float downcasting emitted
+once per statistics fetch during extraction. The replace() is gone; the reset-proof max-read and
+the sentinel handling are unchanged (pinned under -W error::FutureWarning).
+
 ## v0.9.58 -- both grids, automatically, for the whole sample
 
 The two-grid design stops being opt-in. Every `--source extract` run now does BOTH intervals for

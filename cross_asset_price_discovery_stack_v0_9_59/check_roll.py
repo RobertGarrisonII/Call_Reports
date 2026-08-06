@@ -82,7 +82,10 @@ def _num(df, col):
     which the max over a few pre-open rows is equally safe."""
     if df is None or col not in df.columns:
         return np.nan
-    v = pd.to_numeric(df[col].replace("\\N", np.nan), errors="coerce").dropna()
+    # errors="coerce" already turns the Athena NULL sentinel "\\N" (and any other non-numeric)
+    # into NaN -- the old explicit replace() was redundant and, on pandas >=2.2, emitted a
+    # once-per-fetch FutureWarning about silent object->float downcasting during extraction.
+    v = pd.to_numeric(df[col], errors="coerce").dropna()
     return float(v.max()) if len(v) else np.nan
 
 
