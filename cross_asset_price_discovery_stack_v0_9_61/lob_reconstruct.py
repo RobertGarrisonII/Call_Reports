@@ -38,6 +38,7 @@ multi-venue stream. ``reconstruct_session`` is the live entry point.
 from __future__ import annotations
 
 import logging
+from bisect import bisect_left, insort
 from collections import Counter, defaultdict, namedtuple
 from typing import Optional, Sequence
 
@@ -107,18 +108,95 @@ _CODE = {"mt_add_order": _ADD, "mt_cancel_order": _CANCEL, "mt_modify_order": _M
 # Per-venue book + consolidation
 # ════════════════════════════════════════════════════════════════════════════
 class _Book:
-    """Per-feed order books. orders[(feed, ref)] = [side, price, size]; bid/ask[feed][price] = size."""
+    """Per-feed order books. orders[(feed, ref)] = [side, price, size]; bid/ask[feed][price] = size.
 
-    def __init__(self):
+    INCREMENTAL CONSOLIDATED TRACKING (v0.9.61). The replay used to rebuild the consolidated
+    ladder from scratch at every grid snapshot -- iterate every price level of every venue, full
+    sort, per-venue round-lot scan -- which is O(whole book) per snapshot. At 1s (23,401 snaps)
+    that cost ~40% of the replay; at 10ms (2,340,001 snaps) it was ~1.4 ms x 2.34M ~ an hour and a
+    half PER LEG PER SESSION of pure snapshot overhead, which is what made the fine-grid pulls
+    look hung. Every level mutation now routes through ``_setlv``, which maintains, as it goes:
+
+      cons[side]   price -> EFFECTIVE consolidated size (venue-level sizes summed, the odd-lot
+                   filter applied per venue level exactly as ``consolidated`` does)
+      plist[side]  the prices with positive effective size, kept SORTED (bisect insert/remove on
+                   0<->positive transitions only -- C-speed memmove, rare relative to size updates)
+      rlp[side]    feed -> sorted prices whose VENUE level size >= round_lot (Reg NMS round-lot
+                   best per venue, for the NBBO columns)
+
+    A snapshot is then O(levels reported): top-K = the tail/head of ``plist``, NBBO = the per-feed
+    list ends. Sizes are exchange integers in float64, so the incremental sums are exact (no
+    drift); ``consolidated()``/``best_round_lot()`` remain as the reference implementation, used
+    by the legacy snap path that the equivalence test replays against this one."""
+
+    def __init__(self, round_lot: int = 100, odd_lot_inclusive: bool = True, track: bool = True):
         self.orders: dict = {}
         self.bid: dict = defaultdict(lambda: defaultdict(float))
         self.ask: dict = defaultdict(lambda: defaultdict(float))
         self.mbo_feeds: set = set()                  # feeds populated by order replay
         self.mbp_feeds: set = set()                  # feeds populated by price-level updates
         self.stats = Counter()
+        self.rlot = float(round_lot)
+        self.oli = bool(odd_lot_inclusive)
+        self.track = bool(track)                     # False -> _setlv skips aggregate upkeep (legacy
+                                                     # snap path rebuilds per snapshot; zero event tax)
+        self.cons = ({}, {})                         # side -> {price: effective consolidated size}
+        self.plist = ([], [])                        # side -> sorted prices with effective size > 0
+        self.rlp = ({}, {})                          # side -> {feed: sorted round-lot prices}
 
     def _lv(self, feed, side):
         return self.bid[feed] if side == 0 else self.ask[feed]      # side: 0=Bid, 1=Ask (int codes)
+
+    def _setlv(self, feed, side, price, new):
+        """THE level-mutation choke point: set (feed, side, price) to ``new`` (<=EPS deletes) and
+        keep the consolidated aggregates in step. Every mutation path funnels here."""
+        lv = self._lv(feed, side)
+        old = lv.get(price, 0.0)
+        if new <= EPS:
+            if old:
+                del lv[price]
+            new = 0.0
+        else:
+            lv[price] = new
+        if new == old or not self.track:
+            return
+        # effective (odd-lot-filtered) consolidated contribution of THIS venue level
+        if self.oli:
+            d = new - old
+        else:
+            d = (new if new >= self.rlot else 0.0) - (old if old >= self.rlot else 0.0)
+        if d:
+            c = self.cons[side]
+            prev = c.get(price, 0.0)
+            cur = prev + d
+            if cur <= EPS:
+                if prev > EPS:
+                    c.pop(price, None)
+                    lst = self.plist[side]
+                    i = bisect_left(lst, price)
+                    if i < len(lst) and lst[i] == price:
+                        del lst[i]
+            else:
+                c[price] = cur
+                if prev <= EPS:
+                    insort(self.plist[side], price)
+        # per-venue Reg NMS round-lot membership (for the NBBO columns)
+        was_rl = old >= self.rlot
+        is_rl = new >= self.rlot
+        if was_rl != is_rl:
+            rl = self.rlp[side]
+            lst = rl.get(feed)
+            if is_rl:
+                if lst is None:
+                    rl[feed] = [price]
+                else:
+                    insort(lst, price)
+            elif lst is not None:
+                i = bisect_left(lst, price)
+                if i < len(lst) and lst[i] == price:
+                    del lst[i]
+                if not lst:
+                    del rl[feed]
 
     def add(self, feed, ref, side, price, size):
         if not (np.isfinite(price) and np.isfinite(size) and size > 0) or side not in (0, 1):
@@ -128,7 +206,8 @@ class _Book:
         if key in self.orders:                      # duplicate add ref -> replace (treat as re-add)
             self.remove(feed, ref); self.stats["dup_add"] += 1
         self.orders[key] = [side, price, size]
-        self._lv(feed, side)[price] += size
+        lv = self._lv(feed, side)
+        self._setlv(feed, side, price, lv.get(price, 0.0) + size)
 
     def set_level(self, feed, side, price, qty):
         """MBP: assign the NEW aggregate size at (feed, side, price); qty<=0 deletes the level.
@@ -137,11 +216,7 @@ class _Book:
         if side not in (0, 1) or not np.isfinite(price):
             return
         self.mbp_feeds.add(feed)
-        lv = self._lv(feed, side)
-        if not np.isfinite(qty) or qty <= EPS:
-            lv.pop(price, None)
-        else:
-            lv[price] = qty                          # assign, not +=
+        self._setlv(feed, side, price, qty if np.isfinite(qty) else 0.0)
         self.stats["mbp_level_events"] += 1
 
     def remove(self, feed, ref):
@@ -150,9 +225,7 @@ class _Book:
             return False
         side, price, size = o
         lv = self._lv(feed, side)
-        lv[price] -= size
-        if lv[price] <= EPS:
-            lv.pop(price, None)
+        self._setlv(feed, side, price, lv.get(price, 0.0) - size)
         return True
 
     def reduce(self, feed, ref, qty):               # trade against a referenced resting order
@@ -162,12 +235,10 @@ class _Book:
         side, price, size = o
         lv = self._lv(feed, side)
         if size - qty <= EPS:
-            lv[price] -= size
-            if lv[price] <= EPS:
-                lv.pop(price, None)
+            self._setlv(feed, side, price, lv.get(price, 0.0) - size)
             self.orders.pop((feed, ref), None)
         else:
-            lv[price] -= qty
+            self._setlv(feed, side, price, lv.get(price, 0.0) - qty)
             o[2] = size - qty
         return True
 
@@ -188,9 +259,7 @@ class _Book:
         side, price, size = o
         lv = self._lv(feed, side)
         if not np.isfinite(leaves) or leaves <= EPS:
-            lv[price] -= size
-            if lv[price] <= EPS:
-                lv.pop(price, None)
+            self._setlv(feed, side, price, lv.get(price, 0.0) - size)
             self.orders.pop((feed, ref), None)
         else:
             if leaves > size + EPS:
@@ -202,9 +271,7 @@ class _Book:
                 # rate -- a level silently inflated on the bid side is a crossed book.
                 self.stats["trade_leaves_gt_size"] += 1
                 return True
-            lv[price] += (leaves - size)              # assign the venue's figure, keep the level in step
-            if lv[price] <= EPS:
-                lv.pop(price, None)
+            self._setlv(feed, side, price, lv.get(price, 0.0) + (leaves - size))
             o[2] = leaves
             if abs(leaves - size) > EPS:
                 self.stats["trade_leaves_corrected"] += 1
@@ -220,6 +287,11 @@ class _Book:
             del self.orders[key]
             n += 1
         n_lv = len(self.bid.get(feed, ())) + len(self.ask.get(feed, ()))
+        for side in (0, 1):
+            lv = (self.bid if side == 0 else self.ask).get(feed)
+            if lv:
+                for price in list(lv.keys()):        # route each level through the choke point so
+                    self._setlv(feed, side, price, 0.0)   # the consolidated aggregates stay in step
         self.bid.pop(feed, None)
         self.ask.pop(feed, None)
         self.stats["feed_clears"] += 1
@@ -233,9 +305,7 @@ class _Book:
         # consumed (opposite-side) order and crosses the book -- see reduce_at_price.
         lv = self._lv(feed, side)
         if price in lv:
-            lv[price] -= qty
-            if lv[price] <= EPS:
-                lv.pop(price, None)
+            self._setlv(feed, side, price, lv[price] - qty)
 
     def reduce_at_price(self, feed, price, qty):
         """Trade with no matching resting ref: consume `qty` of displayed size at `price` on whichever
@@ -257,9 +327,9 @@ class _Book:
         else:
             side, lv = (0, bid) if on_bid else (1, ask)
         if qty >= lv[price] - EPS:
-            lv.pop(price, None)
+            self._setlv(feed, side, price, 0.0)
         else:
-            lv[price] -= qty
+            self._setlv(feed, side, price, lv[price] - qty)
         return side
 
     def modify(self, feed, prev_ref, ref, side, price, size, prev_price, prev_size, maintain):
@@ -507,7 +577,9 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
                      session=("09:30", "16:00"), tz: str = "America/New_York",
                      date_str: Optional[str] = None, clock: str = "exchange",
                      price_scale: float = 1.0, consume: bool = False, order_by: str = "sequence",
-                     rules: Optional[dict] = None) -> pd.DataFrame:
+                     rules: Optional[dict] = None, progress_cb=None,
+                     progress_every: int = 2_000_000,
+                     legacy_snap: Optional[bool] = None) -> pd.DataFrame:
     """Replay the messages into per-venue books and sample the CONSOLIDATED book as-of each grid
     point. ``messages`` is a dict {message_type: DataFrame} (raw mstwx columns, tz-aware index).
 
@@ -554,37 +626,115 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
             raise ValueError(f"unknown replay rule(s): {sorted(_bad)}; valid: {sorted(_R)}")
         _R.update(rules)
 
-    book = _Book()
+    # snap strategy: the incremental aggregates cost ~2-3us of upkeep PER EVENT and repay
+    # ~O(book size) PER SNAPSHOT. Coarse grids (23k snaps against millions of events) are
+    # event-dominated -- the legacy rebuild is cheaper there and tracking is switched off
+    # entirely. Fine grids (100k+ snaps) are snapshot-dominated -- the incremental path is the
+    # difference between minutes and hours. legacy_snap=None (default) picks by grid size;
+    # True/False forces (the equivalence gate replays both and requires identical output).
+    if legacy_snap is None:
+        legacy_snap = len(grid_ns) < 100_000
+    book = _Book(round_lot=round_lot, odd_lot_inclusive=odd_lot_inclusive, track=not legacy_snap)
     book.stats["rule_apply_clears"] = int(_R["apply_clears"])
     book.stats["rule_use_leaves"] = int(_R["use_leaves"])
     book.stats["rule_consume_undisplayed"] = int(_R["consume_undisplayed"])
     for _c, _nm in ((_ADD, "n_add"), (_CANCEL, "n_cancel"), (_MODIFY, "n_modify"), (_TRADE, "n_trade"),
                     (_LEVEL_SET, "n_level_set"), (_LEVEL_DEL, "n_level_del")):
         book.stats[_nm] = int(np.count_nonzero(ev.code == _c))   # message-type counts (for no-ref RATES)
-    rows, gi, ng = [], 0, len(grid_ns)
+    gi, ng = 0, len(grid_ns)
+    # canonical column order (must match the historical dict insertion order bit-for-bit)
+    colnames = []
+    for i in range(levels):
+        colnames += [f"{asset}_bidprice_{i+1}", f"{asset}_bidquantity_{i+1}",
+                     f"{asset}_askprice_{i+1}", f"{asset}_askquantity_{i+1}"]
+    colnames += [f"{asset}_nbbo_bid", f"{asset}_nbbo_ask", f"{asset}_mid"]
+    ncols = len(colnames)
+    # Preallocated output. The old list-of-dicts held ng x ~45 python objects -- at 10ms that is
+    # 2.34M dicts (multiple GB per leg) before pd.DataFrame even started copying them.
+    out_arr = np.empty((ng, ncols), dtype=float)
+    _last_lc = _last_x = False                       # crossing flags of the most recent snapshot
 
-    def _snap():
+    def _snap_legacy():
+        """The original per-snapshot rebuild, kept verbatim as the REFERENCE implementation: the
+        equivalence gate replays the same messages through both paths and requires identical
+        frames and stats. O(whole book) per call -- do not use on fine grids."""
         bagg = book.consolidated("Bid", round_lot, odd_lot_inclusive)
         aagg = book.consolidated("Ask", round_lot, odd_lot_inclusive)
         bids = sorted(bagg.items(), key=lambda x: -x[0])[:levels]
         asks = sorted(aagg.items(), key=lambda x: x[0])[:levels]
-        row = {}
+        row = np.empty(ncols)
         for i in range(levels):
-            row[f"{asset}_bidprice_{i+1}"] = bids[i][0] if i < len(bids) else np.nan
-            row[f"{asset}_bidquantity_{i+1}"] = bids[i][1] if i < len(bids) else 0.0
-            row[f"{asset}_askprice_{i+1}"] = asks[i][0] if i < len(asks) else np.nan
-            row[f"{asset}_askquantity_{i+1}"] = asks[i][1] if i < len(asks) else 0.0
+            row[4 * i] = bids[i][0] if i < len(bids) else np.nan
+            row[4 * i + 1] = bids[i][1] if i < len(bids) else 0.0
+            row[4 * i + 2] = asks[i][0] if i < len(asks) else np.nan
+            row[4 * i + 3] = asks[i][1] if i < len(asks) else 0.0
         nb, na = book.best_round_lot("Bid", round_lot), book.best_round_lot("Ask", round_lot)
-        row[f"{asset}_nbbo_bid"] = nb if nb is not None else np.nan
-        row[f"{asset}_nbbo_ask"] = na if na is not None else np.nan
+        row[ncols - 3] = nb if nb is not None else np.nan
+        row[ncols - 2] = na if na is not None else np.nan
         cb = bids[0][0] if bids else np.nan
         ca = asks[0][0] if asks else np.nan
-        row[f"{asset}_mid"] = (cb + ca) / 2.0 if (bids and asks) else np.nan
-        if bids and asks and bids[0][0] >= asks[0][0] - EPS:
-            book.stats["consolidated_locked_or_crossed"] += 1
-            if bids[0][0] > asks[0][0] + EPS:                   # STRICTLY crossed: impossible for a real
-                book.stats["consolidated_crossed"] += 1         # matching engine -> stale orders pinning the top
-        return row
+        row[ncols - 1] = (cb + ca) / 2.0 if (bids and asks) else np.nan
+        lc = bool(bids and asks and bids[0][0] >= asks[0][0] - EPS)
+        x = bool(lc and bids[0][0] > asks[0][0] + EPS)
+        return row, lc, x
+
+    def _snap_fast():
+        """O(levels) snapshot from the incrementally-maintained consolidated aggregates."""
+        plb, pla = book.plist
+        consb, consa = book.cons
+        row = np.empty(ncols)
+        nb_lv = len(plb); na_lv = len(pla)
+        for i in range(levels):
+            if i < nb_lv:
+                p = plb[nb_lv - 1 - i]               # bids: sorted ascending -> take from the end
+                row[4 * i] = p; row[4 * i + 1] = consb[p]
+            else:
+                row[4 * i] = np.nan; row[4 * i + 1] = 0.0
+            if i < na_lv:
+                p = pla[i]
+                row[4 * i + 2] = p; row[4 * i + 3] = consa[p]
+            else:
+                row[4 * i + 2] = np.nan; row[4 * i + 3] = 0.0
+        nb = na = None
+        for lst in book.rlp[0].values():             # per-venue round-lot best, best across venues
+            v = lst[-1]
+            if nb is None or v > nb:
+                nb = v
+        for lst in book.rlp[1].values():
+            v = lst[0]
+            if na is None or v < na:
+                na = v
+        row[ncols - 3] = nb if nb is not None else np.nan
+        row[ncols - 2] = na if na is not None else np.nan
+        if nb_lv and na_lv:
+            cb = plb[-1]; ca = pla[0]
+            row[ncols - 1] = (cb + ca) / 2.0
+            lc = bool(cb >= ca - EPS)
+            x = bool(lc and cb > ca + EPS)
+        else:
+            row[ncols - 1] = np.nan
+            lc = x = False
+        return row, lc, x
+
+    _snap_row = _snap_legacy if legacy_snap else _snap_fast
+
+    def _flush(upto_ts):
+        """Emit snapshots for every grid point strictly before ``upto_ts``. The book does not
+        change between grid points inside one flush run, so the FIRST snapshot is computed and the
+        rest are row copies -- with the locked/crossed stats incremented per emitted snapshot,
+        exactly as the per-point rebuild did."""
+        nonlocal gi, _last_lc, _last_x
+        if not (gi < ng and grid_ns[gi] < upto_ts):
+            return
+        row, lc, x = _snap_row()
+        _last_lc, _last_x = lc, x
+        while gi < ng and grid_ns[gi] < upto_ts:
+            out_arr[gi] = row
+            if lc:
+                book.stats["consolidated_locked_or_crossed"] += 1
+                if x:
+                    book.stats["consolidated_crossed"] += 1
+            gi += 1
 
     tsa, codea, feeda, sidea = ev.ts, ev.code, ev.feed, ev.side
     pricea, sizea, ppricea, psizea = ev.price, ev.size, ev.pprice, ev.psize
@@ -598,15 +748,19 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
     # Advance on the running maximum instead, which is identical when the input IS sorted and
     # bounded when it is not. Inversions are counted rather than assumed away.
     ts_hi = np.int64(-(2 ** 63))
-    for j in range(len(tsa)):
+    _nev = len(tsa)
+    for j in range(_nev):
+        if progress_cb is not None and j and (j % progress_every) == 0:
+            progress_cb("%s replay: %d%% events (%d/%d), %d%% grid"
+                        % (asset, int(100 * j / _nev), j, _nev, int(100 * gi / max(ng, 1))))
         ts = tsa[j]
         if ts < ts_hi:
             book.stats["clock_inversions"] += 1
             ts = ts_hi                              # never let one late stamp jump the grid
         else:
             ts_hi = ts
-        while gi < ng and grid_ns[gi] < ts:         # as-of: snapshot reflects all events with ts <= grid
-            rows.append(_snap()); gi += 1
+        if gi < ng and grid_ns[gi] < ts:            # as-of: snapshot reflects all events with ts <= grid
+            _flush(ts)                              # (guard inlined: a no-op call per event is ~2us x 10M)
         code = codea[j]; feed = feeda[j]
         if code == _ADD:
             book.add(feed, refa[j], sidea[j], pricea[j], sizea[j])
@@ -659,8 +813,7 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
                     if book.reduce_at_price(feed, pricea[j], sizea[j]) < 0:
                         book.stats["trade_no_ref_undisplayed"] += 1   # print at a non-displayed price: no-op
         book.stats["events"] += 1
-    while gi < ng:                                  # flush remaining grid with the final state
-        rows.append(_snap()); gi += 1
+    _flush(np.iinfo(np.int64).max)                  # flush remaining grid with the final state
 
     fname = ev.feed_names
     def _names(codes):                              # int feed codes -> sorted feed-name strings (for attrs)
@@ -690,8 +843,9 @@ def reconstruct_book(messages: dict, asset: str = "SPY", levels: int = 10, inter
                     book.stats.get("rule_apply_clears", 1), book.stats.get("rule_use_leaves", 1),
                     book.stats.get("rule_consume_undisplayed", 0))
 
-    out = pd.DataFrame(rows, index=grid)
+    out = pd.DataFrame(out_arr, index=grid, columns=colnames)
     out.index.name = "time"
+    out.attrs["snap_path"] = "legacy" if legacy_snap else "fast"
     out.attrs["lob_stats"] = dict(book.stats)
     out.attrs["resting_orders_eod"] = len(book.orders)
     out.attrs["mbo_feeds"] = _names(book.mbo_feeds)
@@ -843,7 +997,7 @@ def reconstruct_session(date_str: str, product: str = "SPY", product_type: str =
     out = reconstruct_book(msgs, asset=ml.canonical_root(product, product_type), levels=levels,
                            interval=interval, round_lot=round_lot, odd_lot_inclusive=odd_lot_inclusive,
                            session=session, tz=tz, date_str=date_str, clock=clock, price_scale=price_scale,
-                           consume=True, rules=rules)
+                           consume=True, rules=rules, progress_cb=progress_cb)
     out.attrs["message_counts"] = counts
     out.attrs["book_family"] = family
     out.attrs["activity_seconds"] = list(act)

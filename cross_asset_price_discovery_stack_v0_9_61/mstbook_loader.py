@@ -1188,12 +1188,40 @@ def _cache_path(cache_dir: str, label: str, interval: str, levels: int, clock: s
     return os.path.join(cache_dir, f"session_{ymd}_{interval}_L{int(levels)}_{clock}{tag}.pkl")
 
 
+def heartbeat_writer(hb_dir: str, label: str, interval: str, user_cb=None):
+    """File-based per-session liveness for PARALLEL extraction. Console heartbeats cannot stream
+    cleanly from process workers, which made a multi-hour fine-grid STAGE 2b look HUNG -- the
+    2026-08-06 run went silent for the whole 10ms pull. Each call atomically rewrites one small
+    JSON (``<hb_dir>/<label>_<interval>.json``) with the current phase and elapsed time;
+    ``extraction_status.py`` tabulates the directory (point ``watch -n 30`` at it). Never raises:
+    a full disk or unwritable dir costs the heartbeat, not the session."""
+    t0 = time.time()
+    path = os.path.join(hb_dir, "%s_%s.json" % (str(label).replace("/", "-"), interval)) if hb_dir else ""
+
+    def _beat(msg):
+        if path:
+            try:
+                import json as _json
+                os.makedirs(hb_dir, exist_ok=True)
+                tmp = path + ".tmp%d" % os.getpid()
+                with open(tmp, "w") as fh:
+                    _json.dump({"session": str(label), "interval": interval, "phase": str(msg),
+                                "elapsed_s": round(time.time() - t0, 1), "pid": os.getpid(),
+                                "updated_epoch": time.time(),
+                                "updated": time.strftime("%Y-%m-%dT%H:%M:%S")}, fh)
+                os.replace(tmp, path)
+            except Exception:
+                pass
+        if user_cb is not None:
+            user_cb(msg)
+    return _beat
+
+
 def _extract_one_session(spec, cfg: dict, progress_cb=None):
     """Picklable per-session worker (one trading day): reconstruct SPY + front-month ES books on one
     GPS clock, attach the trade tape, and return ``(label, regime, df, diag_msg, warn_msg, qc)``.
     ``cfg`` is a dict of primitives only (so it pickles to loky/process workers); ``progress_cb`` is
-    used only on the serial path (None under parallelism, where per-fetch heartbeats can't stream
-    cleanly).
+    chained behind a file heartbeat (see ``heartbeat_writer``) so parallel workers stay observable.
 
     When ``cfg['cache_dir']`` is set the finished frame is written there and, if ``cfg['resume']``,
     a previous run's frame is reused instead of re-fetching -- a session costs 10-25 minutes of
@@ -1203,6 +1231,11 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
     label, regime = _spec_parts(spec)
     ymd = label.replace("-", "")
     cache_dir = cfg.get("cache_dir") or ""
+    # file heartbeat: observable liveness for every worker, serial or parallel (the passed
+    # progress_cb -- serial console updates -- is chained behind it)
+    progress_cb = heartbeat_writer(os.path.join(cache_dir, "progress") if cache_dir else "",
+                                   label, cfg["interval"], user_cb=progress_cb)
+    progress_cb("starting")
     cpath = (_cache_path(cache_dir, label, cfg["interval"], cfg["levels"], cfg["clock"],
                          cfg.get("es_book_source", "aggregated"))
              if cache_dir else "")
@@ -1237,6 +1270,7 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                                 "notice)", label, _cp, _got_src, _want_src)
                 continue
             qc = session_qc(df)
+            progress_cb("DONE (cache hit)")
             return (label, regime, df, "reused cached %s: %d rows (%s)" % (label, len(df), _cp), None, qc)
         except Exception as exc:                           # a corrupt/partial cache must never win
             log.warning("%s: cache read failed (%s); re-extracting", label, exc)
@@ -1318,6 +1352,7 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
     # equity halt. Fetching only the equity stream made the futures pause invisible, and it is
     # exactly the kind of cross-asset event this paper is about. It also cost the ES price limits
     # (below), which CME does publish.
+    progress_cb("halt/status streams")
     for _asset, _prod, _ptype, _scale in (("SPY", "SPY", "direct", 1.0),
                                           ("ES", contract, "futures", cfg["futures_scale"])):
         try:
@@ -1388,6 +1423,7 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
         df.attrs["roll_measurement"] = _roll_rep
     if locals().get("_es_from_ladder"):            # so session_qc knows to run the LADDER checks
         df.attrs["book_source_ES"] = "aggregated"  # (the crossed test is vacuous on that leg)
+    progress_cb("qc")
     qc = session_qc(df, crossed_tol=float(cfg.get("crossed_tol", 0.005)))
     df.attrs["qc"] = qc
     med_spy = qc["SPY"]["median_bid"]
@@ -1408,12 +1444,14 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
         warns.append("%s DEGRADED -- %s" % (label, "; ".join(qc["reasons"])))
     if qc["ok"] and cpath:                                 # only memoize a session worth reusing
         try:
+            progress_cb("caching frame")
             os.makedirs(cache_dir, exist_ok=True)
             tmp = cpath + f".tmp{os.getpid()}"
             df.to_pickle(tmp)
             os.replace(tmp, cpath)                         # atomic: a reader never sees a partial file
         except Exception as exc:
             log.warning("%s: could not cache session to %s (%s)", label, cpath, exc)
+    progress_cb("DONE")
     return (label, regime, df, diag, ("\n".join(warns) if warns else None), qc)
 
 
@@ -1431,6 +1469,12 @@ def _guarded_session(spec, cfg: dict, progress_cb=None):
     except Exception as exc:
         msg = "%s: EXTRACTION FAILED (%s: %s)" % (label, type(exc).__name__,
                                                   str(exc).splitlines()[0][:300])
+        try:                                        # the status board must show the failure too
+            heartbeat_writer(os.path.join(cfg.get("cache_dir") or "", "progress")
+                             if cfg.get("cache_dir") else "",
+                             label, cfg.get("interval", "?"))("FAILED: %s" % type(exc).__name__)
+        except Exception:
+            pass
         # logged by extract_sessions' _on_done in the PARENT process (a worker-side log record may
         # never reach the parent's handlers, and logging it in both places double-prints it)
         return (label, regime, None, msg, None,
@@ -1564,8 +1608,11 @@ def extract_sessions(date_specs: Sequence, es_symbol: str = "ES", levels: int = 
     parallel = (max_workers or 1) > 1 and len(specs) > 1 and backend != "sequential"
     be = backend or ("process" if parallel else "sequential")
     if parallel:
-        log.info("extracting %d sessions in parallel (backend=%s, max_workers=%d); per-fetch heartbeats "
-                 "are suppressed -- a completion line prints as each day lands", len(specs), be, max_workers)
+        log.info("extracting %d sessions in parallel (backend=%s, max_workers=%d); per-session "
+                 "heartbeats stream to %s -- run `python extraction_status.py --cache-dir %s` "
+                 "(or watch -n 30 ...) to see what every worker is doing; a completion line "
+                 "prints here as each day lands", len(specs), be, max_workers,
+                 os.path.join(cache_dir or "<cache>", "progress"), cache_dir or "<cache>")
         triples = _parallel_sessions(functools.partial(_guarded_session, cfg=cfg),
                                      specs, max_workers, be, _on_done)
     else:

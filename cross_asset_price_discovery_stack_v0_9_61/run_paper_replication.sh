@@ -350,6 +350,7 @@ if have_stage 1; then
            test_fine_grid_stage.py \
            test_masked_run_casualties.py \
            test_pull_once.py \
+           test_replay_fast_snap.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -392,6 +393,7 @@ if have_stage 2; then
         info "session cache: ${CACHE_DIR} (resume=$([ "$RESUME" -eq 1 ] && echo yes || echo no))"
         info "  a day already extracted there is reused, not re-fetched -- so a run that dies"
         info "  partway costs only the missing days on the retry. --no-cache disables it."
+        info "  LIVE STATUS of every worker:  watch -n 30 $PY extraction_status.py --cache-dir ${CACHE_DIR}"
       fi
       # ── PULL ONCE, PROCESS TWICE ────────────────────────────────────────────
       # When both grids are on, the whole fine sample is wanted, and the coarse interval is an

@@ -1,5 +1,45 @@
 # Changelog
 
+## v0.9.61 -- the 10ms pulls were not hung: the snapshot was O(whole book), in silence
+
+The first two-grid run went quiet at the fine pulls. Two defects, one visible and one structural:
+parallel workers suppressed every heartbeat (nothing printed until a day completed), and the
+replay rebuilt the consolidated ladder FROM SCRATCH at every grid snapshot -- iterate every price
+level of every venue, full sort both sides, per-venue round-lot scan, build a 45-key dict --
+O(whole book) x 2,340,001 snapshots per leg per session at 10ms, plus multiple GB of row dicts
+per leg. Profiled on synthetic sessions before touching anything; both halves fixed:
+
+* **Incremental consolidated tracking** (`_Book._setlv`): every level mutation now routes through
+  one choke point that maintains, as it goes, the effective consolidated size per price (odd-lot
+  filter applied per venue level exactly as `consolidated()` does), a SORTED list of live prices
+  (bisect insert/remove on zero-crossings only), and per-venue round-lot price lists for the
+  Reg NMS NBBO. A snapshot is then O(levels reported) instead of O(book): top-K off the list
+  ends, NBBO off the per-feed list ends. Exchange sizes are integers in float64, so the
+  incremental sums are exact -- no drift.
+* **The legacy rebuild is kept in-tree as the reference** and grids under 100k points use it with
+  tracking switched OFF entirely (`legacy_snap=None` auto-picks): the upkeep costs ~2-3us per
+  event, which taxes the event-dominated 1s path for nothing. 1s extraction is unchanged to the
+  second; measured 10ms speedup 1.8-2.9x on synthetic sessions and growing with book depth --
+  the real SPY book is several times deeper than the synthetic one, and the snapshot term it
+  eliminates was the dominant term there.
+* **Rows are a preallocated float array**, not 2.34M python dicts; and one snapshot per flush run
+  is computed with row copies for the rest (the book cannot change between grid points inside a
+  run), with the locked/crossed stats incremented per emitted point exactly as before.
+* **Per-session heartbeats** (`mstbook_loader.heartbeat_writer`): every worker atomically
+  rewrites `<cache>/progress/<date>_<interval>.json` at each phase transition (fetches, replay
+  with % events / % grid every ~2M events, ES ladder, trade flow, halt/status, qc, caching,
+  DONE / FAILED). **`extraction_status.py`** (new) tabulates the directory -- session, grid,
+  phase, elapsed, heartbeat age -- and flags anything silent >15 min as STALLED?, which is the
+  signal separating "slow but moving" from stuck (check memory/swap first). The driver prints
+  the `watch -n 30` line at STAGE 2.
+* Equivalence is the whole point and it is PINNED: `test_replay_fast_snap.py` replays a stream
+  exercising every mutation path (MBO add/cancel/modify, trades with and without leavesquantity,
+  refless displayed + Hidden prints, an MBP set-level feed, a mid-session feed clear) through
+  both paths and requires byte-identical frames AND identical replay stats, at 1s and 10ms,
+  odd-lot inclusive and exclusive. `attrs["snap_path"]` records which path built a frame.
+
+STAGE 1 is now 56 modules.
+
 ## v0.9.60 -- pull once, process twice
 
 The two-grid runs paid the vendor twice: STAGE 2 fetched and replayed every session's messages for
