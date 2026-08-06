@@ -68,8 +68,10 @@
 #   ./run_paper_replication.sh --source extract --extract-cache /scratch/sessions
 #   ./run_paper_replication.sh --paper-sample           # the published 2014-2017 universe
 #   ./run_paper_replication.sh --volatile D,D,... --baseline D,D,...   # your own sample
-#   ./run_paper_replication.sh --source extract --with-fine            # + 10ms second grid
-#   ./run_paper_replication.sh --source extract --with-fine \
+#   ./run_paper_replication.sh --source extract              # BOTH grids (1s + 10ms), full sample
+#   ./run_paper_replication.sh --source extract --no-fine     # coarse grid only
+#   ./run_paper_replication.sh --source extract --fine-stages all   # full battery at 10ms too
+#   ./run_paper_replication.sh --source extract \
 #        --fine-dates 2020-03-09,2020-03-12,2020-03-16,2020-03-18,2022-03-24   # staged rollout
 #
 # Environment
@@ -87,18 +89,24 @@ PICKLE=""
 OUT_ROOT="output"
 INTERVAL="1s"
 FINE_INTERVAL="10ms"
-# ── the fine grid (--with-fine) ───────────────────────────────────────────────
-# A SECOND grid beside the 1s one, not a replacement: STAGE 2b extracts FINE_INTERVAL frames and
-# STAGE 6b runs only the exhibits 1s cannot resolve -- Hasbrouck IS bounds (rcorr~0.97 at 1s puts
-# them near [0,1]; asynchrony at 10ms breaks the simultaneity), the ecm_sde IS(S) mechanism,
-# co-jump lead-lag (16 of 17 co-jumps are "simultaneous" at 1s by construction), and the
-# staleness/noise diagnostics. STAGE 5 picks the fine frames up for the Table 9 Epps pair, which
-# is where the Pearson-vs-HY gap is largest. The 1s mains stay primary: at 10ms upwards of 99% of
-# snapshots are stale repeats (ES's coarse tick), so panel VECM / DCC / cross-impact would get
-# WORSE there, not better. --fine-dates runs a subset first (recommended for the first pass:
-# the per-worker peak has never been measured at 10ms; frames are ~100x the rows).
-WITH_FINE=0
+# ── the fine grid (ON BY DEFAULT since v0.9.58; --no-fine opts out) ──────────
+# A SECOND grid beside the 1s one, not a replacement, and now part of every extract run for the
+# WHOLE sample (benchmark + volatile + MWCB): STAGE 2b extracts FINE_INTERVAL frames, STAGE 3 QCs
+# them, STAGE 5 estimates the Table 9 Epps pair on them, and STAGE 6b runs the fine-grid analysis
+# battery. FINE_STAGES defaults to every stage that is statistically defensible AND tractable at
+# 10ms -- Hasbrouck IS bounds (rcorr~0.97 at 1s puts them near [0,1]; asynchrony at 10ms breaks
+# the simultaneity), the ecm_sde + liquidity_conditional IS(S) mechanism, cross-impact (the
+# fleeting-quote filter engages at this grid), co-jump lead-lag (16 of 17 co-jumps are
+# "simultaneous" at 1s by construction), and the staleness/noise diagnostics. What the default
+# leaves at 1s-only: panel / dcc / irf / robustness / legacy -- upwards of 99% of 10ms snapshots
+# are stale repeats of ES's coarse tick (the mains would get worse, not better) and the pooled
+# 56M-row designs / 200-horizon bootstraps are multi-hour, tens-of-GB stages. --fine-stages
+# overrides the list; --fine-stages all runs the full battery at the fine grid, wall-clock and
+# staleness caveats accepted. --fine-dates restricts the fine grid to a subset (useful for a
+# first pass: the per-worker peak has never been measured at 10ms; frames are ~100x the rows).
+WITH_FINE=1
 FINE_DATES=""
+FINE_STAGES="information_shares,ecm_sde,liquidity_conditional,cross_impact,jumps,microstructure"
 N_BOOT=499
 CORR_WINDOW=100
 N_LAGS="bic"          # integer, or an information criterion: bic | aic | hq
@@ -153,8 +161,10 @@ while [ "$#" -gt 0 ]; do
     --out-dir)       OUT_ROOT="$2"; shift 2 ;;
     --interval)      INTERVAL="$2"; shift 2 ;;
     --fine-interval) FINE_INTERVAL="$2"; shift 2 ;;
-    --with-fine)     WITH_FINE=1; shift ;;
+    --with-fine)     WITH_FINE=1; shift ;;                  # accepted no-op: fine is the default
+    --no-fine)       WITH_FINE=0; shift ;;
     --fine-dates)    FINE_DATES="$2"; WITH_FINE=1; shift 2 ;;
+    --fine-stages)   FINE_STAGES="$2"; shift 2 ;;
     --n-boot)        N_BOOT="$2"; shift 2 ;;
     --corr-window)   CORR_WINDOW="$2"; shift 2 ;;
     --n-lags)        N_LAGS="$2"; shift 2 ;;
@@ -424,7 +434,7 @@ if have_stage 2; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 2b — the fine grid (--with-fine): FINE_INTERVAL frames beside the 1s ones
+# STAGE 2b — the fine grid (DEFAULT ON; --no-fine opts out): FINE_INTERVAL frames beside the 1s ones
 #
 # ADDITIVE by design: a fine-grid failure warns and the 1s run continues -- the
 # paper's mains must never die over its microscope. The frames land in the same
@@ -444,7 +454,7 @@ if [ "$WITH_FINE" -eq 1 ] && have_stage 2; then
         info "fine grid: using existing ${FINE_INTERVAL} frames: $FINE_FRAMES"
       else
         info "fine grid: no ${FINE_INTERVAL} frames beside the 1s pickle (looked for ${_CAND})"
-        info "  extract them once with --source extract --with-fine; the cache keeps them."
+        info "  extract them once with --source extract (fine is the default); the cache keeps them."
       fi
       ;;
     extract)
@@ -816,7 +826,7 @@ if have_stage 5; then
     run_show $PY run_table9_both_ways.py --source load --pickle "$FRAMES" \
         --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS
     # 10-millisecond: the paper uses a 1-second window there, i.e. 100 bars again.
-    # STAGE 2b resolves FINE_FRAMES when --with-fine ran; the old name-substitution stays as the
+    # STAGE 2b resolves FINE_FRAMES when the fine grid ran; the old name-substitution stays as the
     # fallback so hand-extracted fine frames beside the 1s pickle are still found.
     FINE_T9="${FINE_FRAMES:-${FRAMES/1s/${FINE_INTERVAL}}}"
     if [ -n "$FINE_T9" ] && [ "$FINE_T9" != "$FRAMES" ] && { [ "$DRY" -eq 1 ] || [ -f "$FINE_T9" ]; }; then
@@ -824,7 +834,7 @@ if have_stage 5; then
       run_show $PY run_table9_both_ways.py --source load --pickle "$FINE_T9" \
           --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS
     else
-      info "no ${FINE_INTERVAL} frames found — re-run with --with-fine (STAGE 2b extracts them) for"
+      info "no ${FINE_INTERVAL} frames found — re-run --source extract (STAGE 2b extracts them) for"
       info "the fine-grid pair, which is where the Epps gap should be largest"
     fi
   fi
@@ -848,7 +858,7 @@ if have_stage 6; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 6b — fine-grid analyses (--with-fine): the exhibits 1s cannot resolve
+# STAGE 6b — fine-grid analyses (DEFAULT ON; --no-fine opts out)
 #
 # CURATED stage list, not the full battery. What runs and why:
 #   information_shares  rcorr~0.97 at 1s puts the Hasbrouck bounds near [0,1] on many days
@@ -862,20 +872,28 @@ fi
 #                       (frequency_defaults picks the jump method by grid)
 #   microstructure      staleness report + the noise-robust-covariance note at the grid where
 #                       both actually bind
-# What deliberately does NOT run here: panel / dcc / irf / cross_impact / robustness -- at 10ms
+# The default FINE_STAGES list leaves panel / dcc / irf / robustness / legacy at 1s-only: at 10ms
 # upwards of 99% of snapshots are stale repeats of ES's coarse tick, so the 1s mains are the
-# estimates the paper quotes; the fine grid is a microscope, not a better version of them.
+# estimates the paper quotes -- and the pooled 56M-row panel design / 200-horizon LP bootstraps
+# are multi-hour, tens-of-GB stages. --fine-stages all runs everything anyway, caveats accepted.
 # n_lags is NOT forwarded from the 1s run: frequency_defaults rescales it to the grid.
 # ══════════════════════════════════════════════════════════════════════════════
 if [ "$WITH_FINE" -eq 1 ] && have_stage 6 && [ "$SOURCE" != "demo" ]; then
   say "STAGE 6b fine-grid analyses (${FINE_INTERVAL})"
   if [ -n "$FINE_FRAMES" ] && { [ "$DRY" -eq 1 ] || [ -f "$FINE_FRAMES" ]; }; then
     FQ=""; [ "$QUICK" -eq 1 ] && FQ="--quick"
+    ONLY_FLAG="--only $FINE_STAGES"
+    if [ "$FINE_STAGES" = "all" ]; then
+      ONLY_FLAG=""
+      info "FULL battery at ${FINE_INTERVAL} (--fine-stages all): the pooled panel design is"
+      info "  ~56M rows x ~120 columns and the LP runs ~200 horizons x 300 bootstraps -- expect"
+      info "  hours and tens of GB. The 1s mains remain the quotable estimates; see the header."
+    fi
     # shellcheck disable=SC2086
     run $PY run_analysis.py --source load --pickle "$FINE_FRAMES" \
         --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
         --interval "$FINE_INTERVAL" \
-        --only information_shares,ecm_sde,jumps,microstructure \
+        $ONLY_FLAG \
         --output-dir "$OUT" $FQ \
       || info "STAGE 6b FAILED -- the 1s results above are unaffected; see $LOG"
   else
@@ -893,7 +911,7 @@ if have_stage 7; then
     echo
     echo "source=${SOURCE}  interval=${INTERVAL}  corr_window=${CORR_WINDOW}  n_boot=${N_BOOT}"
     if [ "$WITH_FINE" -eq 1 ]; then
-      echo "fine grid: ${FINE_INTERVAL}  frames=${FINE_FRAMES:-none produced}  stages=information_shares,ecm_sde,jumps,microstructure (+Table 9 Epps pair)"
+      echo "fine grid: ${FINE_INTERVAL}  frames=${FINE_FRAMES:-none produced}  stages=${FINE_STAGES} (+Table 9 Epps pair)"
     fi
     echo "lag order: requested=${N_LAGS} (pmax=${PMAX})  resolved p=${N_LAGS_INT:-per-driver}"
     echo "sizing:    cores=${AS_CORES} ram=${AS_RAM}GiB extraction_workers=${AS_EXTRACT} cpu_jobs=${NJ}"

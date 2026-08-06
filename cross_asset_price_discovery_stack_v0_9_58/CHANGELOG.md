@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.9.58 -- both grids, automatically, for the whole sample
+
+The two-grid design stops being opt-in. Every `--source extract` run now does BOTH intervals for
+all 24 sessions -- benchmark, volatile, and MWCB alike -- and runs the subsequent analysis on
+both, with no flags:
+
+* **STAGE 2b (fine extraction) is ON by default** (`--no-fine` opts out; `--with-fine` still
+  parses as a no-op). The fine frames cover the full sample and land in the interval-keyed
+  extract cache, so they are paid for once.
+* **STAGE 6b (fine analysis) runs automatically** on a `FINE_STAGES` list expanded to everything
+  statistically defensible and tractable at 10ms: `information_shares` (the IS bounds),
+  `ecm_sde` + `liquidity_conditional` (both halves of the IS(S) mechanism), `cross_impact` (the
+  fleeting-quote filter engages at this grid, and the drop-one diagnostic rides along), `jumps`
+  (co-jump lead-lag), and `microstructure`. STAGE 5's Table 9 Epps pair runs on both grids as
+  before, three ways each.
+* **`--fine-stages` overrides the list; `--fine-stages all` runs the FULL battery at the fine
+  grid** -- with an explicit wall-clock warning: the pooled panel design at 10ms is ~56M rows by
+  ~120 columns and the LP runs ~200 horizons x 300 bootstraps, i.e. hours and tens of GB, and
+  the mains are statistically WORSE there (upwards of 99% of 10ms snapshots are stale repeats of
+  ES's coarse tick). The default list is the deliberate line between "analysis at both
+  intervals" and "burning a day to make the panel VECM worse"; `all` is there for whoever wants
+  to see it anyway.
+* The manifest records the fine stage list actually run; `--fine-dates` still restricts the fine
+  grid to a subset for a staged first pass (the per-worker peak remains unmeasured at 10ms --
+  autoscale.measure reports it on the first real run).
+
+Gate updated: `test_fine_grid_stage.py` now pins default-ON (no flag prints the whole two-grid
+flow), the `--no-fine` opt-out, `--fine-stages all` dropping `--only` with the warning, and the
+expanded six-stage list running 6/6 on synthetic 10ms frames. 54 modules, all passing.
+
 ## v0.9.57 -- the masked run's casualties, the halt-mask A/B, and the revised sample
 
 The 2026-08-05 halt-masked run was the first time every estimator received NaN-masked frames, and

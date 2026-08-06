@@ -20,7 +20,7 @@ Pinned here:
       otherwise only discover a rename at hour three of a real run
   (4) the load-path fallback cannot self-match: a pickle named without the interval token must
       report "no fine frames", not silently hand the 1s frames to the fine stages
-  (5) the curated list actually RUNS on 10ms frames: 4/4 stages ok on synthetic sub-second
+  (5) the curated list actually RUNS on 10ms frames: 6/6 stages ok on synthetic sub-second
       sessions, with the sub-second path engaged (auto lag rescale, Lee-Mykland, fleeting filter)
 
 Run: python test_fine_grid_stage.py
@@ -39,7 +39,8 @@ import pandas as pd
 
 TZ = "America/New_York"
 DRIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_paper_replication.sh")
-CURATED = ["information_shares", "ecm_sde", "jumps", "microstructure"]
+CURATED = ["information_shares", "ecm_sde", "liquidity_conditional", "cross_impact",
+           "jumps", "microstructure"]
 
 
 def _dry(*args):
@@ -50,7 +51,8 @@ def _dry(*args):
 
 
 def check_dry_run_prints_the_two_grid_flow():
-    rc, out = _dry("--source", "extract", "--with-fine", "--stages", "2,3,5,6")
+    # NO flag: the two-grid flow is the DEFAULT since v0.9.58
+    rc, out = _dry("--source", "extract", "--stages", "2,3,5,6")
     want = ["STAGE 2b", "--interval 10ms", "qc_frames_10ms", "frames_10ms.pkl", "STAGE 6b",
             "--only " + ",".join(CURATED)]
     missing = [w for w in want if w not in out]
@@ -61,9 +63,21 @@ def check_dry_run_prints_the_two_grid_flow():
 
 
 def check_default_run_is_unchanged():
-    rc, out = _dry("--source", "extract", "--stages", "2,3,5,6")
+    rc, out = _dry("--source", "extract", "--no-fine", "--stages", "2,3,5,6")
     ok = rc == 0 and "STAGE 2b" not in out and "STAGE 6b" not in out
-    print("(1b) without --with-fine neither 2b nor 6b appears -- default flow unchanged : %s" % ok)
+    print("(1b) --no-fine suppresses both 2b and 6b -- the opt-out works : %s" % ok)
+    return ok
+
+
+def check_fine_stages_all_drops_only():
+    rc, out = _dry("--source", "extract", "--fine-stages", "all", "--stages", "2,6")
+    six_b = out[out.find("STAGE 6b"):]
+    cmd = [l for l in six_b.splitlines() if "run_analysis.py" in l and "10ms" in l]
+    no_only = bool(cmd) and "--only" not in cmd[0]
+    warned = "FULL battery" in six_b
+    ok = rc == 0 and no_only and warned
+    print("(1c) --fine-stages all: 6b runs the full battery (no --only: %s) with the wall-clock "
+          "warning (%s) : %s" % (no_only, warned, ok))
     return ok
 
 
@@ -85,7 +99,7 @@ def check_curated_stages_exist_in_the_registry():
     missing = [c for c in CURATED if c not in names]
     with open(DRIVER) as fh:
         drv = fh.read()
-    wired = ("--only " + ",".join(CURATED)) in drv
+    wired = ('FINE_STAGES="' + ",".join(CURATED) + '"') in drv
     ok = not missing and wired
     print("(3) curated stages %s all exist in run_analysis.STAGES (missing: %s) and the driver "
           "passes exactly that list (%s) : %s" % (CURATED, missing or "none", wired, ok))
@@ -139,11 +153,11 @@ def check_curated_list_runs_on_10ms_frames():
                      capture_output=True, text=True, timeout=540,
                      cwd=os.path.dirname(DRIVER))
         out = res.stdout + res.stderr
-    ran = "4/4 stages ok" in out
+    ran = "6/6 stages ok" in out
     sub = '"path": "sub-second"' in out and '"jump_method": "lee_mykland"' in out
     lag = '"n_lags": 60' in out                     # frequency rescale, not the 1s number
     ok = res.returncode == 0 and ran and sub and lag
-    print("(5) curated list on 10ms frames: 4/4 stages ok (%s), sub-second path engaged with "
+    print("(5) curated list on 10ms frames: 6/6 stages ok (%s), sub-second path engaged with "
           "Lee-Mykland (%s), lag auto-rescaled to 60 (%s) : %s" % (ran, sub, lag, ok))
     return ok
 
@@ -151,6 +165,7 @@ def check_curated_list_runs_on_10ms_frames():
 def main():
     checks = [check_dry_run_prints_the_two_grid_flow,
               check_default_run_is_unchanged,
+              check_fine_stages_all_drops_only,
               check_fine_dates_runs_the_subset,
               check_curated_stages_exist_in_the_registry,
               check_load_fallback_cannot_self_match,
