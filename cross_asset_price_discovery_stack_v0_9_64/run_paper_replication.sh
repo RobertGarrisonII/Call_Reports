@@ -897,10 +897,11 @@ EOF
             info "(the realistic form: dCorr is the difference of a ${CORR_WINDOW}-bar rolling"
             info "correlation, so the spike is at lag ${CORR_WINDOW} exactly, and a bounded search"
             info "climbs to its own edge walking toward it; test_svar_lag_artifact.py reproduces"
-            info "p*=W on constant-correlation data). QUOTE THE DCC COLUMN in Table 9 -- STAGE 5"
-            info "estimates it by default since v0.9.56: the DCC conditional correlation is"
-            info "recursive, has no fixed-width box to difference, and returns p*~1 on that same"
-            info "data. 'Both ways' alone does NOT fix this -- Pearson and HY differ on"
+            info "p*=W on constant-correlation data). QUOTE THE DCC OR RealBar COLUMN in Table 9"
+            info "-- STAGE 5 estimates both by default: DCC is recursive with no fixed-width box,"
+            info "so its selected order is small and WINDOW-INDEPENDENT (a few lags of its own"
+            info "smoothing, not the window); RealBar's non-overlapping bars share no data at"
+            info "all. 'Both ways' alone does NOT fix this -- Pearson and HY differ on"
             info "asynchronicity but both difference the same ${CORR_WINDOW}-bar box."
           fi
           if [ "$LAG_EDGE" = "1" ] || { [ "$N_LAGS_INT" -ge "$PMAX" ] 2>/dev/null; }; then

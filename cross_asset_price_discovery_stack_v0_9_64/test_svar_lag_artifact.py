@@ -16,8 +16,8 @@ nothing for a VAR to find; an honest criterion should choose p ~ 0-1. Instead:
     rolling                25                25
     rolling                40                 0
     rolling                50                 0
-    dcc                    25                 1
-    dcc                    50                 1
+    dcc                    12                 ~5 (WINDOW-independent; the recursion's own smoothing)
+    dcc                    25                 ~5 (same order at double the window)
 
 **p* = corr_window, exactly.** The mechanism is the dependent variable. `dCorr` is the first
 difference of a W-bar rolling correlation, so it drops the observation from W bars ago and adds
@@ -96,13 +96,23 @@ def check_lag_equals_the_window():
 
 
 def check_dcc_does_not_do_this():
-    """DCC's recursive filter induces no spike, so the criterion reports the truth: p ~ 1."""
+    """DCC's recursive filter has no fixed-width box, so its selected lag cannot TRACK the
+    window -- the property the rolling LHS fails. It is not lag-free: rho_t is an
+    exponentially-weighted statistic, so diff(rho_t) carries the recursion's own short-memory
+    smoothing and the criterion legitimately spends a few lags on it. (Pre-v0.9.65 this
+    check asserted p* <= 2, calibrated against the SCALE-DEGENERATE GARCH -- omega pinned to
+    its absolute bound at raw log-return magnitudes -- whose near-flat rho path had almost
+    nothing to fit. With the standardized fit the honest pins are: small relative to the
+    window, bounded, and IDENTICAL across windows.)"""
     df = _no_dynamics_frame()
-    ps = [_pick(df, "dcc", W, min(3 * W, 60)) for W in (12, 25)]
-    ok = all(p is not None and p <= 2 for p in ps)
-    print("(2) the same data with corr_method='dcc': p* = %s -- small, and independent of the "
-          "window, because a recursive conditional correlation has no fixed-width box to difference "
-          ": %s" % (", ".join(str(p) for p in ps), ok))
+    Ws = (12, 25)
+    ps = [_pick(df, "dcc", W, min(3 * W, 60)) for W in Ws]
+    small = all(p is not None and p <= 8 and p < min(Ws) // 2 + 2 for p in ps)
+    window_free = ps[0] is not None and ps[1] is not None and abs(ps[0] - ps[1]) <= 1
+    ok = small and window_free
+    print("(2) the same data with corr_method='dcc': p* = %s -- small and bounded (%s), and "
+          "the SAME at double the window (%s): the recursion's own smoothing, not the "
+          "window's box : %s" % (", ".join(str(p) for p in ps), small, window_free, ok))
     return ok
 
 
