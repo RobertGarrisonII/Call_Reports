@@ -192,7 +192,7 @@ _LABEL = {"qspr": "Spread", "wspr": "WtdSpread", "ofi": "OFI", "rv": "RV", "mdev
 
 def build_svar_frame(df, spec="informational", n_levels=10, target_qty=None,
                      corr_method="rolling", corr_window=100, wspread_kind="cost_to_fill",
-                     dcc_returns=None, extra_fn=None):
+                     dcc_returns=None, extra_fn=None, bar_seconds=60):
     """Assemble the per-bar SVAR variables in CAUSAL order (futures ES block, then
     equities SPY block, any `extra_fn(df)` columns, then the d-correlation LHS last).
     Liquidity levels are differenced; OFI/RV/MicroDev and extra columns enter as
@@ -207,11 +207,28 @@ def build_svar_frame(df, spec="informational", n_levels=10, target_qty=None,
                              moves with trading intensity -- itself a regressor in this system.
                              Report Table 9 both ways; the gap IS the measurement artifact.
     corr_method='dcc'     -> d of the DCC conditional correlation (pass dcc_returns or it
-                             is fit here from the two return series)."""
+                             is fit here from the two return series).
+    corr_method='bar'     -> the system RE-BARRED to ``bar_seconds`` bars with the dependent
+                             variable the change in the Fisher-z of each bar's REALIZED
+                             correlation (Pearson over the sub-returns INSIDE the bar).
+                             Non-overlapping bars share no data, so differencing manufactures
+                             no MA term at any lag -- the fixed-width-window artifact that made
+                             the selected order track corr_window cannot exist here by
+                             construction. Fisher-z because realized rho sits near 0.92: atanh
+                             unbounds the support and makes a shock on a calm day commensurate
+                             with one on a crash day. Regressors aggregate to the bar: OFI and
+                             cross-flow counts SUM, RV becomes the bar's own realized variance
+                             (mean squared sub-return -- also window-free, replacing the rolling
+                             RV), spread levels bar-MEAN then differenced, MicroDev bar-MEAN.
+                             On a 10ms frame the sub-returns are the fine grid: the two-grid
+                             design exists exactly so this estimator has them."""
     feats = PRESETS[spec] if isinstance(spec, str) else list(spec)
     idx = df.index
     cols = {}
     r = {a: _returns_bps(df, a) for a in ("SPY", "ES")}
+    if corr_method == "bar":
+        return _build_svar_frame_bar(df, feats, n_levels, target_qty, wspread_kind,
+                                     bar_seconds, extra_fn, r)
     for a in ("ES", "SPY"):                                                    # futures first
         for f in feats:
             if f == "qspr":
@@ -248,6 +265,73 @@ def build_svar_frame(df, spec="informational", n_levels=10, target_qty=None,
     return X[mask], names, len(names) - 1
 
 
+def _fisher_z(rho):
+    """atanh with the boundary clamped: a bar where every sub-return pair agrees exactly
+    (rho -> +-1, possible on a quiet bar of identical ticks) must map to a large finite z,
+    not inf."""
+    return np.arctanh(np.clip(np.asarray(rho, float), -1.0 + 1e-8, 1.0 - 1e-8))
+
+
+def _build_svar_frame_bar(df, feats, n_levels, target_qty, wspread_kind, bar_seconds,
+                          extra_fn, r):
+    """The corr_method='bar' assembly: one row per NON-OVERLAPPING ``bar_seconds`` bar.
+    Same causal ordering contract as the native-grid path (ES block, SPY block, extras,
+    dependent last); returns (X, names, corr_idx)."""
+    idx = df.index
+    bar = idx.floor("%ds" % int(bar_seconds))
+    V = pd.DataFrame(index=idx)
+    for a in ("ES", "SPY"):                                                    # futures first
+        for f in feats:
+            name = f"{_LABEL[f]}_{a}"
+            if f == "qspr":
+                V[name] = quoted_spread(df, a)
+            elif f == "wspr":
+                V[name] = weighted_spread(df, a, target_qty, n_levels, wspread_kind)
+            elif f == "ofi":
+                V[name] = ca.order_flow_imbalance(df, a, n_levels)
+            elif f == "rv":
+                V[name] = pd.Series(r[a], index=idx) ** 2                      # per-bar mean below
+            elif f == "mdev":
+                V[name] = microprice_dev(df, a, min(n_levels, 5))
+    if extra_fn is not None:
+        E = extra_fn(df).reindex(idx)
+        for c in E.columns:
+            V[c] = np.asarray(E[c], float)
+            _BAR_SUM.add(c)                                                    # counts: sum per bar
+    g = V.groupby(bar)
+    B = pd.DataFrame(index=pd.Index(sorted(bar.unique()), name="bar"))
+    for c in V.columns:
+        base = c.split("_")[0]
+        if c in _BAR_SUM or base in ("OFI",):
+            B[c] = g[c].sum(min_count=1)
+        else:                                                                  # RV / spreads / mdev
+            B[c] = g[c].mean()
+    for c in list(B.columns):                                                  # spread LEVELS -> changes
+        if c.split("_")[0] in ("Spread", "WtdSpread"):
+            B[c] = B[c].diff()
+    # dependent: change in Fisher-z of the bar's realized correlation of the sub-returns.
+    # A bar needs enough finite pairs and movement on both legs to yield a correlation at all.
+    rs = pd.Series(r["SPY"], index=idx); re_ = pd.Series(r["ES"], index=idx)
+    min_sub = max(10, int(bar_seconds) // 6)
+    rho = []
+    for b, ii in rs.groupby(bar).groups.items():
+        x = rs.loc[ii].to_numpy(float); y = re_.loc[ii].to_numpy(float)
+        m = np.isfinite(x) & np.isfinite(y)
+        if m.sum() >= min_sub and x[m].std() > EPS and y[m].std() > EPS:
+            rho.append((b, float(np.corrcoef(x[m], y[m])[0, 1])))
+        else:
+            rho.append((b, np.nan))
+    z = pd.Series(dict(rho)).reindex(B.index)
+    B["dCorr"] = pd.Series(_fisher_z(z), index=B.index).diff() if z.notna().any() else np.nan
+    names = list(B.columns)
+    X = B.to_numpy(float)
+    mask = np.all(np.isfinite(X), axis=1)
+    return X[mask], names, len(names) - 1
+
+
+_BAR_SUM = set()                                     # extra_fn columns registered as per-bar sums
+
+
 def _dcc_corr(df, r, dcc_returns):
     """DCC conditional correlation series (length len(df), leading NaN). Falls back to
     NaN if dcc_garch is unavailable or the fit fails."""
@@ -259,6 +343,89 @@ def _dcc_corr(df, r, dcc_returns):
         return np.concatenate([[np.nan], np.asarray(fit["rho"], float)])
     except Exception:
         return np.full(len(df), np.nan)
+
+
+# ── panel VAR design: within-day lags + day fixed effects ─────────────────────
+def _panel_var_design(Xs, p, fe=True, start=None):
+    """Stack per-session VAR designs with lags built STRICTLY within-day and (with ``fe``)
+    each session demeaned -- day fixed effects via the within transformation, which at
+    T ~ 23,400 bars per day carries an O(1/T) Nickell bias of no consequence.
+
+    The naive alternative this replaces -- np.vstack the sessions, then lag the stack --
+    let the first p bars of every session borrow the PREVIOUS session's close as their
+    "lags" (an overnight seam treated as one grid step) and pooled days around a single
+    intercept, conflating within-day dynamics with between-day level shifts (a 2020 MWCB
+    day and a 2023 baseline day differ in RV/spread LEVELS by orders of magnitude).
+
+    ``start`` fixes the first usable row per session (>= p), so lag-order candidates can
+    share a common sample. Returns (Y, Z, groups) with NO intercept column under fe."""
+    st = int(p if start is None else max(start, p))
+    Ys, Zs, Gs = [], [], []
+    for g, X in enumerate(Xs):
+        X = np.asarray(X, float); T = X.shape[0]
+        if T <= st + 2:
+            continue
+        Xd = X - X.mean(axis=0) if fe else X
+        cols = [] if fe else [np.ones(T - st)]
+        for L in range(1, p + 1):
+            cols.append(Xd[st - L:T - L])
+        if not cols:
+            cols = [np.ones(T - st)]                # p=0 with fe: pure-mean model, intercept-free
+            Ys.append(Xd[st:]); Zs.append(np.zeros((T - st, 0))); Gs.append(np.full(T - st, g))
+            continue
+        Ys.append(Xd[st:]); Zs.append(np.column_stack(cols)); Gs.append(np.full(T - st, g))
+    if not Ys:
+        return None, None, None
+    return np.vstack(Ys), np.vstack(Zs), np.concatenate(Gs)
+
+
+def panel_var_ols(Xs, p, fe=True):
+    """Pooled VAR(p) on the panel design (within-day lags, day FE). Returns
+    (A list, Sigma, resid, groups) -- the same contract as ``var_ols`` plus the day id
+    per residual row, so day-cluster machinery can consume it."""
+    Y, Z, groups = _panel_var_design(Xs, p, fe=fe)
+    if Y is None:
+        raise ValueError("no session long enough for the requested lag order")
+    k = Y.shape[1]
+    if Z.shape[1] == 0:
+        resid = Y
+        A = []
+    else:
+        B, resid = pds._ols(Y, Z)
+        off = 0 if fe else 1
+        A = [B[off + (i - 1) * k: off + i * k, :].T for i in range(1, p + 1)]
+    dof = max(resid.shape[0] - Z.shape[1] - (len(Xs) * k if fe else 0) // max(k, 1), 1)
+    Sigma = (resid.T @ resid) / dof
+    return A, Sigma, resid, groups
+
+
+def select_lag_var_panel(Xs, pmax=12, criterion="bic", fe=True):
+    """Lag-order selection on the PANEL design: every candidate scored on the common
+    sample (rows pmax.. per session), lags within-day, day FE. The stacked-selection it
+    replaces scored candidates whose lag windows crossed the overnight seams."""
+    rows = []
+    for p in range(0, pmax + 1):
+        Y, Z, _ = _panel_var_design(Xs, p, fe=fe, start=pmax)
+        if Y is None or Y.shape[0] < Z.shape[1] + 5:
+            rows.append((p, np.nan, np.nan, np.nan, np.nan)); continue
+        if Z.shape[1]:
+            _, resid = pds._ols(Y, Z)
+        else:
+            resid = Y
+        n, k = resid.shape
+        Sig = (resid.T @ resid) / n
+        sign, ld = np.linalg.slogdet(Sig + np.eye(k) * EPS)
+        if sign <= 0:
+            rows.append((p, np.nan, np.nan, np.nan, np.nan)); continue
+        K = Z.shape[1] * k                           # free slope params across equations
+        aic = ld + 2.0 * K / n
+        bic = ld + np.log(n) * K / n
+        hq = ld + 2.0 * np.log(np.log(max(n, 3))) * K / n
+        rows.append((p, ld, aic, bic, hq))
+    tab = pd.DataFrame(rows, columns=["p", "logdet", "aic", "bic", "hqic"]).set_index("p")
+    col = tab[{"aic": "aic", "hq": "hqic", "hqic": "hqic"}.get(str(criterion).lower(), "bic")]
+    p_star = int(col.idxmin()) if col.notna().any() else None
+    return p_star, tab
 
 
 # ── reduced-form VAR(p) + orthogonalized IRF ──────────────────────────────────
@@ -482,7 +649,7 @@ def lag_diagnosis(p, corr_window, pmax, corr_method="rolling", tol=1) -> dict:
 
 def select_svar_lag(data, spec="informational", n_levels=10, target_qty=None,
                     corr_method="rolling", corr_window=100, wspread_kind="cost_to_fill",
-                    extra_fn=None, criterion="bic", pmax=12):
+                    extra_fn=None, criterion="bic", pmax=12, bar_seconds=60, panel="fe"):
     """Choose the SVAR lag order from the data by information criterion. Returns (p*, IC table).
 
     Selection is on the SAME frame Eq. (5) is estimated on -- every session's built SVAR variables
@@ -508,7 +675,8 @@ def select_svar_lag(data, spec="informational", n_levels=10, target_qty=None,
     Xs = []
     for df in frames:
         X, _nm, _ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
-                                       corr_window, wspread_kind, extra_fn=extra_fn)
+                                       corr_window, wspread_kind, extra_fn=extra_fn,
+                                       bar_seconds=bar_seconds)
         if len(X) > pmax + 5:
             Xs.append(X)
     if not Xs:
@@ -523,7 +691,14 @@ def select_svar_lag(data, spec="informational", n_levels=10, target_qty=None,
     keep = X.std(axis=0) > EPS
     if keep.any() and not keep.all():
         X = X[:, keep]
-    p, tab = pds.select_lag_var(X, pmax=pmax, criterion=criterion)
+        Xs = [x[:, keep] for x in Xs]
+    # panel="fe" (default): candidates scored with lags built WITHIN-day and day FE -- the
+    # stacked scoring let every candidate's lag windows cross the overnight seams and pooled
+    # days around one intercept. panel="stack" reproduces the pre-v0.9.63 behaviour.
+    if len(Xs) > 1 and panel != "stack":
+        p, tab = select_lag_var_panel(Xs, pmax=pmax, criterion=criterion)
+    else:
+        p, tab = pds.select_lag_var(X, pmax=pmax, criterion=criterion)
     col = tab[{"aic": "aic", "hq": "hqic", "hqic": "hqic"}.get(str(criterion).lower(), "bic")]
     if not col.notna().any():
         # Every candidate failed to score. Say so instead of handing back the p=1 fallback, which
@@ -547,7 +722,7 @@ def resolve_n_lags(data, n_lags, pmax=12, **kw):
 def correlation_irf(data, spec="informational", n_lags=6, horizon=10, ident="cholesky",
                     cumulative=False, n_levels=10, corr_method="rolling", corr_window=100,
                     target_qty=None, wspread_kind="cost_to_fill", min_obs=400, extra_fn=None,
-                    criterion=None, pmax=12, lag_pooled=True):
+                    criterion=None, pmax=12, lag_pooled=True, bar_seconds=60, panel="fe"):
     """Reproduce Table 9 in the spread framework. `data` is a (date, regime, df) session
     list (one VAR per regime, frames stacked) or a single df (regime 'all'). Returns a
     DataFrame: rows = shock variables, columns = regimes, values = the impact (h=0)
@@ -575,13 +750,19 @@ def correlation_irf(data, spec="informational", n_lags=6, horizon=10, ident="cho
         p_pooled = select_svar_lag(data, spec=spec, n_levels=n_levels, target_qty=target_qty,
                                    corr_method=corr_method, corr_window=corr_window,
                                    wspread_kind=wspread_kind, extra_fn=extra_fn,
-                                   criterion=criterion, pmax=pmax)[0]
+                                   criterion=criterion, pmax=pmax, bar_seconds=bar_seconds,
+                                   panel=panel)[0]
     keep_min = (pmax if criterion is not None else n_lags) + 5   # room for the LARGEST candidate
+    # min_obs was calibrated to native-grid rows; a 60s bar frame has 1/60th of them. Scale it so
+    # the bar column is not silently dropped for having exactly the row count re-barring implies.
+    if corr_method == "bar":
+        min_obs = max(40, int(min_obs) // max(int(bar_seconds), 1))
     for regime, frames in groups.items():
         Xs, names = [], None
         for df in frames:
             X, nm, ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
-                                         corr_window, wspread_kind, extra_fn=extra_fn)
+                                         corr_window, wspread_kind, extra_fn=extra_fn,
+                                         bar_seconds=bar_seconds)
             if len(X) > keep_min:
                 Xs.append(X); names = nm; corr_idx = ci
         if not Xs or sum(len(x) for x in Xs) < min_obs:
@@ -590,10 +771,20 @@ def correlation_irf(data, spec="informational", n_lags=6, horizon=10, ident="cho
         if p_pooled is not None:
             p_use = p_pooled
         elif criterion is not None:
-            p_use = pds.select_lag_var(X, pmax=pmax, criterion=criterion)[0]
+            if len(Xs) > 1 and panel != "stack":
+                p_use = select_lag_var_panel(Xs, pmax=pmax, criterion=criterion)[0]
+            else:
+                p_use = pds.select_lag_var(X, pmax=pmax, criterion=criterion)[0]
         else:
             p_use = n_lags
-        A, Sigma, _ = var_ols(X, p_use)
+        if p_use is None:
+            p_use = n_lags
+        # panel="fe" (default): within-day lags + day fixed effects. "stack" reproduces the
+        # pre-v0.9.63 estimation (seam-crossing lags, one common intercept) for comparison.
+        if len(Xs) > 1 and panel != "stack":
+            A, Sigma, _, _ = panel_var_ols(Xs, p_use, fe=True)
+        else:
+            A, Sigma, _ = var_ols(X, p_use)
         Theta = orthogonalized_irf(A, Sigma, horizon, ident)
         if cumulative:
             resp = np.sum([Theta[h][corr_idx, :] for h in range(horizon + 1)], axis=0)
@@ -605,6 +796,73 @@ def correlation_irf(data, spec="informational", n_lags=6, horizon=10, ident="cho
         return pd.DataFrame()
     tab = pd.DataFrame(out, index=names_ref)
     return tab.drop(index=names_ref[-1])                                       # drop the dCorr-own row
+
+
+def correlation_irf_mean_group(data, spec="informational", n_lags=6, horizon=10,
+                               ident="cholesky", cumulative=False, n_levels=10,
+                               corr_method="rolling", corr_window=100, target_qty=None,
+                               wspread_kind="cost_to_fill", extra_fn=None,
+                               criterion=None, pmax=12, bar_seconds=60, min_obs_day=200):
+    """Mean-group (Pesaran-Smith / Pedroni-style) Table 9: the SVAR is fitted and identified
+    PER DAY -- T ~ 23,400 bars per day is ample -- and the regime column is the cross-day MEAN
+    response with its dispersion and a day-level t (mean / (sd/sqrt(N_days))).
+
+    This is the heterogeneity check the pooled fixed-effects column needs: the paper's own
+    thesis is that dynamics differ by regime, so homogeneous pooled dynamics assume part of the
+    conclusion. If mean-group ~ pooled-FE, pooling is validated and the table says so with
+    numbers; if they diverge, the divergence is a finding about slope heterogeneity, not a
+    nuisance. The lag order is resolved ONCE on the pooled sample (same p every day) so the
+    cross-day average compares like with like.
+
+    Returns {"point", "se", "tstat", "n_days" (DataFrames, shocks x regimes), "per_day"
+    (tidy DataFrame), "n_lags"}."""
+    if isinstance(data, pd.DataFrame):
+        data = [("all", "all", data)]
+    if criterion is not None:
+        p_sel = select_svar_lag(data, spec=spec, n_levels=n_levels, target_qty=target_qty,
+                                corr_method=corr_method, corr_window=corr_window,
+                                wspread_kind=wspread_kind, extra_fn=extra_fn,
+                                criterion=criterion, pmax=pmax, bar_seconds=bar_seconds)[0]
+        if p_sel is not None:
+            n_lags = int(p_sel)
+    if corr_method == "bar":                         # bar rows are 1/bar_seconds of native rows
+        min_obs_day = max(20, int(min_obs_day) // max(int(bar_seconds), 1))
+    rows = []
+    names_ref = None
+    for item in data:
+        date = item[0]; regime = item[1] if len(item) == 3 else "all"; df = item[-1]
+        X, names, ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
+                                        corr_window, wspread_kind, extra_fn=extra_fn,
+                                        bar_seconds=bar_seconds)
+        if len(X) < max(min_obs_day, n_lags + 10):
+            continue
+        keep = X.std(axis=0) > EPS
+        if not keep[ci]:                             # a day with a frozen dependent variable
+            continue
+        try:
+            A, Sigma, _ = var_ols(X, n_lags)         # per-day intercept = day FE, trivially
+            Theta = orthogonalized_irf(A, Sigma, horizon, ident)
+        except Exception:
+            continue
+        resp = (np.sum([Theta[h][ci, :] for h in range(horizon + 1)], axis=0)
+                if cumulative else Theta[0][ci, :])
+        names_ref = names
+        for j, nm in enumerate(names):
+            if j == ci:
+                continue
+            rows.append({"date": str(date), "regime": regime, "shock": nm,
+                         "resp_x100": 100.0 * resp[j]})
+    per_day = pd.DataFrame(rows)
+    if per_day.empty:
+        return {"point": pd.DataFrame(), "se": pd.DataFrame(), "tstat": pd.DataFrame(),
+                "n_days": pd.DataFrame(), "per_day": per_day, "n_lags": int(n_lags)}
+    g = per_day.groupby(["shock", "regime"])["resp_x100"]
+    mean = g.mean().unstack(); sd = g.std(ddof=1).unstack(); n = g.count().unstack()
+    se = sd / np.sqrt(n)
+    order = [nm for nm in (names_ref or []) if nm in mean.index] or list(mean.index)
+    mean, se, n = mean.reindex(order), se.reindex(order), n.reindex(order)
+    return {"point": mean, "se": se, "tstat": mean / se.replace(0.0, np.nan),
+            "n_days": n, "per_day": per_day, "n_lags": int(n_lags)}
 
 
 # ── Table 9 with inference: bootstrap SE + Romano-Wolf joint significance ──────
@@ -668,7 +926,7 @@ def correlation_irf_inference(data, spec="informational", n_lags=6, horizon=10, 
                               cumulative=False, n_levels=10, corr_method="rolling", corr_window=100,
                               target_qty=None, wspread_kind="cost_to_fill", min_obs=400, extra_fn=None,
                               n_boot=499, alpha=0.05, rw_by_regime=False, block_len=None, seed=0,
-                              n_jobs=None, criterion=None, pmax=12):
+                              n_jobs=None, criterion=None, pmax=12, bar_seconds=60, panel="fe"):
     """`correlation_irf` with bootstrap standard errors and **Romano-Wolf joint significance**
     built in, so the IRF table comes out publication-ready: each cell is the impact (or
     cumulative) response x100 with a bootstrap SE and stars from the FWER-controlled
@@ -700,12 +958,14 @@ def correlation_irf_inference(data, spec="informational", n_lags=6, horizon=10, 
         p_sel = select_svar_lag(data, spec=spec, n_levels=n_levels, target_qty=target_qty,
                                 corr_method=corr_method, corr_window=corr_window,
                                 wspread_kind=wspread_kind, extra_fn=extra_fn,
-                                criterion=criterion, pmax=pmax)[0]
+                                criterion=criterion, pmax=pmax, bar_seconds=bar_seconds,
+                                panel=panel)[0]
         if p_sel is not None:
             n_lags = int(p_sel)
     kw = dict(spec=spec, n_lags=n_lags, horizon=horizon, ident=ident, cumulative=cumulative,
               n_levels=n_levels, corr_method=corr_method, corr_window=corr_window,
-              target_qty=target_qty, wspread_kind=wspread_kind, min_obs=min_obs, extra_fn=extra_fn)
+              target_qty=target_qty, wspread_kind=wspread_kind, min_obs=min_obs, extra_fn=extra_fn,
+              bar_seconds=bar_seconds, panel=panel)
     point = correlation_irf(data, **kw)
     empty = {"point": point, "se": pd.DataFrame(), "tstat": pd.DataFrame(), "padj": pd.DataFrame(),
              "reject": pd.DataFrame(), "ci_lower": pd.DataFrame(), "ci_upper": pd.DataFrame(),
@@ -734,7 +994,7 @@ def correlation_irf_inference(data, spec="informational", n_lags=6, horizon=10, 
     else:                                                            # single frame: block-bootstrap its rows
         df = data if isinstance(data, pd.DataFrame) else data[0][-1]
         X, names, ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method, corr_window,
-                                        wspread_kind, extra_fn=extra_fn)
+                                        wspread_kind, extra_fn=extra_fn, bar_seconds=bar_seconds)
         nshock = len(names) - 1
         stat = lambda Xb: _irf_corr_response(Xb, ci, n_lags, horizon, ident, cumulative)[:nshock]
         bd = moving_block_bootstrap(X, stat, n_boot=n_boot, block_len=block_len, seed=seed,

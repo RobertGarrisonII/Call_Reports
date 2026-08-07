@@ -95,6 +95,26 @@ def build_parser():
     ap.add_argument("--no-dcc", dest="with_dcc", action="store_false",
                     help="skip the DCC column (saves one DCC fit per estimator block; the lag "
                          "caution then has no lag-robust column to point at)")
+    # v0.9.63: the RealBar column and the panel estimation are DEFAULT ON. RealBar is the
+    # recommended dependent variable -- non-overlapping per-bar realized correlation (Fisher-z),
+    # structurally immune to the window-induced MA artifact; the panel estimation builds lags
+    # strictly within-day with day fixed effects instead of stacking sessions across overnight
+    # seams around one intercept.
+    ap.add_argument("--with-bar", dest="with_bar", action="store_true", default=True,
+                    help="add the RealBar column (DEFAULT): d Fisher-z of the non-overlapping "
+                         "per-bar realized correlation")
+    ap.add_argument("--no-bar", dest="with_bar", action="store_false",
+                    help="skip the RealBar column")
+    ap.add_argument("--bar-seconds", type=int, default=60,
+                    help="RealBar bar length in seconds (default 60; on a 10ms frame each bar "
+                         "holds 6,000 sub-returns)")
+    ap.add_argument("--panel", choices=["fe", "stack"], default="fe",
+                    help="'fe' (DEFAULT): within-day lags + day fixed effects; 'stack' reproduces "
+                         "the pre-v0.9.63 stacked estimation (seam-crossing lags, one intercept)")
+    ap.add_argument("--mean-group", dest="mean_group", action="store_true", default=True,
+                    help="append the mean-group (per-day) estimate with cross-day dispersion "
+                         "(DEFAULT) -- the slope-heterogeneity check on the pooled column")
+    ap.add_argument("--no-mean-group", dest="mean_group", action="store_false")
     ap.add_argument("--n-lags", default="6",
                     help="fixed integer, or an information criterion: bic | aic | hq. "
                          "A criterion is resolved ONCE on the pooled SVAR frame and the chosen "
@@ -159,12 +179,28 @@ def main(argv=None):
     tbl = pt.table_correlation_irf_both_ways(
         sessions, spec=a.spec, ident=a.ident, cumulative=a.cumulative, n_boot=a.n_boot,
         n_lags=n_lags, horizon=a.horizon, corr_window=a.corr_window, min_obs=a.min_obs,
-        seed=a.seed, n_jobs=a.n_jobs, with_dcc=a.with_dcc)
+        seed=a.seed, n_jobs=a.n_jobs, with_dcc=a.with_dcc, with_bar=a.with_bar,
+        bar_seconds=a.bar_seconds, panel=a.panel, mean_group=a.mean_group)
     if tbl.df.empty:
         print(tbl.notes or "no output")
         return 1
     pd.set_option("display.width", 240)
     print(tbl.to_string())
+    mg = getattr(tbl, "mean_group", None)
+    if mg is not None and not mg["point"].empty:
+        print()
+        print("MEAN-GROUP (per-day SVAR, cross-day mean; the slope-heterogeneity check on the")
+        print("pooled column -- Pesaran-Smith: agreement validates pooling, divergence IS the")
+        print("heterogeneity finding). VAR(%d) per day; response x100; day-level t in brackets;"
+              % mg["n_lags"])
+        print("n_days per cell in the last block.")
+        disp = mg["point"].round(3).astype(str)
+        t = mg["tstat"]
+        for c in disp.columns:
+            disp[c] = disp[c] + " [" + t[c].round(2).astype(str) + "]"
+        print(disp.to_string())
+        print("n_days:")
+        print(mg["n_days"].to_string())
 
     # the headline: how much of each response is measurement artifact
     if isinstance(tbl.df.columns, pd.MultiIndex) and "Delta (HY-Pearson)" in tbl.df.columns.get_level_values(0):

@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.9.63 -- Table 9 becomes a real panel SVAR, and the dependent variable stops fighting back
+
+Two design questions from the coauthors, both of which found real defects:
+
+**"Panel SVAR or fixed-effects SVAR?" -- what shipped before was neither.** The pooled Table 9
+np.vstack'ed the 24 sessions into one long series: the first p bars of every day borrowed the
+PREVIOUS day's close as their "lags" (an overnight seam treated as one one-second step), and all
+days shared a single intercept, conflating within-day dynamics with between-day level shifts --
+a 2020 MWCB day and a 2023 baseline day differ in RV/spread LEVELS by orders of magnitude, and
+that between-day covariation loaded onto the lag coefficients (demonstrated: a DGP with ZERO
+within-day cross-dynamics but co-moving day means produces a spurious cross-coefficient 10x the
+FE estimate).
+
+* **Fixed-effects panel VAR is now the default estimation** (`panel="fe"`): lags built strictly
+  within-day, day fixed effects via the within transformation (Nickell bias is O(1/T) at
+  T~23,400 -- negligible, and the small-T GMM machinery would be actively wrong here), and
+  lag-order candidates scored on the same panel design (`select_lag_var_panel`) instead of the
+  seam-crossing stack. The day-cluster bootstrap the table already carried remains the
+  inference. `--panel stack` reproduces the pre-v0.9.63 estimation exactly (pinned by test).
+* **Mean-group (Pesaran-Smith / Pedroni-style) estimator** (`correlation_irf_mean_group`,
+  printed by default after the table): the SVAR fitted and identified PER DAY at the pooled lag,
+  regime columns = cross-day mean with dispersion and a day-level t. This is the
+  slope-heterogeneity check the pooled column needs -- the paper's own thesis is that dynamics
+  differ by regime, so homogeneous pooled dynamics assume part of the conclusion. Agreement
+  validates pooling with numbers; divergence IS the heterogeneity finding.
+
+**"Change the dependent variable" -- the RealBar column.** d(rolling correlation) carries an MA
+term at exactly the window length by construction; no window size fixes that, and DCC fixed it
+only by accepting GARCH model dependence. `corr_method="bar"` re-bars the system to
+non-overlapping ``bar_seconds`` bars (default 60s) with the dependent variable the change in the
+**Fisher-z of each bar's realized correlation** of the sub-returns: bars share no data, so the
+window-induced MA term cannot exist by construction -- measured, not filtered. Fisher-z because
+realized rho sits near 0.92, hard against the boundary. The per-bar realized variance replaces
+the rolling RV regressor in that column for the same reason (the RV smoother carried the same
+window). On a 10ms frame the sub-returns are the fine grid -- the two-grid design exists exactly
+so this estimator has 6,000 sub-returns per minute bar. Table 9 now ships FOUR columns
+(Pearson | HY | DCC | RealBar; `--no-bar` opts out; `--bar-seconds` tunes).
+
+The headline pin (`test_panel_svar.py`, 7 checks; STAGE 1 is now 57 modules): on
+constant-correlation null data the rolling LHS still drives BIC to the window (p*=W exactly --
+the artifact, kept as the in-test contrast) while the bar LHS selects p*<=3 on the SAME data.
+The lag-marching pathology is not mitigated by the new dependent variable; it is structurally
+impossible.
+
 ## v0.9.62 -- three replay defects the adversarial review caught before real data could
 
 An 8-agent review pass over the v0.9.61 hot-path diff (three lenses, refutation-mode verification

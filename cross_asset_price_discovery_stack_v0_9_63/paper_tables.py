@@ -195,7 +195,8 @@ def table_correlation_irf(sessions, spec="informational", ident="cholesky", cumu
 def table_correlation_irf_both_ways(sessions, spec="informational", ident="cholesky",
                                     cumulative=False, extra_fn=None, n_boot=499, n_lags=4,
                                     horizon=6, corr_window=80, min_obs=200, seed=0, n_jobs=None,
-                                    criterion=None, pmax=12, with_dcc=False,
+                                    criterion=None, pmax=12, with_dcc=False, with_bar=True,
+                                    bar_seconds=60, panel="fe", mean_group=False,
                                     methods=(("Pearson", "rolling"), ("HY", "hy")),
                                     title="Table 9 (repro): IRF of return correlation, Pearson vs Hayashi-Yoshida"):
     """Table 9 estimated twice -- once on the paper's grid-sampled Pearson d-correlation and once
@@ -226,6 +227,12 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
         # Pearson and HY differ in how they handle asynchronicity but both difference a W-bar box,
         # so neither removes the lag artifact above -- DCC is what the caution in the note points at.
         methods = tuple(methods) + (("DCC", "dcc"),)
+    if with_bar and not any(m == "bar" for _l, m in methods):
+        # The FOURTH dependent variable, and the recommended one (v0.9.63): the change in the
+        # Fisher-z of each bar's NON-OVERLAPPING realized correlation. Bars share no data, so the
+        # fixed-width-window MA artifact cannot exist by construction -- measured, not filtered
+        # (DCC's advantage without the GARCH model dependence).
+        methods = tuple(methods) + (("RealBar", "bar"),)
     lag_note = ""
     if criterion is not None:
         p_sel = csv.select_svar_lag(sessions, spec=spec, corr_window=corr_window,
@@ -254,7 +261,8 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
             if not _d["ok"]:
                 lag_note += " CAUTION: " + _d["text"]
     kw = dict(spec=spec, n_lags=n_lags, horizon=horizon, ident=ident, cumulative=cumulative,
-              corr_window=corr_window, min_obs=min_obs, extra_fn=extra_fn, seed=seed, n_jobs=n_jobs)
+              corr_window=corr_window, min_obs=min_obs, extra_fn=extra_fn, seed=seed, n_jobs=n_jobs,
+              bar_seconds=bar_seconds, panel=panel)
     base = ("Impact" if not cumulative else f"Cumulative ({horizon}-step)") + \
            f" orthogonalized response of d-correlation, x100; identification = {ident}; VAR({n_lags})." + lag_note
     out, nums = {}, {}
@@ -292,7 +300,24 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
             "share of each published response attributable to that measurement artifact.")
     if n_boot and n_boot > 0:
         note += " Day-cluster bootstrap SE in parentheses; Romano-Wolf joint stars (***/**/* = 1/5/10% FWER)."
-    return Table(title, disp, note, numeric=nums.get("Pearson"))
+    if with_bar:
+        note += (" RealBar: change in Fisher-z of the %ds-bar NON-OVERLAPPING realized correlation "
+                 "-- no fixed-width rolling window, hence no window-induced MA term for the lag "
+                 "criterion to chase; per-bar realized variance replaces the rolling RV regressor "
+                 "in that column for the same reason." % int(bar_seconds))
+    if panel != "stack":
+        note += (" Estimation is a fixed-effects panel VAR: lags built strictly within-day (no "
+                 "overnight seam-crossing) with day fixed effects; --panel stack reproduces the "
+                 "pre-v0.9.63 stacked estimation.")
+    tbl = Table(title, disp, note, numeric=nums.get("Pearson"))
+    if mean_group:
+        mg = csv.correlation_irf_mean_group(sessions, spec=spec, n_lags=n_lags, horizon=horizon,
+                                            ident=ident, cumulative=cumulative,
+                                            corr_method="bar" if with_bar else "rolling",
+                                            corr_window=corr_window, extra_fn=extra_fn,
+                                            bar_seconds=bar_seconds)
+        tbl.mean_group = mg
+    return tbl
 
 
 def table_mwcb_reopening_ols(treated_sessions, release_by_date, asset="SPY",
