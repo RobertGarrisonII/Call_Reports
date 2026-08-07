@@ -431,37 +431,53 @@ def run_irf(sessions, args):
     sv = irfm.structural_vecm_irf(df, horizons=H, n_lags=args.n_lags, n_levels=args.n_levels,
                                   min_rest_steps=fc["min_rest_steps"])
     fevd0 = irfm.fevd_from_irf(sv["return_irf"], H=max(H))
-    per, ofi_corr = {}, {}
+    per, per_g, ofi_corr = {}, {}, {}
     for _dd, rr, dfx in sessions:
         try:
             svx = irfm.structural_vecm_irf(dfx, horizons=H, n_lags=min(int(args.n_lags), 12),
                                            n_levels=args.n_levels,
                                            min_rest_steps=fc["min_rest_steps"])
             per.setdefault(rr, []).append(irfm.fevd_from_irf(svx["return_irf"], H=max(H)))
-            # The FEVD partitions variance only under UNCORRELATED shocks; the tandem-flow
-            # result says OFI_SPY/OFI_ES are not. Report the correlation the shares ignore.
+            # The orthogonal FEVD partitions variance only under UNCORRELATED shocks; the
+            # tandem-flow result says OFI_SPY/OFI_ES are not. Measure the correlation and
+            # feed it to the GENERALIZED decomposition (Pesaran-Shin) alongside.
             o1 = np.asarray(ca.order_flow_imbalance(dfx, "SPY", args.n_levels,
                                                     fc["min_rest_steps"]), float)[1:]
             o2 = np.asarray(ca.order_flow_imbalance(dfx, "ES", args.n_levels,
                                                     fc["min_rest_steps"]), float)[1:]
             m = np.isfinite(o1) & np.isfinite(o2)
             if m.sum() > 30:
-                ofi_corr.setdefault(rr, []).append(float(np.corrcoef(o1[m], o2[m])[0, 1]))
+                rho = float(np.corrcoef(o1[m], o2[m])[0, 1])
+                ofi_corr.setdefault(rr, []).append(rho)
+                R = np.array([[1.0, rho], [rho, 1.0]])
+                per_g.setdefault(rr, []).append(
+                    irfm.gfevd_from_irf(svx["return_irf"], R, H=max(H)))
         except Exception:
             continue
-    by_regime = {}
-    for rr, mats in per.items():
-        M = np.median(np.stack(mats), axis=0)
-        M = M / np.maximum(M.sum(axis=1, keepdims=True), 1e-12)   # rows re-sum to 1 after median
-        by_regime[rr] = pd.DataFrame(M, index=["ret_SPY", "ret_ES"], columns=["OFI_SPY", "OFI_ES"])
+
+    def _median_shares(groups):
+        out_ = {}
+        for rr, mats in groups.items():
+            M = np.median(np.stack(mats), axis=0)
+            M = M / np.maximum(M.sum(axis=1, keepdims=True), 1e-12)  # rows re-sum to 1 after median
+            out_[rr] = pd.DataFrame(M, index=["ret_SPY", "ret_ES"], columns=["OFI_SPY", "OFI_ES"])
+        return out_
+
+    by_regime = _median_shares(per)
+    g_by_regime = _median_shares(per_g)
     f0 = pd.DataFrame(fevd0, index=["ret_SPY", "ret_ES"], columns=["OFI_SPY", "OFI_ES"])
     return {"local_projection": lp,
             "fevd": by_regime.get("benchmark", f0),
             "fevd_by_regime": by_regime,
+            "gfevd": g_by_regime.get("benchmark"),
+            "gfevd_by_regime": g_by_regime,
             "ofi_innovation_corr": {rr: float(np.median(v)) for rr, v in ofi_corr.items()},
-            "fevd_note": ("shares assume UNCORRELATED OFI shocks (see irf.fevd_from_irf); at the "
-                          "measured ofi_innovation_corr they are a diagonal approximation and the "
-                          "SPY-flow/ES-flow split is partly common tandem flow"),
+            "fevd_note": ("fevd assumes UNCORRELATED OFI shocks (see irf.fevd_from_irf) -- a "
+                          "diagonal approximation at the measured ofi_innovation_corr. gfevd is "
+                          "the Pesaran-Shin GENERALIZED decomposition at that measured "
+                          "correlation: order-free and valid under correlated shocks; it is the "
+                          "one to quote, with the caveat that under tandem flow part of each "
+                          "share is common flow counted toward both shocks"),
             "fevd_session0": f0, "fevd_session0_date": str(d0)}
 
 def run_robustness(sessions, args):

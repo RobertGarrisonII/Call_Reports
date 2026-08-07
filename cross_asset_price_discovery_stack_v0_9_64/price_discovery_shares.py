@@ -418,10 +418,17 @@ def panel_vecm(sessions, n_lags=5, names=("SPY", "ES"), criterion=None, pmax=10)
         per.append({"XtX": XtX_g, "XtY": XtY_g, "YtY": YtY_g, "Xsum": Xsum_g,
                     "Ysum": Ysum_g, "n": n_g, "vol": d_flag})
         XtX += XtX_g; XtY += XtY_g; n_all += n_g
+    # Symmetric Jacobi equilibration before the solve (the Gram squares the design's
+    # condition number; scaling by sqrt(diag) is the near-optimal diagonal preconditioner
+    # and is mathematically identical). Singular designs (e.g. no volatile session -> the
+    # z*D column is zero) fall through to pinv, matching lstsq's min-norm behavior.
+    _d = np.sqrt(np.clip(np.diag(XtX), EPS, None))
+    _Xs = XtX / _d[:, None] / _d[None, :]
+    _Ys = XtY / _d[:, None]
     try:
-        B = np.linalg.solve(XtX, XtY)                     # min-norm fallback matches lstsq on
-    except np.linalg.LinAlgError:                         # a singular design (e.g. no volatile
-        B = np.linalg.pinv(XtX) @ XtY                     # session -> the z*D column is zero)
+        B = np.linalg.solve(_Xs, _Ys) / _d[:, None]
+    except np.linalg.LinAlgError:
+        B = (np.linalg.pinv(_Xs) @ _Ys) / _d[:, None]
     alpha_base = B[0, :].copy(); alpha_int = B[1, :].copy()
     alpha_vol = alpha_base + alpha_int
 

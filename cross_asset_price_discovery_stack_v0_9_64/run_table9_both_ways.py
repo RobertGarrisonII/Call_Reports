@@ -200,6 +200,25 @@ def main(argv=None):
         print("  (AIC is not consistent for lag order and on ~23k-bar samples runs away -- the "
               "paper's own footnote 17 reports it choosing 60; BIC's log(T) penalty is what keeps "
               "this finite.)")
+        # RealBar's own preferred lag as an MA(1) diagnostic. The table is fitted at ONE common
+        # order by design (a column difference must not be a lag difference), but differencing
+        # per-bar realized-correlation ESTIMATES leaves an MA(1) from estimation noise, and the
+        # visible signature is RealBar's own criterion wanting exactly one more lag than the
+        # common order. A gap of +1 is that noise term; a larger gap is data, not noise.
+        if a.with_bar:
+            try:
+                p_bar, _tab = cs.select_svar_lag(sessions, spec=a.spec, corr_method="bar",
+                                                 bar_seconds=a.bar_seconds, criterion=crit,
+                                                 pmax=a.pmax, panel=a.panel)
+                if p_bar is not None:
+                    gap = int(p_bar) - int(n_lags)
+                    tag = ("the expected MA(1) noise term" if gap == 1 else
+                           "no extra lag wanted -- the noise term is negligible here" if gap <= 0
+                           else "MORE than the MA(1) can explain -- treat as dynamics, not noise")
+                    print("  RealBar diagnostic: its own %s-preferred lag is p*=%d vs the common "
+                          "p=%d (gap %+d: %s)." % (crit.upper(), int(p_bar), int(n_lags), gap, tag))
+            except Exception:
+                pass
         print()
 
     tbl = pt.table_correlation_irf_both_ways(
@@ -233,6 +252,11 @@ def main(argv=None):
         for c in disp.columns:
             disp[c] = disp[c] + " [" + t[c].round(2).astype(str) + "]"
         print(disp.to_string())
+        wm = mg.get("point_weighted")
+        if wm is not None and not wm.empty:
+            print("effective-sample-weighted mean (weight = usable rows/day; agreement with the")
+            print("unweighted MG above says the mean is not driven by its shortest days):")
+            print(wm.round(3).to_string())
         print("n_days:")
         print(mg["n_days"].to_string())
         skip = mg.get("n_skipped") or {}

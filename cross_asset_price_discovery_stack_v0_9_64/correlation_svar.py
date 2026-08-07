@@ -459,13 +459,23 @@ def _panel_gram(Xs, p, fe=True, start=None, chunk=200_000):
 
 def _gram_solve(ZtZ, ZtY, YtY):
     """OLS slope + residual cross-product from Grams. -> (B, rss) with
-    rss = (Y-ZB)'(Y-ZB), symmetrized (the full quadratic form, exact under pinv too)."""
+    rss = (Y-ZB)'(Y-ZB), symmetrized (the full quadratic form, exact under pinv too).
+
+    Solved under symmetric Jacobi equilibration: the Gram squares the design's condition
+    number, and mixed-unit columns (price levels vs counts vs bps returns) push kappa toward
+    the float64 cliff. Scaling by D = diag(sqrt(diag(ZtZ))) and solving
+    (D^-1 ZtZ D^-1) x~ = D^-1 ZtY with x = D^-1 x~ is mathematically identical, is within a
+    factor k of the optimal diagonal preconditioner (van der Sluis), and reproduces the
+    unscaled solve exactly on well-conditioned designs."""
     if ZtZ is None or ZtZ.shape[0] == 0:
         return np.zeros((0, YtY.shape[0])), YtY.copy()
+    d = np.sqrt(np.clip(np.diag(ZtZ), EPS, None))
+    Zs = ZtZ / d[:, None] / d[None, :]
+    Ys = ZtY / d[:, None]
     try:
-        B = np.linalg.solve(ZtZ, ZtY)
+        B = np.linalg.solve(Zs, Ys) / d[:, None]
     except np.linalg.LinAlgError:
-        B = np.linalg.pinv(ZtZ) @ ZtY
+        B = (np.linalg.pinv(Zs) @ Ys) / d[:, None]
     rss = YtY - ZtY.T @ B - B.T @ ZtY + B.T @ ZtZ @ B
     return B, (rss + rss.T) / 2.0
 
@@ -986,18 +996,30 @@ def correlation_irf_mean_group(data, spec="informational", n_lags=6, horizon=10,
             if j == ci:
                 continue
             rows.append({"date": str(date), "regime": regime, "shock": nm,
-                         "resp_x100": 100.0 * resp[j]})
+                         "resp_x100": 100.0 * resp[j], "n_obs": int(len(X))})
     per_day = pd.DataFrame(rows)
     if per_day.empty:
-        return {"point": pd.DataFrame(), "se": pd.DataFrame(), "tstat": pd.DataFrame(),
-                "n_days": pd.DataFrame(), "per_day": per_day, "n_lags": int(n_lags),
-                "n_skipped": n_skip}
+        return {"point": pd.DataFrame(), "point_weighted": pd.DataFrame(), "se": pd.DataFrame(),
+                "tstat": pd.DataFrame(), "n_days": pd.DataFrame(), "per_day": per_day,
+                "n_lags": int(n_lags), "n_skipped": n_skip}
     g = per_day.groupby(["shock", "regime"])["resp_x100"]
     mean = g.mean().unstack(); sd = g.std(ddof=1).unstack(); n = g.count().unstack()
     se = sd / np.sqrt(n)
+    # Effective-sample-weighted mean alongside the unweighted MG: after halt masking, days
+    # differ substantially in usable rows, and the pure Pesaran-Smith mean hands a truncated
+    # MWCB day the same weight as a full baseline day. The weight is the day's usable design
+    # rows (a precision PROXY -- per-day bootstrap SEs would be the exact weight but cost a
+    # full bootstrap per day); agreement between the two columns is itself evidence the MG
+    # mean is not driven by its shortest days.
+    def _wmean(gg):
+        w = gg["n_obs"].to_numpy(float); v = gg["resp_x100"].to_numpy(float)
+        return float(np.sum(w * v) / max(np.sum(w), EPS))
+    wmean = per_day.groupby(["shock", "regime"])[["n_obs", "resp_x100"]].apply(_wmean).unstack()
     order = [nm for nm in (names_ref or []) if nm in mean.index] or list(mean.index)
     mean, se, n = mean.reindex(order), se.reindex(order), n.reindex(order)
-    return {"point": mean, "se": se, "tstat": mean / se.replace(0.0, np.nan),
+    wmean = wmean.reindex(order)
+    return {"point": mean, "point_weighted": wmean, "se": se,
+            "tstat": mean / se.replace(0.0, np.nan),
             "n_days": n, "per_day": per_day, "n_lags": int(n_lags), "n_skipped": n_skip}
 
 

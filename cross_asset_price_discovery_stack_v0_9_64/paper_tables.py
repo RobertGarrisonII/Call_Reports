@@ -476,20 +476,31 @@ def table_rigobon(sessions, n_lags=1):
     diag = rg.identification_diagnostic(rg.regime_residual_cov(U, regimes), names=("SPY", "ES"))
     verdict = "yes" if diag["identified"] else "NO -- do not quote the Rigobon column"
     rC = out["contemp_rigobon"]; cf_ = out["contemp_cholesky_fwd"]; cr = out["contemp_cholesky_rev"]
-    num = pd.DataFrame({
-        "Rigobon (order-free)": [rC.loc["SPY", "ES"], rC.loc["ES", "SPY"],
-                                 diag["var_ratio_spread"], diag["rel_eig_gap"], verdict],
-        "Cholesky SPY->ES": [cf_.loc["SPY", "ES"], cf_.loc["ES", "SPY"], np.nan, np.nan, ""],
-        "Cholesky ES->SPY": [cr.loc["SPY", "ES"], cr.loc["ES", "SPY"], np.nan, np.nan, ""],
-    }, index=["contemp SPY<-ES", "contemp ES<-SPY",
-              "var-ratio spread (max/min - 1; ~0 = common-scale, unidentified)",
-              "relative eigenvalue gap (verdict thresholds this > 0.10)",
-              "identified (relative het present)"])
+    idx = ["contemp SPY<-ES", "contemp ES<-SPY",
+           "var-ratio spread (max/min - 1; ~0 = common-scale, unidentified)",
+           "relative eigenvalue gap (verdict thresholds this > 0.10)",
+           "identified (relative het present)"]
+    col_r = [rC.loc["SPY", "ES"], rC.loc["ES", "SPY"],
+             diag["var_ratio_spread"], diag["rel_eig_gap"], verdict]
+    col_f = [cf_.loc["SPY", "ES"], cf_.loc["ES", "SPY"], np.nan, np.nan, ""]
+    col_v = [cr.loc["SPY", "ES"], cr.loc["ES", "SPY"], np.nan, np.nan, ""]
+    # With 3+ exogenous labels (e.g. benchmark / volatile / mwcb) the constant-A het model is
+    # OVER-identified: the same rotation must diagonalize every regime's covariance, and the
+    # off-diagonal mass it leaves is a testable restriction rather than a free parameter --
+    # ~0 supports the identification, large means the contemporaneous matrix itself moves
+    # across regimes and the Rigobon point estimates blend different structures.
+    if out.get("overid") is not None:
+        idx.append("over-ID off-diag mass across 3+ regimes (~0 = constant-A holds)")
+        col_r.append(out["overid"]); col_f.append(np.nan); col_v.append(np.nan)
+    num = pd.DataFrame({"Rigobon (order-free)": col_r,
+                        "Cholesky SPY->ES": col_f,
+                        "Cholesky ES->SPY": col_v}, index=idx)
     note = (f"Contemporaneous structural coefficients. Regimes = {regime_src}. Het-ID pins the "
             f"rotation down only when regimes differ in RELATIVE heteroskedasticity; when the "
             f"verdict row says NO the Rigobon numbers are numerical noise -- quote the Cholesky "
             f"bracket instead. The Rigobon column needs no ordering; the two Cholesky columns "
-            f"bracket the ordering assumption.")
+            f"bracket the ordering assumption. Labeling MWCB days as their own third regime "
+            f"(instead of folding them into 'volatile') adds the over-identification row.")
     return Table("Rigobon order-free identification vs Cholesky orderings (revamp)", _fmt_df(num, 4), note, numeric=num)
 
 

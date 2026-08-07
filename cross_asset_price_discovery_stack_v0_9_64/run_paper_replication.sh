@@ -150,12 +150,14 @@ QC_ACTION="warn"      # warn | drop | raise -- what to do with a session whose b
 # 2025-01-27 Mon vs 2024-01-29 Mon (364 d). New pair: 2025-08-01 Fri vs 2024-08-09 Fri (357 d).
 # validate_sample.py passes this list clean: all pairs same weekday, 350-371 d apart.
 #
-# REPRODUCIBILITY LIMIT, stated rather than implied: validate_sample.py checks the PAIRING
-# rules (weekday match, ~1y gap, market open), but no script in this repo computes the
-# "largest intraday-range days in 2022-2026" RANKING that selected the volatile list -- that
-# needs a daily OHLC feed the stack does not pull. The list is therefore an INPUT to the
-# pipeline, not a derived object; a referee reproducing the selection must rank ranges from
-# their own daily data (SPY high-low over close), then verify the pairing here.
+# REPRODUCIBILITY: validate_sample.py checks the PAIRING rules (weekday match, ~1y gap,
+# market open), and rank_sample.py (v0.9.65) computes the "largest intraday-range days"
+# RANKING itself from a user-supplied daily OHLC csv -- the one piece of data the stack does
+# not pull. To re-derive (or challenge) this list:
+#     python rank_sample.py --csv spy_daily.csv --compare
+# prints the ranked days, suggested same-weekday ~1y-prior pairs in --volatile/--baseline
+# form, and where each shipped day ranks under YOUR data. The paper should cite the daily
+# file the selection was run on.
 VOLATILE="2024-12-18,2026-06-05,2025-10-10,2024-09-03,2025-04-03,2024-08-05,2024-07-24,2025-01-27,2023-03-09,2025-08-01"
 BASELINE="2023-12-20,2025-06-13,2024-10-18,2023-09-05,2024-04-04,2023-08-07,2023-07-19,2024-01-29,2022-03-24,2024-08-09"
 MWCB="2020-03-09,2020-03-12,2020-03-16,2020-03-18"
@@ -376,6 +378,8 @@ if have_stage 1; then
            test_replay_fast_snap.py \
            test_panel_svar.py \
            test_audit_fixes.py \
+           test_improvements.py \
+           test_golden_numbers.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi

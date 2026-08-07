@@ -203,6 +203,38 @@ def fevd_from_irf(return_irf, H=None):
     return num / (tot + EPS)
 
 
+def gfevd_from_irf(return_irf, shock_corr=None, H=None, normalize=True):
+    """GENERALIZED forecast-error variance decomposition (Pesaran-Shin 1998) -- the
+    order-free decomposition that stays valid when the structural shocks are CORRELATED,
+    which is exactly the regime the tandem-flow result puts the OFI shocks in.
+
+    ``return_irf`` are the structural responses D_h to unit-SD shocks (as from
+    ``structural_vecm_irf``: D_h = C_h B with B = Lambda diag(sd(OFI)), so the normalized
+    shocks u have Cov(u) = R, their CORRELATION matrix). ``shock_corr`` is that R (k x k;
+    None = identity, in which case this reduces exactly to ``fevd_from_irf``).
+
+        theta_ij = sum_h ((D_h R)_ij)^2 / R_jj   over   sum_h (D_h R D_h')_ii
+
+    Rows do NOT sum to 1 under correlated shocks -- the shocks' shared variance is counted
+    toward every shock that carries it, which is the honest answer when 'SPY flow' and 'ES
+    flow' are partly the same tandem flow. ``normalize=True`` (the convention) rescales rows
+    to sum to 1 for readability; report the raw row sums alongside if the overlap itself is
+    of interest."""
+    D = np.asarray(return_irf, float); H = (len(D) - 1) if H is None else H
+    k = D.shape[1]
+    R = np.eye(k) if shock_corr is None else np.asarray(shock_corr, float)
+    num = np.zeros((k, k)); den = np.zeros(k)
+    for h in range(H + 1):
+        DR = D[h] @ R
+        num += DR ** 2
+        den += np.diag(D[h] @ R @ D[h].T)
+    num = num / np.clip(np.diag(R), EPS, None)[None, :]
+    theta = num / (den[:, None] + EPS)
+    if normalize:
+        theta = theta / (theta.sum(axis=1, keepdims=True) + EPS)
+    return theta
+
+
 # ── self-test ────────────────────────────────────────────────────────────────
 def _selftest():
     rng = np.random.default_rng(9)

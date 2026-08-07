@@ -1,0 +1,62 @@
+name: gate-suite
+
+# The stack's correctness gates, run on every push/PR that touches the stack. Everything is
+# synthetic/deterministic -- no vendor credentials or market data are needed (maystreet_data
+# is only imported by the legacy Athena path, which no gate touches). The full 58+ module
+# suite runs in ~5 minutes locally; the generous timeout covers slower hosted runners.
+
+on:
+  push:
+    paths:
+      - "cross_asset_price_discovery_stack_v*/**"
+      - ".github/workflows/gates.yml"
+  pull_request:
+    paths:
+      - "cross_asset_price_discovery_stack_v*/**"
+      - ".github/workflows/gates.yml"
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install numpy pandas scipy joblib
+
+      - name: Locate the current stack directory
+        id: stack
+        run: |
+          DIR="$(ls -d cross_asset_price_discovery_stack_v* 2>/dev/null | grep -v '\.zip$' | sort -V | tail -1)"
+          test -n "$DIR" || { echo "no stack directory found"; exit 1; }
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "stack: $DIR"
+
+      - name: Compile checks (python + bash + driver flags)
+        working-directory: ${{ steps.stack.outputs.dir }}
+        run: |
+          python -m py_compile *.py
+          bash -n run_paper_replication.sh
+          python check_driver_flags.py run_paper_replication.sh --quiet
+
+      - name: Run the full gate suite
+        working-directory: ${{ steps.stack.outputs.dir }}
+        run: |
+          FAIL=""; PASS=0
+          for t in test_*.py; do
+            echo "::group::$t"
+            if timeout 1800 python "$t"; then
+              PASS=$((PASS+1))
+            else
+              FAIL="$FAIL $t"
+            fi
+            echo "::endgroup::"
+          done
+          echo "passed: $PASS | failed:${FAIL:- none}"
+          test -z "$FAIL"
