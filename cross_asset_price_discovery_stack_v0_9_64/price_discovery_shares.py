@@ -240,10 +240,21 @@ def gonzalo_granger(alpha):
 def _is_for_factor(psi, F, denom):
     return (psi @ F) ** 2 / denom
 
+def _is_degenerate(psi, Omega, denom):
+    """RELATIVE degeneracy test for the IS denominator psi'Omega psi. The quantity has units
+    of alpha^2 x return-variance -- at a 10ms grid that is ~1e-16 on PERFECTLY identified
+    days -- so comparing it to the absolute EPS=1e-15 silently returned a fake 0.5/0.5 tie
+    (with ec_valid True, averaged into every mean_IS_* table) exactly where the fine grid is
+    supposed to shine. Degeneracy is denom vanishing RELATIVE to its own natural scale
+    ||psi||^2 * tr(Omega): true when alpha ~ (0,0) or Omega is degenerate along psi, false
+    for any well-identified system at any grid's units."""
+    scale = float(psi @ psi) * float(np.trace(Omega))
+    return not np.isfinite(denom) or denom <= 1e-12 * max(scale, 0.0) or scale <= 0.0
+
 def hasbrouck_is(alpha, Omega):
     """IS lower/upper bounds (two Cholesky orderings) + midpoint, per market."""
     psi = _psi(alpha); denom = float(psi @ Omega @ psi.T)
-    if denom <= EPS:
+    if _is_degenerate(psi, Omega, denom):
         z = np.array([0.5, 0.5]); return z, z, z
     F1 = np.linalg.cholesky(Omega)
     is1 = _is_for_factor(psi, F1, denom)
@@ -257,7 +268,7 @@ def lien_shrestha_is(alpha, Omega):
     """Unique, order-invariant IS via symmetric correlation factorization:
     F = V * corr^{1/2}_sym, FF' = Omega."""
     psi = _psi(alpha); denom = float(psi @ Omega @ psi.T)
-    if denom <= EPS:
+    if _is_degenerate(psi, Omega, denom):
         return np.array([0.5, 0.5])
     v = np.sqrt(np.diag(Omega))
     Vinv = np.diag(1.0 / np.where(v > EPS, v, np.nan))

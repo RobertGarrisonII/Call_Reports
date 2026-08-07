@@ -736,7 +736,12 @@ def _load(gl):
 panels, by, source = {}, {}, "PUBLISHED (paper's Table 5.II literals; no frames found)"
 try:
     import mstbook_loader as ml
+    import market_halts as mh
     sess = _load(frames_glob)
+    # halt-mask on load (v0.9.65): frames are cached PRE-mask, and this inline loader was
+    # the remaining consumer estimating unmasked -- LULD residual prints inside halt windows
+    # would count as tandem order flow in exactly the MWCB panel this table separates out.
+    sess = [(d, r, mh.mask_frame(f)[0]) for d, r, f in sess]
     if sess and ml.has_trade_flow(sess):
         # MWCB days are their own panel, not part of 'volatile' -- the halt is a different regime.
         mw = set(x for x in mwcb.split(",") if x)

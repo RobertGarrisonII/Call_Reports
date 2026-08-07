@@ -770,6 +770,14 @@ def build_all_tables(sessions, counts_fn, vol, mwcb_treated, mwcb_control, relea
             status = "ERROR: " + repr(e)
         if verbose:
             print(f"  [{name:24s}] {status}")
+    # A failed builder is an EMPTY table with a BUILD ERROR note that write_report renders
+    # inline among the good ones -- easy to scroll past in a 16-table file. Say it once,
+    # loudly, at the end, with names: a manuscript-tables file missing exhibits should never
+    # read as a clean run.
+    errs = [n for n, t in out.items() if str(getattr(t, "notes", "")).startswith("BUILD ERROR")]
+    if errs and verbose:
+        print("  BUILD ERRORS: %d of %d tables failed and are EMPTY in the output: %s"
+              % (len(errs), len(out), ", ".join(errs)))
     return out
 
 

@@ -103,7 +103,15 @@ def derive_coarse_frame(fine: pd.DataFrame, target: str, fine_interval: str | No
         key = fine.index.floor(freq)
         g = fine[sum_cols + px_cols + vwap_cols].groupby(key)
         for c in sum_cols:
-            out[c] = g[c].sum().reindex(coarse_idx).to_numpy()
+            s = g[c].sum().reindex(coarse_idx)
+            # A bin whose sub-bins are ALL NaN is a MASKED (or dataless) bin, and pandas'
+            # default sum would fabricate a finite 0.0 there -- fake "no flow" inside a halt
+            # window that the finite-row design masks downstream would then keep. Genuine
+            # no-trade bins are unaffected: the extractor writes 0.0 for those (finite), so
+            # their sums stay 0.0 and derived == direct exactly.
+            nf = fine[c].notna().groupby(key).sum().reindex(coarse_idx).fillna(0)
+            s[nf == 0] = np.nan
+            out[c] = s.to_numpy()
         for c in px_cols:
             out[c] = g[c].last().reindex(coarse_idx).to_numpy()      # .last() skips NaN
         for c in vwap_cols:
@@ -117,7 +125,11 @@ def derive_coarse_frame(fine: pd.DataFrame, target: str, fine_interval: str | No
                     out[c] = (num / den.where(den > 0)).to_numpy()
             else:
                 out[c] = g[c].last().reindex(coarse_idx).to_numpy()
-    out.attrs = dict(fine.attrs)
+    # estimation memos (correlation_svar caches X/rho on attrs) must NOT travel onto a frame
+    # with different data -- their fingerprint would go stale anyway, but a memoized fine-grid
+    # X is hundreds of MB of dead weight to copy and cache.
+    out.attrs = {k: v for k, v in fine.attrs.items()
+                 if k not in ("_svar_frame_memo", "_dcc_rho_memo")}
     out.attrs["derived_from_interval"] = fine_interval or ("%gs" % dt_f)
     return out
 
@@ -127,11 +139,23 @@ def _verify(derived: pd.DataFrame, direct: pd.DataFrame) -> dict:
     exactly (NaN-aware); flow columns must match on all bars EXCEPT the final one (post-close
     prints -- see module docstring); vwap is reported but tolerated (signed-weight approximation)."""
     rep = {"ok": True, "book_mismatch": [], "flow_mismatch": [], "vwap_max_dev": 0.0,
-           "final_bar_flow_diff": 0.0, "n_rows": int(len(derived))}
+           "final_bar_flow_diff": 0.0, "n_rows": int(len(derived)),
+           "head_trim_bars": 0, "tail_trim_bars": 0}
     if len(derived) != len(direct) or not derived.index.equals(direct.index):
-        rep["ok"] = False
-        rep["book_mismatch"].append("<index differs: %d vs %d rows>" % (len(derived), len(direct)))
-        return rep
+        # A ceil-anchored derived frame legitimately starts LATER than the direct cache:
+        # the fine frames are saved post-_align_books (head rows trimmed), while direct
+        # caches were extracted untrimmed. That is COVERAGE, not a derivation error -- and
+        # calling it a mismatch made --verify-existing exit 3 and roll back every derived
+        # cache on any workbench whose sessions have a trimmed start. Edge-only differences
+        # are aligned and reported as trims; an interior index difference stays a mismatch.
+        pos = direct.index.get_indexer(derived.index)
+        if len(derived) == 0 or (pos < 0).any() or not (np.diff(pos) == 1).all():
+            rep["ok"] = False
+            rep["book_mismatch"].append("<index differs: %d vs %d rows>" % (len(derived), len(direct)))
+            return rep
+        rep["head_trim_bars"] = int(pos[0])
+        rep["tail_trim_bars"] = int(len(direct) - 1 - pos[-1])
+        direct = direct.loc[derived.index]
     common = [c for c in derived.columns if c in direct.columns]
     for c in common:
         a = pd.to_numeric(derived[c], errors="coerce").to_numpy(float)
@@ -232,8 +256,13 @@ def main(argv=None) -> int:
         vtxt = ""
         if v is not None:
             if v["ok"]:
+                trim = ""
+                if v.get("head_trim_bars") or v.get("tail_trim_bars"):
+                    trim = ("; aligned over the common range, direct cache has %d leading/"
+                            "%d trailing extra bar(s) -- the _align_books head trim"
+                            % (v.get("head_trim_bars", 0), v.get("tail_trim_bars", 0)))
                 vtxt = (" | VERIFIED against direct cache (vwap max dev %.3g; final-bar flow "
-                        "diff %.0f)" % (v["vwap_max_dev"], v["final_bar_flow_diff"]))
+                        "diff %.0f%s)" % (v["vwap_max_dev"], v["final_bar_flow_diff"], trim))
             else:
                 vtxt = (" | MISMATCH vs direct cache: book=%s flow=%s"
                         % (v["book_mismatch"][:4], v["flow_mismatch"][:4]))
@@ -248,20 +277,27 @@ def main(argv=None) -> int:
         # frame this run cached for sessions without a direct cache is suspect too. Leaving
         # them in place meant a later coarse extraction cache-HIT silently served them even
         # though this exit code said not to trust them (and the driver ran on).
-        rolled = []
+        rolled, stuck = [], []
         for label, rep in reports.items():
             c = rep.get("cached")
             if isinstance(c, str) and os.path.sep in c and os.path.exists(c):
                 try:
                     os.unlink(c); rolled.append(label)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    # A cache that cannot be removed is still a SUSPECT derived frame that
+                    # later runs will cache-HIT -- swallowing this silently defeats the
+                    # rollback. Name it so the operator can delete it by hand.
+                    stuck.append("%s (%s: %s)" % (label, c, exc))
         print("\n%d session(s) MISMATCH the direct extraction -- the direct caches were kept"
               % bad)
         if rolled:
             print("rolled back %d derived cache write(s) from this run (%s): the derivation is "
                   "suspect for ALL sessions until the mismatch is explained"
                   % (len(rolled), ", ".join(rolled)))
+        if stuck:
+            print("ROLLBACK INCOMPLETE -- could not remove %d suspect derived cache(s); delete "
+                  "them by hand before the next run cache-HITs them: %s"
+                  % (len(stuck), "; ".join(stuck)))
         print("investigate before trusting derivation for uncached sessions.")
         return 3
     return 0

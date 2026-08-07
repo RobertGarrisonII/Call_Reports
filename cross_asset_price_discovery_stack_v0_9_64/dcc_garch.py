@@ -54,13 +54,26 @@ def _garch_filter(eps, omega, alpha, beta, gamma, X):
 
 def garch_x_fit(eps, X=None):
     """Fit GARCH(1,1)-X by Gaussian MLE. eps: mean-zero series. X: T x p or None.
-    Returns params dict, conditional variance h, standardized resid z."""
+    Returns params dict, conditional variance h, standardized resid z.
+
+    The series is STANDARDIZED to unit variance internally and the parameters mapped back
+    (omega, h, gamma scale by var; alpha, beta, z are scale-free; loglik gets the Jacobian
+    term). Every production caller feeds RAW log-mid returns whose variance is ~4e-9 at 1s
+    and ~4e-11 at 10ms, and against that scale the omega lower bound (1e-9) and the
+    _garch_filter variance floor (EPS=1e-10) -- both absolute constants sized for unit-ish
+    data -- were BINDING: at 1s the fitted omega pinned to its bound and persistence
+    collapsed; at 10ms h was 100% floored, alpha=beta=0, and the 'standardized' residuals
+    kept all their volatility clustering, contaminating every DCC rho_t downstream. In the
+    scaled domain the constants are what they were always meant to be: negligible."""
     eps = np.asarray(eps, float)
     Xm = None if X is None else (np.asarray(X, float).reshape(-1, 1)
                                  if np.asarray(X).ndim == 1 else np.asarray(X, float))
     fin = np.isfinite(eps) & (np.all(np.isfinite(Xm), axis=1) if Xm is not None else True)
     eps = eps[fin]; Xm = None if Xm is None else Xm[fin]
-    v = np.var(eps)
+    v_raw = np.var(eps)
+    s = float(np.sqrt(v_raw)) if (np.isfinite(v_raw) and v_raw > 0) else 1.0
+    eps = eps / s
+    v = np.var(eps)                                          # ~1 by construction
     p = 0 if Xm is None else Xm.shape[1]
 
     def nll(theta):
@@ -83,8 +96,11 @@ def garch_x_fit(eps, X=None):
     th = best.x
     gamma = th[3:] if p else np.array([])
     h = _garch_filter(eps, th[0], th[1], th[2], (gamma if p else 0.0), Xm)
-    return {"omega": th[0], "alpha": th[1], "beta": th[2], "gamma": gamma,
-            "loglik": -best.fun, "h": h, "z": eps / np.sqrt(h)}
+    s2 = s * s
+    return {"omega": th[0] * s2, "alpha": th[1], "beta": th[2],
+            "gamma": gamma * s2 if p else gamma,
+            "loglik": -best.fun - len(eps) * np.log(s),      # raw-scale Gaussian loglik
+            "h": h * s2, "z": eps / np.sqrt(h)}
 
 
 # ── DCC(1,1) second stage ────────────────────────────────────────────────────

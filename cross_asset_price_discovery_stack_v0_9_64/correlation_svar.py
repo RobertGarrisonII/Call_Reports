@@ -230,9 +230,17 @@ def build_svar_frame(df, spec="informational", n_levels=10, target_qty=None,
     # draws, so the last build is cached on df.attrs; one slot bounds extra residency at a
     # single X per session while every draw inside an estimator block hits. Callers treat the
     # returned X as read-only (all downstream ops -- X[:, keep], vstack, resampling -- copy).
+    #
+    # SOUNDNESS (v0.9.65): pandas carries attrs through copy/pickle/derivation, so a memo
+    # can outlive the data it was built from -- a halt-masked copy or a derived coarse frame
+    # would have served the pre-mask fine-grid X. The key therefore embeds a DATA fingerprint
+    # (length, index endpoints, halt-mask state), which goes stale on every such transition;
+    # and extra_fn builds are not cached at all (id() is only unique among live objects, so a
+    # recycled lambda address could serve another table's regressor block).
+    fp = _frame_fingerprint(df)
     key = (tuple(feats), int(n_levels), target_qty, str(corr_method), int(corr_window),
-           str(wspread_kind), int(bar_seconds), id(extra_fn) if extra_fn is not None else None)
-    cacheable = dcc_returns is None
+           str(wspread_kind), int(bar_seconds), fp)
+    cacheable = dcc_returns is None and extra_fn is None and fp is not None
     if cacheable:
         hit = df.attrs.get("_svar_frame_memo")
         if hit is not None and hit[0] == key:
@@ -283,6 +291,35 @@ def build_svar_frame(df, spec="informational", n_levels=10, target_qty=None,
     if cacheable:
         df.attrs["_svar_frame_memo"] = (key, out)
     return out
+
+
+def _frame_fingerprint(df):
+    """Cheap data-identity stamp for the attrs memos: length, index endpoints, halt-mask
+    state. Catches every real transition that changes the DATA while pandas faithfully
+    carries attrs along -- masking (halt_masked appears with nonzero counts), derivation and
+    resampling (length/endpoints change), pickle round-trips of a different frame. Frames
+    with equal data share a fingerprint, which is exactly when serving the memo is correct.
+    Returns None (caller must not cache) when the frame cannot be stamped."""
+    try:
+        idx = df.index
+        hm = df.attrs.get("halt_masked") or {}
+        return (int(len(df)), int(idx[0].value), int(idx[-1].value),
+                tuple(sorted((str(k), int(v)) for k, v in hm.items())))
+    except Exception:
+        return None
+
+
+MEMO_ATTR_KEYS = ("_svar_frame_memo", "_dcc_rho_memo")
+
+
+def strip_memo_attrs(df):
+    """Remove the estimation memos from a frame's attrs IN PLACE (they rebuild on demand).
+    Call before persisting or deriving: a memoized X can be hundreds of MB at a fine grid,
+    and a pickled/copied memo is at best dead weight and at worst a stale-data hazard the
+    fingerprint then has to catch."""
+    for k in MEMO_ATTR_KEYS:
+        df.attrs.pop(k, None)
+    return df
 
 
 def _fisher_z(rho):
@@ -370,21 +407,39 @@ def _dcc_corr(df, r, dcc_returns):
 
     The fitted rho depends ONLY on the frame's returns, not on corr_window or the regressor
     spec, so it memoizes on df.attrs independently of the frame memo above -- a spec or
-    window change re-assembles the frame but must not re-fit the GARCH."""
-    if dcc_returns is None:
+    window change re-assembles the frame but must not re-fit the GARCH. The memo carries the
+    same data fingerprint as the frame memo (length alone let a masked copy or a same-length
+    different frame serve a stale rho)."""
+    fp = _frame_fingerprint(df)
+    if dcc_returns is None and fp is not None:
         hit = df.attrs.get("_dcc_rho_memo")
-        if hit is not None and len(hit) == len(df):
-            return hit
+        if hit is not None and isinstance(hit, tuple) and hit[0] == fp:
+            return hit[1]
     try:
         import dcc_garch as dg
         ret = dcc_returns if dcc_returns is not None else np.column_stack(
             [np.diff(np.log(np.asarray(ca._mid(df, "SPY"), float))), np.diff(np.log(np.asarray(ca._mid(df, "ES"), float)))])
-        fit = dg.dcc_garch_x(ret)
-        out = np.concatenate([[np.nan], np.asarray(fit["rho"], float)])
+        # dcc_garch_x drops non-finite rows jointly and returns rho over the CLEAN rows only,
+        # so on a halt-masked session (every LULD/MWCB day) the old straight concatenate was
+        # short and pd.Series(rho, index=idx) blew up the whole both-ways table. Scatter the
+        # clean rho back onto the original grid: masked rows stay NaN, the dCorr diff then
+        # NaNs the reopen boundary too, and the finite-row design mask drops halt + seam --
+        # the same exclusion every other estimator applies. (The GARCH/DCC recursion does run
+        # ACROSS the excised gap -- one h_t/Q_t step bridges pre-halt to reopen -- a bounded
+        # initialization effect on the first post-reopen bars, against which masking rows out
+        # of the fit is the lesser evil vs feeding the 900s halt move in as one 'return'.)
+        fin = np.all(np.isfinite(np.asarray(ret, float)), axis=1)
+        rho_fit = np.asarray(dg.dcc_garch_x(ret)["rho"], float)
+        rho = np.full(len(ret), np.nan)
+        if len(rho_fit) == len(ret):                    # nothing dropped (or all-NaN fallback)
+            rho = rho_fit
+        elif len(rho_fit) == int(fin.sum()):            # clean-row rho -> scatter onto the grid
+            rho[fin] = rho_fit
+        out = np.concatenate([[np.nan], rho])
     except Exception:
         out = np.full(len(df), np.nan)
-    if dcc_returns is None:
-        df.attrs["_dcc_rho_memo"] = out
+    if dcc_returns is None and fp is not None:
+        df.attrs["_dcc_rho_memo"] = (fp, out)
     return out
 
 

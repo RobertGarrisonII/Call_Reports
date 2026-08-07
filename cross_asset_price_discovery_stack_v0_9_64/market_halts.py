@@ -378,10 +378,18 @@ def mask_frame(df, assets=("SPY", "ES"), tz: str = TZ):
         if m.any():
             todo.append((a, m))
     if not todo:
-        df.attrs["halt_masked"] = dict(rep)
+        # Return the ORIGINAL untouched -- including its attrs. Annotating it with
+        # halt_masked={...: 0} (the first version of this fast path) leaked a truthy dict
+        # onto the very object run_analysis keeps as the PRE-MASK frame and saves as the
+        # faithful artifact; ab_halt_mask then read every v0.9.64 frames pickle as
+        # 'masked at rest' and refused the A/B. No mask, no trace.
         return df, rep
     out = df.copy()
-    out.attrs = dict(attrs)
+    out.attrs = {k: v for k, v in attrs.items()
+                 if k not in ("_svar_frame_memo", "_dcc_rho_memo")}
+    # (estimation memos are stripped from the COPY: they were built on the unmasked data,
+    # and while their fingerprint would go stale anyway, a memoized X can be hundreds of MB
+    # at a fine grid -- dead weight traveling on every masked frame.)
     for a, m in todo:
         cols = [c for c in out.columns if c.startswith(f"{a}_")
                 and any(t in c.lower() for t in _MARKET)

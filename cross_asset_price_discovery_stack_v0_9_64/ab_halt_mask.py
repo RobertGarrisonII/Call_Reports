@@ -62,7 +62,12 @@ def _masked_at_rest(sessions):
     """True if the pickle already carries the mask: the unmasked arm would be an A/A."""
     for _d, _r, df in sessions:
         attrs = getattr(df, "attrs", {}) or {}
-        if attrs.get("halt_masked"):
+        # any() over the COUNTS, not dict truthiness: an annotation of all-zero counts
+        # (a no-halt session that merely passed THROUGH mask_frame) is a statement that
+        # nothing was masked, and treating it as masked-at-rest refused valid pre-mask
+        # pickles wholesale.
+        hm = attrs.get("halt_masked") or {}
+        if any(int(v) > 0 for v in hm.values()):
             return True
         for a in ("SPY", "ES"):
             wins = attrs.get(f"halt_windows_{a}") or []

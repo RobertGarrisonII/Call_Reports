@@ -88,8 +88,45 @@ def _resample_to_interval(sessions, interval):
                 LOG.warning("session %s native grid ~%.3gs is coarser than target %s; cannot upsample, keeping native",
                             str(d), native, interval)
             out.append((d, r, df)); continue
-        rs = df.resample(pd.Timedelta(interval)).last().dropna(how="all")
-        LOG.info("session %s resampled %.3gs -> %s (%d -> %d rows)", str(d), native, interval, len(df), len(rs))
+        # COLUMN-AWARE coarsening (v0.9.65). The old frame-wide .last() violated the
+        # derivation contract this stack itself documents: *_trade_* flow columns are
+        # per-bin aggregates whose coarse bin is the SUM of sub-bins, so .last() kept only
+        # the final sub-bin's flow (~1/100 of true 1s flow from a 10ms frame) and vwap
+        # became the last sub-bin's print. The exact path is derive_frames.derive_coarse_frame
+        # (row-selection state, summed flow, recombined vwap, NaN-preserving); the resample
+        # fallback below only fires for a non-integer-multiple target and fixes flow/vwap
+        # there too. Neither path drops all-NaN rows anymore -- deleting masked bars is a
+        # row-drop splice.
+        import derive_frames as dvf
+        try:
+            rs = dvf.derive_coarse_frame(df, interval)
+        except (ValueError, KeyError):
+            rr = df.resample(pd.Timedelta(interval))
+            sum_cols = [c for c in df.columns if c.endswith(dvf.SUM_SUFFIXES)]
+            px_cols = [c for c in df.columns if c.endswith(dvf.PX_SUFFIX)]
+            vwap_cols = [c for c in df.columns if c.endswith(dvf.VWAP_SUFFIX)]
+            state = [c for c in df.columns
+                     if c not in set(sum_cols) | set(px_cols) | set(vwap_cols)]
+            parts = [rr[state].last()]
+            if sum_cols:
+                parts.append(rr[sum_cols].sum(min_count=1))
+            if px_cols:
+                parts.append(rr[px_cols].last())
+            for c in vwap_cols:
+                root = c[: -len(dvf.VWAP_SUFFIX)]
+                bv, sv = f"{root}_trade_buy_volume", f"{root}_trade_sell_volume"
+                if bv in df.columns and sv in df.columns:
+                    w = df[bv].fillna(0.0) + df[sv].fillna(0.0)
+                    num = (df[c] * w).resample(pd.Timedelta(interval)).sum()
+                    den = w.resample(pd.Timedelta(interval)).sum()
+                    parts.append((num / den.where(den > 0)).rename(c).to_frame())
+                else:
+                    parts.append(rr[[c]].last())
+            rs = pd.concat(parts, axis=1)[list(df.columns)]
+            rs.attrs = {k: v for k, v in df.attrs.items()
+                        if k not in ("_svar_frame_memo", "_dcc_rho_memo")}
+        LOG.info("session %s coarsened %.3gs -> %s (%d -> %d rows, column-aware)",
+                 str(d), native, interval, len(df), len(rs))
         out.append((d, r, rs))
     return out
 
@@ -916,6 +953,12 @@ def run_stages(sessions, args, ts=None, t0=None):
         # grid it is tens of GB -- a crash (or the OOM killer) mid-write used to leave a
         # truncated frames_*.pkl that the driver's newest-first glob would then FIND and feed
         # to STAGE 3, which dies on the partial pickle instead of falling back.
+        # strip the estimation memos before persisting: a memoized X is up to hundreds of MB
+        # per session at a fine grid, and a pickled memo is dead weight (its data fingerprint
+        # goes stale on load anyway). They rebuild on demand.
+        import correlation_svar as _cs
+        for _d, _r, _f in to_save:
+            _cs.strip_memo_attrs(_f)
         tmp = fpath + ".tmp%d" % os.getpid()
         with open(tmp, "wb") as fh:
             pickle.dump([(str(d), r, f) for d, r, f in to_save], fh, protocol=4)

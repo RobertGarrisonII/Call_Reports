@@ -205,16 +205,18 @@ def check_svar_frame_memo():
     hit = a is b                                        # identical params -> the cached object
     c = cs.build_svar_frame(df, "standard", 3, None, "rolling", 60, "cost_to_fill")
     miss = c is not a                                   # changed window -> rebuild
-    sentinel = np.full(len(df), 0.123)
     df2 = _book_frame(seed=6)
-    df2.attrs["_dcc_rho_memo"] = sentinel
+    sentinel = np.full(len(df2), 0.123)
+    # v0.9.65 contract: the rho memo is (data_fingerprint, rho) -- a stale or foreign
+    # fingerprint must be IGNORED, a matching one served without a fit.
+    df2.attrs["_dcc_rho_memo"] = (cs._frame_fingerprint(df2), sentinel)
     memo_used = cs._dcc_corr(df2, None, None) is sentinel
-    custom = np.random.default_rng(0).normal(size=(len(df2) - 1, 2))
-    not_for_custom = cs._dcc_corr(df2, None, custom) is not sentinel
-    ok = hit and miss and memo_used and not_for_custom
+    df2.attrs["_dcc_rho_memo"] = (("stale",), sentinel)
+    stale_ignored = cs._dcc_corr(df2, None, None) is not sentinel
+    ok = hit and miss and memo_used and stale_ignored
     print("(5) build_svar_frame memo: same params -> same object (%s), changed params -> "
-          "rebuild (%s); _dcc_corr honors its rho memo (%s) and ignores it for custom "
-          "returns (%s) : %s" % (hit, miss, memo_used, not_for_custom, ok))
+          "rebuild (%s); _dcc_corr serves a fingerprint-matched rho memo (%s) and ignores a "
+          "stale one (%s) : %s" % (hit, miss, memo_used, stale_ignored, ok))
     return ok
 
 
@@ -394,12 +396,85 @@ def check_rigobon_exogenous_regimes():
     return ok
 
 
+# ── (13) bar coverage floors exclude masked bars ──────────────────────────────
+def check_bar_coverage_floors():
+    import correlation_svar as cs
+    from test_panel_svar import _book_frame
+    full = _book_frame(seed=5, n=1200)
+    Xf, _nf, _cf = cs.build_svar_frame(full, "standard", 3, None, "bar", 100,
+                                       "cost_to_fill", bar_seconds=60)
+    masked = _book_frame(seed=5, n=1200)
+    # NaN 50 of bar #1's 60 sub-rows across ALL columns: 10 finite < min_sub=15 (0.25*60)
+    # for rho, and < 30 (0.5*60) for the flow sums -- the bar must fall out of the design.
+    for c in masked.columns:
+        masked.loc[masked.index[60:110], c] = np.nan
+    Xm, _nm, _cm = cs.build_svar_frame(masked, "standard", 3, None, "bar", 100,
+                                       "cost_to_fill", bar_seconds=60)
+    dropped = len(Xf) - len(Xm)
+    ok = len(Xf) > 0 and 1 <= dropped <= 3       # the masked bar + diff-chain neighbours
+    print("(13) bar coverage floors: a bar with 10/60 finite sub-rows is excluded from the "
+          "design (%d row(s) dropped vs the unmasked build of %d) : %s"
+          % (dropped, len(Xf), ok))
+    return ok
+
+
+# ── (14) MWCB DiD wild-cluster p-values are finite on a well-formed panel ─────
+def check_mwcb_wcb_p_finite():
+    import paper_tables as pt
+    rel = pd.Timestamp("2020-03-09 09:34:00", tz=TZ)
+    treated, control, release_by_date = [], [], {}
+    for i, day in enumerate(("2020-03-09", "2020-03-12", "2020-03-16", "2020-03-18")):
+        r = pd.Timestamp(f"{day} 09:34:00", tz=TZ)
+        treated.append((day, pt._synth_release_book(day, r, True, 100 + i)))
+        release_by_date[day] = r
+    for i, day in enumerate(("2020-02-10", "2020-02-11", "2020-02-12", "2020-02-13")):
+        r = pd.Timestamp(f"{day} 09:34:00", tz=TZ)
+        control.append((day, pt._synth_release_book(day, r, False, 200 + i)))
+        release_by_date[day] = r
+    tbl = pt.table_mwcb_did(treated, control, release_by_date)
+    col = tbl.df["p (wild cluster)"]
+    n_finite = sum(1 for v in col if str(v) not in ("--", "nan"))
+    ok = n_finite >= 2                            # DiD and RD rows must both carry real p's
+    print("(14) MWCB DiD: wild-cluster bootstrap p-values are FINITE on a well-formed panel "
+          "(%d of %d rows; the _wcb except-branch must not silently eat them) : %s"
+          % (n_finite, len(col), ok))
+    return ok
+
+
+# ── (15) per-day level estimators: longest contiguous unmasked run ────────────
+def check_longest_run_and_per_day_tables():
+    import paper_tables as pt
+    from test_panel_svar import _book_frame
+    Y = np.ones((1000, 2))
+    Y[300:340] = np.nan                           # two runs: 300 rows, then 660 rows
+    run = pt._longest_finite_run(Y)
+    picks_longer = len(run) == 660
+    d1 = _book_frame(seed=5, n=2500, day="2024-07-24")
+    d2 = _book_frame(seed=6, n=2500, day="2024-07-25")
+    # a level shift between days: per-day estimation must not see it as a return
+    for c in d2.columns:
+        if "price" in c:
+            d2[c] = d2[c] * 1.10
+    sessions = [("2024-07-24", "benchmark", d1), ("2024-07-25", "volatile", d2)]
+    t_tick = pt.table_tick_correction(sessions)
+    tick_ok = not t_tick.df.empty and "PER DAY" in t_tick.notes.upper()
+    t_reg = pt.table_regime_is(sessions, p=1, max_iter=30)
+    reg_ok = not t_reg.df.empty and "n_days" in t_reg.df.columns
+    ok = picks_longer and tick_ok and reg_ok
+    print("(15) per-day level estimators: _longest_finite_run picks the longer post-gap "
+          "segment (%s); tick-correction (%s) and MS-VECM regime (%s) tables build per-day "
+          "across a 10%% overnight level shift : %s" % (picks_longer, tick_ok, reg_ok, ok))
+    return ok
+
+
 def main():
     checks = [check_table9_loader_masks, check_contagion_benchmark_label,
               check_gram_exactness, check_panel_vecm_gram, check_svar_frame_memo,
               check_mask_frame_no_copy, check_derive_ceil_anchor, check_mismatch_rollback,
               check_worker_pool_containment, check_driver_invariants,
-              check_jump_split_ec_valid, check_rigobon_exogenous_regimes]
+              check_jump_split_ec_valid, check_rigobon_exogenous_regimes,
+              check_bar_coverage_floors, check_mwcb_wcb_p_finite,
+              check_longest_run_and_per_day_tables]
     res = []
     for fn in checks:
         try:

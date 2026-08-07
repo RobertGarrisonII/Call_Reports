@@ -111,6 +111,12 @@ def moving_block_bootstrap(data, statistic, n_boot=499, block_len=None, seed=0, 
     data = np.asarray(data); n = len(data)
     if block_len is None:
         block_len = auto_block_length(data)
+    # block_len >= T is not a bootstrap: the old clamp to n made EVERY draw the identical
+    # full sample, all statistics degenerate, and (via romano_wolf_from_boot's old NaN
+    # handling) every cell maximally significant. An impossible setting falls back to T//2 --
+    # still long-range-dependence-preserving, but with genuine resampling variability.
+    if block_len >= n:
+        block_len = max(1, n // 2)
     block_len = max(1, min(block_len, n))
     n_blocks = int(np.ceil(n / block_len)); starts_max = n - block_len
     offs = np.arange(block_len)
@@ -298,17 +304,26 @@ def romano_wolf_from_boot(point, boot, alpha=0.05):
     point = np.asarray(point, float); boot = np.asarray(boot, float)
     se = boot.std(axis=0, ddof=1); se_safe = np.where(se > EPS, se, np.nan)
     t = np.abs(point / se_safe)
+    # A degenerate coefficient (zero bootstrap variance -- a structurally-zero response, a
+    # collinearity-dropped cell, or every draw identical) has t = NaN. NaN sorted DESCENDING
+    # lands first, and np.mean(maxdist >= NaN) is 0.0 -- the old code handed such cells
+    # adj_p = 0.0 and *** stars: maximal significance for a coefficient with NO bootstrap
+    # evidence. Degenerate cells are excluded from the step-down and reported adj_p = 1,
+    # reject = False -- no evidence is no evidence.
+    ok = np.isfinite(t)
     boot_t = np.abs((boot - point) / se_safe[None, :])              # recentered -> null distribution
-    order = np.argsort(t)[::-1]; adj = np.ones(len(point)); prev = 0.0
+    adj = np.ones(len(point)); prev = 0.0
+    order = [int(i) for i in np.argsort(np.where(ok, t, -np.inf))[::-1] if ok[int(i)]]
     for step in range(len(order)):
         active = order[step:]
         maxdist = np.nanmax(boot_t[:, active], axis=1)
         p = max(float(np.mean(maxdist >= t[order[step]])), prev)
         adj[order[step]] = p; prev = p
         if p > alpha:
-            adj[order[step:]] = np.maximum(adj[order[step:]], p)     # remaining all fail (monotone)
+            for i in order[step:]:
+                adj[i] = max(adj[i], p)                              # remaining all fail (monotone)
             break
-    return {"t": t, "adj_p": adj, "reject": adj <= alpha, "se": se}
+    return {"t": t, "adj_p": adj, "reject": (adj <= alpha) & ok, "se": se}
 
 
 # ── self-test ─────────────────────────────────────────────────────────────────

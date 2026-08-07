@@ -1,5 +1,114 @@
 # Changelog
 
+## v0.9.65 -- the three missing audit lenses, and the improvements batch
+
+The v0.9.64 audit ran seven of its ten finder lenses; this release runs the missing three
+(numerics, test-coverage gaps, derivation x mask interactions) with two adversarial verifiers
+per finding -- 20 raw findings, 15 verified (every one CONFIRMED by executed reproduction),
+all fixed -- and ships the improvements batch proposed alongside.
+
+### Numerics lens (all execution-confirmed)
+
+* **The GARCH was scale-degenerate on every real input.** `garch_x_fit`'s omega bounds
+  (absolute 1e-9 floor) and `_garch_filter`'s variance floor (1e-10) were sized for unit-ish
+  data, but every production caller feeds RAW log-mid returns: variance ~4e-9 at 1s, ~4e-11 at
+  10ms. At 1s the fitted omega pinned to its bound and persistence collapsed (a+b ~ 0.75 vs a
+  true 0.98); at 10ms h was 100% floored, alpha=beta=0, and the "standardized" residuals kept
+  ALL their volatility clustering -- so the DCC conditional correlation (the default-ON Table 9
+  column, the stack's own lag-artifact remedy) was contaminated by volatility comovement it
+  claimed to condition away. The fit now standardizes internally and maps parameters back
+  (omega/h/gamma by variance, alpha/beta/z scale-free, loglik with the Jacobian); pinned by a
+  scale-invariance gate.
+* **`_dcc_corr` crashed the both-ways table on every halt-masked session**: `dcc_garch_x`
+  drops non-finite rows and returns rho over the CLEAN rows, the old code assumed full length,
+  and `pd.Series(rho, index=idx)` raised outside every guard -- the DCC column died precisely
+  on the LULD/MWCB sessions the table is about. The clean rho is now scattered back onto the
+  original grid (masked rows NaN, reopen seam NaN'd by the diff, design mask drops both).
+* **Fine-grid information shares were silently a coin flip**: `hasbrouck_is` /
+  `lien_shrestha_is` guarded degeneracy with an ABSOLUTE `denom <= 1e-15` on a quantity of
+  units alpha^2 x return-variance -- ~1e-16 on PERFECTLY identified 10ms days -- returning a
+  fake (0.5, 0.5) tie with `ec_valid=True`, averaged into every `mean_IS_*` at full weight
+  while Gonzalo-Granger on the same alphas read 99:1. The guard is now RELATIVE
+  (`denom <= 1e-12 * ||psi||^2 * tr(Omega)`), making the shares scale-invariant.
+* **The MS-VECM/tick-table sibling `hasbrouck_is_from_alpha` had three defects**: `abs(psi)`
+  flipped the cross-covariance sign on same-signed-alpha days (documented in real runs;
+  25-point IS shifts vs the signed `pds` version on identical inputs, invisible on well-behaved
+  days so no selftest saw it); an additive EPS in the denominator deflated 1s shares ~10% and
+  collapsed 10ms shares to ~1e-5; an absolute Cholesky jitter inflated 10ms variances ~2.5%.
+  Signs kept, guard and jitter now relative to tr(Sigma); pinned to agree with `pds` exactly.
+* **Romano-Wolf gave *** to coefficients with NO bootstrap evidence**: a zero-variance
+  bootstrap column produced t=NaN, which sorted FIRST and received adj_p = 0.0. Degenerate
+  cells are now excluded from the step-down and reported adj_p=1, reject=False; and
+  `moving_block_bootstrap` with an impossible `block_len >= T` (which made every draw the
+  identical full sample -- universally significant tables) falls back to T//2.
+
+### Derivation x mask lens
+
+* **The v0.9.64 attrs memos were unsound**: pandas carries attrs through copy/pickle/
+  derivation, the key encoded only parameters, so a halt-masked copy or a derived coarse frame
+  could be served the pre-mask fine-grid X (executed repro: a 601-row derived frame handed the
+  46,749-row X). Memo keys now embed a DATA fingerprint (length, index endpoints, halt-mask
+  state); `extra_fn` builds are no longer cached at all (`id()` is only unique among live
+  objects -- a recycled lambda address could serve another table's regressor block); and the
+  memos are STRIPPED at every attrs-copy boundary (mask copies, derive_coarse_frame, the
+  frames pickle -- where a memoized fine-grid X was also hundreds of MB of dead weight).
+* **The v0.9.64 no-copy mask fast path broke the A/B tool**: annotating the ORIGINAL frame
+  with `halt_masked={...: 0}` leaked a truthy dict onto the pre-mask artifact, and
+  `ab_halt_mask` (dict-truthiness test) then refused every v0.9.64 frames pickle as "masked at
+  rest". The fast path no longer annotates; the A/B test now checks the COUNTS.
+* **`run_analysis`'s own loader violated the derivation contract**: `--interval` on loaded
+  frames coarsened with a frame-wide `.last()`, so flow columns kept only the final sub-bin
+  (~1/100 of true 1s flow from a 10ms frame) and vwap the last print; the trailing
+  `dropna(how='all')` row-drop-spliced masked bars out. It now delegates to
+  `derive_coarse_frame` (exact path) with a column-aware resample fallback, and drops nothing.
+* **`--verify-existing` falsely indicted the derivation on trimmed sessions**: a ceil-anchored
+  derived frame legitimately starts later than a direct cache extracted untrimmed, and the old
+  index-equality check called that a MISMATCH -- exit 3 plus a full rollback of every derived
+  cache. Edge-only differences are now aligned over the common range and reported as trims;
+  interior differences remain mismatches. Rollback failures (un-unlinkable caches) are now
+  NAMED instead of silently swallowed.
+* **`derive_coarse_frame` fabricated flow inside halts**: an all-NaN (masked) bin summed to a
+  finite 0.0. Bins whose sub-bins are ALL NaN now stay NaN; genuine no-trade bins (extractor
+  writes finite 0.0) are unchanged, so derived == direct exactly where it did before.
+* **STAGE 4's inline loader was the actual last halt-unmasked consumer** (the v0.9.64
+  headline fix claimed Table 9 was the only one): it now masks on load, so LULD residual
+  prints cannot count as tandem flow in the MWCB panel.
+
+### Test-gaps lens
+
+New pins for everything above plus the previously-unpinned v0.9.64 behaviors: the bar
+coverage floors (a 10/60-finite bar falls out of the design), finite wild-cluster p-values on
+a well-formed MWCB panel (the `_wcb` except-branch must not silently eat them), the per-day
+level estimators (`_longest_finite_run` picks the longer post-gap segment; both tables build
+across a 10% overnight level shift), memo fingerprint semantics, and `build_all_tables` now
+prints a loud BUILD ERRORS summary naming failed (empty) tables instead of burying them.
+
+### The improvements batch
+
+* **GFEVD** (`irf.gfevd_from_irf`): the Pesaran-Shin GENERALIZED decomposition at the measured
+  OFI innovation correlation, reported by `run_irf` next to the orthogonal FEVD -- order-free
+  and valid under correlated shocks, i.e. under the paper's own tandem-flow result. Reduces
+  exactly to the orthogonal FEVD at R=I (pinned).
+* **`rank_sample.py`**: the volatile-day selection becomes DERIVABLE from a user-supplied
+  daily OHLC csv -- ranked intraday ranges over the window, same-weekday ~1y-prior pairing
+  suggestions in `--volatile/--baseline` form, and `--compare` showing where each shipped day
+  ranks under the user's own data.
+* **Effective-sample-weighted mean-group** alongside the unweighted Pesaran-Smith column
+  (weight = usable design rows/day; agreement says the MG mean is not driven by its shortest
+  days).
+* **Rigobon over-identification row** with >=3 exogenous labels (label MWCB days as their own
+  regime): the constant-A rotation must diagonalize EVERY regime's covariance, a testable
+  restriction.
+* **RealBar own-lag diagnostic** under a criterion: a +1 gap vs the common order is the
+  expected MA(1) estimation-noise term, larger is dynamics.
+* **Jacobi-equilibrated Gram solves** (`_gram_solve`, `panel_vecm`): near-optimal diagonal
+  preconditioning against the Gram's squared condition number; pinned to lstsq at 1e-6
+  relative on a 1e6-column-scale-spread design.
+* **`test_golden_numbers.py`**: five frozen numeric results on deterministic inputs -- the
+  first gate that pins NUMBERS rather than behaviors, so silent numeric drift fails loudly.
+* **CI** (`.github/workflows/gates.yml`): compile checks + the full gate suite on every
+  push/PR touching the stack.
+
 ## v0.9.64 -- the final audit: 41 findings verified, the headline table re-masked, the memory bombs defused
 
 A ten-lens audit of the whole stack (syntax, hangs, races, resource limits, methodology),

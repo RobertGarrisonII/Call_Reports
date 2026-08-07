@@ -148,12 +148,26 @@ def gonzalo_granger_shares(alpha):
 
 def hasbrouck_is_from_alpha(alpha, Sigma):
     """Hasbrouck information-share bounds from (alpha_perp, Sigma): IS_i under each Cholesky
-    ordering; returns (lower, upper, mid) per asset (2,)."""
-    a = np.asarray(alpha, float); psi = np.abs(np.array([a[1], -a[0]]))
-    S = np.asarray(Sigma, float); tot = float(psi @ S @ psi) + EPS
+    ordering; returns (lower, upper, mid) per asset (2,).
+
+    psi keeps its COMPONENT SIGNS (matching price_discovery_shares._psi): taking abs() first
+    flipped the cross-covariance term whenever the two alphas share a sign -- days real runs
+    demonstrably contain (2023-08-07: +0.052/+0.111) -- shifting the bounds by tens of points
+    while agreeing on well-behaved opposite-signed days, which is why the selftests never saw
+    it. The IS ratio itself is invariant to the OVERALL sign of psi, so no orientation is
+    lost. Degeneracy and jitter are RELATIVE to Sigma's own scale: the old additive EPS in
+    the denominator deflated every IS ~10% at raw 1s log-return scale (diag ~4e-9) and
+    collapsed the 10ms shares to ~1e-5; the old absolute 1e-12 Cholesky jitter inflated 10ms
+    variances ~2.5%."""
+    a = np.asarray(alpha, float); psi = np.array([a[1], -a[0]])
+    S = np.asarray(Sigma, float); tot = float(psi @ S @ psi)
+    scale = float(psi @ psi) * float(np.trace(S))
+    if not np.isfinite(tot) or scale <= 0.0 or tot <= 1e-12 * scale:
+        z = np.array([0.5, 0.5]); return z, z, z
+    jit = 1e-12 * float(np.trace(S))
     vals = []
     for order in ([0, 1], [1, 0]):
-        Sp = S[np.ix_(order, order)]; L = np.linalg.cholesky(Sp + np.eye(2) * 1e-12)
+        Sp = S[np.ix_(order, order)]; L = np.linalg.cholesky(Sp + np.eye(2) * jit)
         pl = psi[order]; contrib = (pl @ L) ** 2 / tot
         is_ord = np.empty(2); is_ord[order] = contrib; vals.append(is_ord)
     lo = np.minimum(vals[0], vals[1]); hi = np.maximum(vals[0], vals[1])
