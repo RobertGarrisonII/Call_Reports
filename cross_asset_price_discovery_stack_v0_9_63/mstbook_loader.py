@@ -404,6 +404,19 @@ def default_lot(product_type: str, product: str) -> float:
 # ════════════════════════════════════════════════════════════════════════════
 # mstbook-query runner
 # ════════════════════════════════════════════════════════════════════════════
+def _fetch_timeout():
+    """Per-attempt wall-clock ceiling for vendor queries (seconds). A wedged lakequery used to
+    hang its worker FOREVER -- no timeout on any of the three sp.run fetch paths -- which
+    presented as a silent, unkillable extraction. Default 3600s is ~4x the slowest observed
+    single fetch; MST_LAKEQUERY_TIMEOUT overrides (<=0 disables). A timeout is treated exactly
+    like a non-zero exit: retried where the caller retries, raised where it raises."""
+    try:
+        v = float(os.environ.get("MST_LAKEQUERY_TIMEOUT", "3600"))
+    except ValueError:
+        v = 3600.0
+    return None if v <= 0 else v
+
+
 def _run_mstbook_query(cmd: list) -> str:
     """Run mstbook-query, trying '-e time' then '-e datetime'. Returns stdout."""
     last = None
@@ -415,7 +428,13 @@ def _run_mstbook_query(cmd: list) -> str:
             if tok == "-e":
                 skip = True
             attempt.append(tok)
-        last = sp.run(attempt, capture_output=True, text=True, check=False)
+        try:
+            last = sp.run(attempt, capture_output=True, text=True, check=False,
+                          timeout=_fetch_timeout())
+        except sp.TimeoutExpired:
+            raise RuntimeError("mstbook-query timed out after %ss (MST_LAKEQUERY_TIMEOUT): %s"
+                               % (os.environ.get("MST_LAKEQUERY_TIMEOUT", "3600"),
+                                  " ".join(attempt[:8])))
         if last.returncode == 0:
             return last.stdout
     raise RuntimeError(f"mstbook-query failed with both '-e time' and '-e datetime'.\n"
@@ -546,8 +565,12 @@ _MSG_QTY_COL = {"mt_add_order": "quantity", "mt_cancel_order": "previousquantity
 
 
 def _run_mstwx_lakequery(cmd: list) -> str:
-    """Run mstwx-lakequery and return stdout (raises on non-zero exit)."""
-    res = sp.run(cmd, capture_output=True, text=True, check=False)
+    """Run mstwx-lakequery and return stdout (raises on non-zero exit or timeout)."""
+    try:
+        res = sp.run(cmd, capture_output=True, text=True, check=False, timeout=_fetch_timeout())
+    except sp.TimeoutExpired:
+        raise RuntimeError("mstwx-lakequery timed out after %ss (MST_LAKEQUERY_TIMEOUT): %s"
+                           % (os.environ.get("MST_LAKEQUERY_TIMEOUT", "3600"), " ".join(cmd[:8])))
     if res.returncode != 0:
         raise RuntimeError(f"mstwx-lakequery failed (rc={res.returncode}): "
                            f"{(res.stderr or '').strip()[:300]}")
@@ -657,7 +680,14 @@ def _run_mstwx_lakequery_to_file(cmd: list, path: str, retries: Optional[int] = 
     err = ""
     for attempt in range(1, n + 1):
         with open(path, "w") as fh:                       # "w" truncates: no partial-attempt residue
-            res = sp.run(cmd, stdout=fh, stderr=sp.PIPE, text=True, check=False)
+            try:
+                res = sp.run(cmd, stdout=fh, stderr=sp.PIPE, text=True, check=False,
+                             timeout=_fetch_timeout())
+            except sp.TimeoutExpired:                     # a hang is a failed attempt, not forever
+                class _TO:                                # duck-typed result: rc!=0 + stderr note
+                    returncode = -9
+                    stderr = "timed out after MST_LAKEQUERY_TIMEOUT"
+                res = _TO()
         if res.returncode == 0:
             if attempt > 1:
                 log.info("mstwx-lakequery succeeded on attempt %d/%d: %s", attempt, n, " ".join(cmd[:8]))

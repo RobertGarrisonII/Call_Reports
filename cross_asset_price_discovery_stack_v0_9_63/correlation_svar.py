@@ -163,7 +163,7 @@ def _hy_rolling_corr(mid_spy, mid_es, window):
         while lo < m and b2[lo] <= a1[k]:
             lo += 1
         j = lo
-        ak, bk, rk = a1[k], b1[k], r1[k]
+        bk, rk = b1[k], r1[k]
         while j < m and a2[j] < bk:
             cov_at[bk if bk >= b2[j] else b2[j]] += rk * r2[j]     # attribute to the later end
             j += 1
