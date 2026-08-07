@@ -193,8 +193,8 @@ def table_correlation_irf(sessions, spec="informational", ident="cholesky", cumu
 
 
 def table_correlation_irf_both_ways(sessions, spec="informational", ident="cholesky",
-                                    cumulative=False, extra_fn=None, n_boot=499, n_lags=4,
-                                    horizon=6, corr_window=80, min_obs=200, seed=0, n_jobs=None,
+                                    cumulative=False, extra_fn=None, n_boot=499, n_lags=6,
+                                    horizon=6, corr_window=100, min_obs=200, seed=0, n_jobs=None,
                                     criterion=None, pmax=12, with_dcc=False, with_bar=True,
                                     bar_seconds=60, panel="fe", mean_group=False,
                                     methods=(("Pearson", "rolling"), ("HY", "hy")),
@@ -235,8 +235,12 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
         methods = tuple(methods) + (("RealBar", "bar"),)
     lag_note = ""
     if criterion is not None:
+        # panel/bar_seconds forwarded (v0.9.64): the criterion must score the design that is
+        # actually fitted -- selecting under stacked seam-crossing lags and then estimating
+        # under within-day FE lags answers a different question at a different order.
         p_sel = csv.select_svar_lag(sessions, spec=spec, corr_window=corr_window,
-                                    extra_fn=extra_fn, criterion=criterion, pmax=pmax)[0]
+                                    extra_fn=extra_fn, criterion=criterion, pmax=pmax,
+                                    bar_seconds=bar_seconds, panel=panel)[0]
         if p_sel is not None:
             lag_note = f" Lag order p={int(p_sel)} chosen by {str(criterion).upper()} over p<={pmax} on the pooled SVAR frame."
             # A criterion CAN return 0 -- it does so on a wide rolling window, where the induced
@@ -302,9 +306,12 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
         note += " Day-cluster bootstrap SE in parentheses; Romano-Wolf joint stars (***/**/* = 1/5/10% FWER)."
     if with_bar:
         note += (" RealBar: change in Fisher-z of the %ds-bar NON-OVERLAPPING realized correlation "
-                 "-- no fixed-width rolling window, hence no window-induced MA term for the lag "
-                 "criterion to chase; per-bar realized variance replaces the rolling RV regressor "
-                 "in that column for the same reason." % int(bar_seconds))
+                 "-- no fixed-width rolling window, so the window-length MA artifact (a spike at "
+                 "exactly lag W) cannot arise. Differencing per-bar ESTIMATES still leaves an "
+                 "MA(1) from estimation noise (adjacent differences share one noisy level), so a "
+                 "criterion may spend one extra lag on it -- bounded and lag-1, unlike the W-lag "
+                 "artifact. Per-bar realized variance replaces the rolling RV regressor in this "
+                 "column for the same reason." % int(bar_seconds))
     if panel != "stack":
         note += (" Estimation is a fixed-effects panel VAR: lags built strictly within-day (no "
                  "overnight seam-crossing) with day fixed effects; --panel stack reproduces the "
@@ -392,60 +399,154 @@ def table_mwcb_did(treated, control, release_by_date, pre_min=8, post_min=8):
     rd = mw.rd_in_time(panel, bandwidth_min=min(5, post_min))
     sp = mw.cross_market_spillover(treated, control, release_by_date, source="ES", target="SPY",
                                    pre_min=pre_min, post_min=post_min)
+    # The CRVE t below uses a NORMAL reference at G ~ 8 date clusters (4 of them treated) --
+    # the exact few-cluster regime METHODS_VIGNETTE prescribes the wild cluster bootstrap for
+    # (Cameron-Gelbach-Miller; Webb six-point weights at G <= 12). Same point estimates,
+    # honest p-values. Ibragimov-Muller is the alternative read at these counts.
+    def _wcb(frame, X_cols, j):
+        try:
+            y = frame["illiq"].to_numpy(float)
+            X = np.column_stack([np.ones(len(frame))] + [frame[c].to_numpy(float) for c in X_cols])
+            r = inf.wild_cluster_bootstrap(y, X, frame["date"].to_numpy(), test_idx=j, n_boot=999, seed=0)
+            return float(r["p"])
+        except Exception:
+            return np.nan
+    p2 = panel.assign(tp=panel["treated"] * panel["post"])
+    p_did = _wcb(p2, ["treated", "post", "tp"], 3)
+    h = min(5, post_min) * 60.0
+    rp = panel[(panel["treated"] == 1) & (panel["t"].abs() <= h)].copy()
+    rp["tau"] = rp["t"] / 60.0
+    rp["post_f"] = (rp["tau"] > 0).astype(float)
+    rp["ptau"] = rp["post_f"] * rp["tau"]
+    p_rd = _wcb(rp, ["post_f", "tau", "ptau"], 1)
     rows = OrderedDict()
-    rows["DiD (treated x post)"] = (d["did_coef"], d["did_se"], d["did_t"])
-    rows["RD jump at reopen"] = (rd["jump"], rd["jump_se"], rd["jump_t"])
+    rows["DiD (treated x post)"] = (d["did_coef"], d["did_se"], d["did_t"], p_did)
+    rows["RD jump at reopen"] = (rd["jump"], rd["jump_se"], rd["jump_t"], p_rd)
     rows["Spillover ES->SPY (post x treated)"] = (sp["spill_post_treated"]["coef"],
-                                                  sp["spill_post_treated"]["se"], sp["spill_post_treated"]["t"])
-    disp = pd.DataFrame({"estimate": [fmt_cell(c, s) for c, s, _ in rows.values()],
-                         "t-stat": [f"{t:.2f}" for _, _, t in rows.values()]}, index=list(rows))
+                                                  sp["spill_post_treated"]["se"],
+                                                  sp["spill_post_treated"]["t"], np.nan)
+    disp = pd.DataFrame({"estimate": [fmt_cell(c, s) for c, s, _t, _p in rows.values()],
+                         "t-stat (CRVE)": [f"{t:.2f}" for _c, _s, t, _p in rows.values()],
+                         "p (wild cluster)": ["--" if not np.isfinite(p) else f"{p:.3f}"
+                                              for _c, _s, _t, p in rows.values()]},
+                        index=list(rows))
     disp.index.name = "effect"
     note = ("SPY cost-to-fill (bps). DiD treated x post is the causal reopening effect; the RD jump "
             "is the discontinuity at the reopen; the spillover triple-difference is the extra ES->SPY "
-            "illiquidity transmission post-reopen on MWCB days (liquidity contagion). Date-clustered SEs.")
+            "illiquidity transmission post-reopen on MWCB days (liquidity contagion). The CRVE t uses "
+            "a normal reference that over-rejects at few clusters; QUOTE the wild-cluster-bootstrap p "
+            "(restricted WCR, Webb weights at G<=12, clusters = dates). The spillover design pools "
+            "differenced panels, so its WCR p is not computed here -- read its CRVE t with the same "
+            "few-cluster caution, or the Ibragimov-Muller route.")
     return Table("Section 6 (revamp): reopening DiD + cross-market spillover", disp, note)
 
 
 def table_rigobon(sessions, n_lags=1):
     """Order-free identification of the contemporaneous cross-market matrix via
     heteroskedasticity (Rigobon), shown next to the two Cholesky orderings the paper assumes
-    away. Regimes = high-/low-volatility halves of the pooled residuals."""
-    dfs = [s[-1] for s in sessions]
-    R = []
-    for df in dfs:
+    away. Regimes = the SESSION labels (ex-ante date classification) whenever the panel carries
+    at least two; the pooled-volatility split is only a fallback, and is labeled as such."""
+    R, lab_rows = [], []
+    for s in sessions:
+        df = s[-1]; reg = str(s[1]).lower() if len(s) == 3 else "all"
         ms_ = np.asarray(ca._mid(df, "SPY"), float); me = np.asarray(ca._mid(df, "ES"), float)
-        R.append(np.column_stack([np.diff(np.log(ms_)) * 1e4, np.diff(np.log(me)) * 1e4]))
-    Rall = np.vstack(R)
-    Rall = Rall[np.all(np.isfinite(Rall), axis=1)]
+        r = np.column_stack([np.diff(np.log(ms_)) * 1e4, np.diff(np.log(me)) * 1e4])
+        R.append(r); lab_rows.append(np.full(len(r), reg, dtype=object))
+    Rall = np.vstack(R); labs = np.concatenate(lab_rows)
+    fin = np.all(np.isfinite(Rall), axis=1)
+    Rall, labs = Rall[fin], labs[fin]
     A, Sig, U = csv.var_ols(Rall, n_lags)
-    vol = pd.Series(np.sqrt((U ** 2).sum(1))).rolling(50, min_periods=1).mean().to_numpy()
-    regimes = np.where(vol >= np.quantile(vol, 0.66), "stress", "calm")
-    out = rg.rigobon_identify(U, regimes, names=("SPY", "ES"))
+    labs = labs[n_lags:]                             # var_ols drops the first n_lags rows
+    # Rigobon's regimes must be EXOGENOUS to the shocks -- splitting on the residuals' own
+    # rolling volatility conditions on the endogenous variable and biases the identified matrix
+    # (the module's own docs forbid it). The session labels are an ex-ante DATE classification,
+    # so they are the valid instrument whenever the panel has two of them.
+    uniq = sorted(set(labs))
+    if len(uniq) >= 2:
+        calm = next((u for u in ("benchmark", "calm", "baseline") if u in uniq), uniq[0])
+        stress = next((u for u in ("volatile", "stress", "mwcb") if u in uniq and u != calm), uniq[-1])
+        regimes, regime_src = labs, f"session labels ({calm} vs {stress}; exogenous, ex-ante)"
+    else:
+        vol = pd.Series(np.sqrt((U ** 2).sum(1))).rolling(50, min_periods=1).mean().to_numpy()
+        regimes = np.where(vol >= np.quantile(vol, 0.66), "stress", "calm")
+        calm, stress = "calm", "stress"
+        regime_src = ("ENDOGENOUS pooled-volatility split (single-label panel fallback) -- the "
+                      "regimes condition on the residuals themselves; treat as descriptive only")
+    out = rg.rigobon_identify(U, regimes, calm=calm, stress=stress, names=("SPY", "ES"))
+    diag = rg.identification_diagnostic(rg.regime_residual_cov(U, regimes), names=("SPY", "ES"))
+    verdict = "yes" if diag["identified"] else "NO -- do not quote the Rigobon column"
     rC = out["contemp_rigobon"]; cf_ = out["contemp_cholesky_fwd"]; cr = out["contemp_cholesky_rev"]
     num = pd.DataFrame({
-        "Rigobon (order-free)": [rC.loc["SPY", "ES"], rC.loc["ES", "SPY"]],
-        "Cholesky SPY->ES": [cf_.loc["SPY", "ES"], cf_.loc["ES", "SPY"]],
-        "Cholesky ES->SPY": [cr.loc["SPY", "ES"], cr.loc["ES", "SPY"]],
-    }, index=["contemp SPY<-ES", "contemp ES<-SPY"])
-    note = (f"Contemporaneous structural coefficients. Regimes used = {out['regimes_used']}; eigenvalue "
-            f"separation = {out['eig_separation']:.3f} (identification strength). The Rigobon column needs "
-            f"no ordering; the two Cholesky columns bracket the ordering assumption.")
+        "Rigobon (order-free)": [rC.loc["SPY", "ES"], rC.loc["ES", "SPY"],
+                                 diag["var_ratio_spread"], diag["rel_eig_gap"], verdict],
+        "Cholesky SPY->ES": [cf_.loc["SPY", "ES"], cf_.loc["ES", "SPY"], np.nan, np.nan, ""],
+        "Cholesky ES->SPY": [cr.loc["SPY", "ES"], cr.loc["ES", "SPY"], np.nan, np.nan, ""],
+    }, index=["contemp SPY<-ES", "contemp ES<-SPY",
+              "var-ratio spread (max/min - 1; ~0 = common-scale, unidentified)",
+              "relative eigenvalue gap (verdict thresholds this > 0.10)",
+              "identified (relative het present)"])
+    note = (f"Contemporaneous structural coefficients. Regimes = {regime_src}. Het-ID pins the "
+            f"rotation down only when regimes differ in RELATIVE heteroskedasticity; when the "
+            f"verdict row says NO the Rigobon numbers are numerical noise -- quote the Cholesky "
+            f"bracket instead. The Rigobon column needs no ordering; the two Cholesky columns "
+            f"bracket the ordering assumption.")
     return Table("Rigobon order-free identification vs Cholesky orderings (revamp)", _fmt_df(num, 4), note, numeric=num)
+
+
+def _longest_finite_run(Y):
+    """Rows of the longest CONTIGUOUS all-finite run. For level-based estimators (VECM, IS)
+    this is the only valid NaN handling: dropping masked rows individually would splice the
+    pre-halt price to the reopen price, and a contiguous run has no seams by construction."""
+    fin = np.all(np.isfinite(np.asarray(Y, float)), axis=1)
+    best_i = best_j = i = 0
+    n = len(fin)
+    while i < n:
+        if fin[i]:
+            j = i
+            while j < n and fin[j]:
+                j += 1
+            if j - i > best_j - best_i:
+                best_i, best_j = i, j
+            i = j
+        else:
+            i += 1
+    return Y[best_i:best_j]
 
 
 def table_regime_is(sessions, p=1, max_iter=80):
     """Markov-switching VECM: endogenous calm/stress regimes with regime-specific
-    error-correction speeds and Gonzalo-Granger information shares."""
-    dfs = [s[-1] for s in sessions]
-    Ys = [np.column_stack([np.log(np.asarray(ca._mid(df, "SPY"), float)),
-                           np.log(np.asarray(ca._mid(df, "ES"), float))]) for df in dfs]
-    Y = np.vstack(Ys)
-    fit = ms.fit_ms_vecm(Y, K=2, p=p, beta=1.0, max_iter=max_iter)
-    summ = ms.regime_summary(fit, names=("SPY", "ES")).drop(columns=["regime"]).set_index("label")
+    error-correction speeds and Gonzalo-Granger information shares. Fitted PER DAY --
+    stacking day-level log-price LEVELS puts the overnight gap inside the sample as one
+    giant 'return' at every seam, and the Hamilton regime chain does not run overnight
+    either. Cross-day means with an n_days column are reported instead."""
+    per, ll_sw, ll_1, n_used = [], 0.0, 0.0, 0
+    for s in sessions:
+        df = s[-1]
+        Y = np.column_stack([np.log(np.asarray(ca._mid(df, "SPY"), float)),
+                             np.log(np.asarray(ca._mid(df, "ES"), float))])
+        Y = _longest_finite_run(Y)
+        if len(Y) < 50 * (p + 2):
+            continue
+        try:
+            fit = ms.fit_ms_vecm(Y, K=2, p=p, beta=1.0, max_iter=max_iter)
+            summ = ms.regime_summary(fit, names=("SPY", "ES")).drop(columns=["regime"]).set_index("label")
+        except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+            continue
+        per.append(summ)
+        ll_sw += float(fit["loglik"]); ll_1 += float(ms.single_regime_loglik(Y, p, 1.0)); n_used += 1
+    if not per:
+        return Table("Markov-switching VECM regime table (revamp)", pd.DataFrame(),
+                     "no session had a long enough contiguous unmasked run")
+    cat = pd.concat(per)
+    summ = cat.groupby(level=0).mean()
+    summ["n_days"] = cat.groupby(level=0).size().astype(float)
     summ.index.name = "regime"
-    note = (f"Two-state Markov-switching VECM (EM). ec_* = error-correction speeds (weaker in stress = "
-            f"arbitrage breaking down); GG_* = Gonzalo-Granger information shares; switching log-lik "
-            f"{fit['loglik']:.0f} vs single-regime {ms.single_regime_loglik(Y, p, 1.0):.0f}.")
+    note = (f"Two-state Markov-switching VECM (EM), fitted PER DAY on each session's longest "
+            f"contiguous unmasked run and averaged across {n_used} days (pre-v0.9.64 this stacked "
+            f"day-level log-price levels, making every overnight gap a within-sample return). "
+            f"ec_* = error-correction speeds (weaker in stress = arbitrage breaking down); GG_* = "
+            f"Gonzalo-Granger information shares; summed switching log-lik {ll_sw:.0f} vs "
+            f"single-regime {ll_1:.0f}.")
     return Table("Markov-switching VECM regime table (revamp)", _fmt_df(summ, 4), note, numeric=summ)
 
 
@@ -493,15 +594,38 @@ def table_pricing_error(session_calm, session_stress, notional=5e9):
 
 def table_tick_correction(sessions, ticks=(0.01, 0.25), prices=(550.0, 5500.0)):
     """Tick-size-aware information share: raw vs common-grid vs rounding-corrected, plus each
-    market's tick-noise share -- referee-proofing the futures-dominance result."""
-    dfs = [s[-1] for s in sessions]
-    Y = np.vstack([np.column_stack([np.log(np.asarray(ca._mid(df, "SPY"), float)),
-                                    np.log(np.asarray(ca._mid(df, "ES"), float))]) for df in dfs])
-    res = tk.tick_corrected_information_share(Y, ticks, prices, beta=1.0)
-    num = res["table"].copy(); num.index.name = "market"
-    note = (f"Hasbrouck information share (mid). Leader: raw={res['leader_raw']}, "
-            f"common-grid={res['leader_common_grid']}, rounding-corrected={res['leader_rounding_corrected']}; "
-            f"lead survives = {res['lead_survives']}. ES is the coarser fractional grid.")
+    market's tick-noise share -- referee-proofing the futures-dominance result. Estimated PER
+    DAY (an information share is a day-level object; stacking day-level log-price levels puts
+    the overnight gap inside the random-walk decomposition) and averaged, leader by day vote."""
+    tabs, survives = [], []
+    leaders = {"raw": [], "common_grid": [], "rounding_corrected": []}
+    for s in sessions:
+        df = s[-1]
+        Y = np.column_stack([np.log(np.asarray(ca._mid(df, "SPY"), float)),
+                             np.log(np.asarray(ca._mid(df, "ES"), float))])
+        Y = _longest_finite_run(Y)
+        if len(Y) < 200:
+            continue
+        try:
+            res = tk.tick_corrected_information_share(Y, ticks, prices, beta=1.0)
+        except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+            continue
+        tabs.append(res["table"])
+        for k in leaders:
+            leaders[k].append(res[f"leader_{k}"])
+        survives.append(bool(res["lead_survives"]))
+    if not tabs:
+        return Table("Tick-size-corrected information share (revamp)", pd.DataFrame(),
+                     "no session had a long enough contiguous unmasked run")
+    num = pd.concat(tabs).groupby(level=0).mean().reindex(tabs[0].index)
+    num.index.name = "market"
+    maj = {k: max(set(v), key=v.count) for k, v in leaders.items()}
+    note = (f"Hasbrouck information share (mid), estimated PER DAY on the longest contiguous "
+            f"unmasked run and averaged across {len(tabs)} days (pre-v0.9.64 this stacked "
+            f"day-level log-price levels across sessions). Leader by day-majority: "
+            f"raw={maj['raw']}, common-grid={maj['common_grid']}, "
+            f"rounding-corrected={maj['rounding_corrected']}; lead survives on "
+            f"{sum(survives)}/{len(survives)} days. ES is the coarser fractional grid.")
     return Table("Tick-size-corrected information share (revamp)", _fmt_df(num, 4), note, numeric=num)
 
 

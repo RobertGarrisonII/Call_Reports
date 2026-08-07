@@ -261,6 +261,11 @@ def dependence_summary(freq, n_bars=None):
                           if np.isfinite(out["lor_sell"]) and np.isfinite(out["lor_buy"])
                           else float("nan"))
     if n_bars:
+        # Woolf SE: sqrt(sum of 1/cell-count) -- valid under IID multinomial sampling of bars.
+        # Intraday state pairs are serially dependent (order-flow clustering, seasonality), so
+        # the effective sample is SMALLER than n_bars and this z overstates significance; it is
+        # reported as a scale reference. Significance should come from permutation_null below,
+        # which preserves each market's own serial dependence and destroys only the pairing.
         n = np.array([a, b, c, d]) / 100.0 * float(n_bars)
         if n.min() > 0:
             se = float(np.sqrt((1.0 / n).sum()))

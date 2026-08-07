@@ -753,6 +753,11 @@ except NameError:
 print("\n  binomial null (n=505/112, one second): PCMOF = NCMOF = 0.4% per corner pair")
 print("  'indep' = independence GIVEN the observed marginals -- the benchmark that isolates")
 print("  cross-market trading. log_OR is marginal-free, so it is comparable across panels.")
+print("  CAVEAT on log_OR_z: the Woolf SE treats the pooled bars as iid draws of the 3x3 state")
+print("  pair. Intraday states are serially dependent (clustering, seasonality), so the")
+print("  effective sample is smaller than the bar count and the z OVERSTATES significance --")
+print("  read it as a scale, and take significance from tof.permutation_null, which shuffles")
+print("  the cross-market PAIRING while preserving each market's own dependence structure.")
 t5.to_csv(f"{out}/table5_corrected_null.csv")
 
 # Table 7: the same binomial null evaluated at each aggregation's actual order counts.
@@ -898,13 +903,18 @@ fi
 if have_stage 6; then
   say "STAGE 6  remaining paper + revamp tables"
   QFLAG=""; [ "$QUICK" -eq 1 ] && QFLAG="--quick"
+  # N_LAGS_INT is NOT forwarded here (v0.9.64). STAGE 4c selects the lag of the Eq. (5) SVAR --
+  # the dCorr system Table 9 estimates -- and STAGE 5 correctly reuses it for Table 9. STAGE 6's
+  # stages fit DIFFERENT models (the fixed-beta VECM behind the information shares, the jump
+  # split, the ECM-SDE), whose lag run_analysis frequency-scales per grid; handing them the
+  # SVAR-frame BIC lag pinned every VECM to a criterion resolved on another model's design.
   case "$SOURCE" in
     demo)  # shellcheck disable=SC2086
            run $PY run_analysis.py --source demo $QFLAG --legacy --output-dir "$OUT" ;;
     *)     # shellcheck disable=SC2086
            run $PY run_analysis.py --source load --pickle "$FRAMES" \
                --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
-               --interval "$INTERVAL" ${N_LAGS_INT:+--n-lags "$N_LAGS_INT"} --legacy \
+               --interval "$INTERVAL" --legacy \
                --output-dir "$OUT" --save-dataset $QFLAG ;;
   esac
 fi
@@ -970,6 +980,8 @@ if have_stage 7; then
     echo "volatile=${VOLATILE}"
     echo "baseline=${BASELINE}"
     echo "mwcb=${MWCB}"
+    echo "regime taxonomy: STAGES 5/6 label volatile+mwcb jointly 'volatile' (two-regime estimators);"
+    echo "Table 5 keeps MWCB as its own panel. Cross-exhibit comparisons must state the composition."
     echo
     echo "## Corrections applied"
     echo "- sequencenumber preserved through the loader; intra-feed replay order restored"

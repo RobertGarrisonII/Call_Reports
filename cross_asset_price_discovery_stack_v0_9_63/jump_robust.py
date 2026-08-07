@@ -328,7 +328,13 @@ def continuous_jump_information_shares(mid_spy, mid_es, n_lags=5, method="trunca
     jvx, jvy = jump_variation(rx, K=K, alpha=alpha), jump_variation(ry, K=K, alpha=alpha)
     jf_lm_leg = {names[0]: jvx["jump_fraction_lm"], names[1]: jvy["jump_fraction_lm"]}
 
+    # kappa/ec_valid mirror pds.estimate_day: with z = p1 - p2 the system corrects only when
+    # kappa = alpha_ES - alpha_SPY > 0. On a non-correcting day psi ~ alpha_perp is a quotient of
+    # same-signed alphas, so EVERY IS/CS number in this row -- continuous and jump alike -- is a
+    # ratio of noise, and unflagged rows were being averaged into the sample means downstream.
+    kappa = float(alpha_v[1] - alpha_v[0])
     out = {"alpha_spy": float(alpha_v[0]), "alpha_es": float(alpha_v[1]),
+           "kappa": kappa, "ec_valid": bool(kappa > 0),
            "n_obs": int(resid.shape[0]), "method": method,
            "jump_frac_cf": jump_frac_cf, "jump_frac_cf_lm": jump_frac_cf_lm,
            "n_jumps_cf_lm": jf_cf["n_jumps_lm"], "bns_cf_z": bns["z"], "bns_cf_p": bns["p_value"]}

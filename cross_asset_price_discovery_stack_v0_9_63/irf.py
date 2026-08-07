@@ -185,7 +185,18 @@ def structural_vecm_irf(df, horizons=None, n_lags=None, n_levels=10, hac_lags=10
 
 def fevd_from_irf(return_irf, H=None):
     """Forecast-error variance decomposition from structural return IRFs.
-    Returns a (response x shock) matrix whose ROWS sum to 1."""
+    Returns a (response x shock) matrix whose ROWS sum to 1.
+
+    ASSUMPTION, stated because this stack's own results contradict it: the decomposition sums
+    squared responses PER SHOCK, which partitions the forecast-error variance only if the
+    structural shocks are mutually UNCORRELATED with unit variance. B here is identified from
+    the cross-impact matrix (B = Lambda diag(sd(OFI))), which normalizes each shock's scale but
+    does NOT orthogonalize across shocks -- and the paper's tandem-flow finding is precisely
+    that SPY and ES order flow are strongly correlated. With corr(OFI_SPY, OFI_ES) = r != 0 the
+    cross terms 2 r C_h b_i b_j' are dropped, so the shares are a DIAGONAL approximation that
+    understates common-flow variance. Read them next to the reported `ofi_innovation_corr`:
+    near 0 the shares are clean; at the tandem-flow magnitudes they attribute variance to
+    'SPY flow' vs 'ES flow' that the data cannot separate."""
     D = np.asarray(return_irf); H = (len(D) - 1) if H is None else H
     num = np.sum(D[:H + 1] ** 2, axis=0)                     # k x k: sum over horizons
     tot = num.sum(axis=1, keepdims=True)

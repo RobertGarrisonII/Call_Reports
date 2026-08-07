@@ -431,13 +431,22 @@ def run_irf(sessions, args):
     sv = irfm.structural_vecm_irf(df, horizons=H, n_lags=args.n_lags, n_levels=args.n_levels,
                                   min_rest_steps=fc["min_rest_steps"])
     fevd0 = irfm.fevd_from_irf(sv["return_irf"], H=max(H))
-    per = {}
+    per, ofi_corr = {}, {}
     for _dd, rr, dfx in sessions:
         try:
             svx = irfm.structural_vecm_irf(dfx, horizons=H, n_lags=min(int(args.n_lags), 12),
                                            n_levels=args.n_levels,
                                            min_rest_steps=fc["min_rest_steps"])
             per.setdefault(rr, []).append(irfm.fevd_from_irf(svx["return_irf"], H=max(H)))
+            # The FEVD partitions variance only under UNCORRELATED shocks; the tandem-flow
+            # result says OFI_SPY/OFI_ES are not. Report the correlation the shares ignore.
+            o1 = np.asarray(ca.order_flow_imbalance(dfx, "SPY", args.n_levels,
+                                                    fc["min_rest_steps"]), float)[1:]
+            o2 = np.asarray(ca.order_flow_imbalance(dfx, "ES", args.n_levels,
+                                                    fc["min_rest_steps"]), float)[1:]
+            m = np.isfinite(o1) & np.isfinite(o2)
+            if m.sum() > 30:
+                ofi_corr.setdefault(rr, []).append(float(np.corrcoef(o1[m], o2[m])[0, 1]))
         except Exception:
             continue
     by_regime = {}
@@ -449,6 +458,10 @@ def run_irf(sessions, args):
     return {"local_projection": lp,
             "fevd": by_regime.get("benchmark", f0),
             "fevd_by_regime": by_regime,
+            "ofi_innovation_corr": {rr: float(np.median(v)) for rr, v in ofi_corr.items()},
+            "fevd_note": ("shares assume UNCORRELATED OFI shocks (see irf.fevd_from_irf); at the "
+                          "measured ofi_innovation_corr they are a diagonal approximation and the "
+                          "SPY-flow/ES-flow split is partly common tandem flow"),
             "fevd_session0": f0, "fevd_session0_date": str(d0)}
 
 def run_robustness(sessions, args):
@@ -486,9 +499,14 @@ def run_jumps(sessions, args):
     method = args._freq["jump_method"]
     mids = rb._mid_sessions(sessions)
     split = jr.estimate_sample_jump_split(mids, n_lags=args.n_lags, method=method)
+    # ec_valid filter (v0.9.64): on a non-correcting day (kappa <= 0) psi ~ alpha_perp makes
+    # every IS number a quotient of same-signed alphas -- noise, not a share. The IS means skip
+    # those days (the jump-FRACTION means do not: jump fractions are QV ratios, kappa-free).
+    _v = split["ec_valid"] if "ec_valid" in split.columns else pd.Series(True, index=split.index)
     out = {"split_method": method, "per_day": split,
-           "mean_ISc_ES": float(split.ISc_ES.mean()),
-           "mean_ISj_ES": float(split.ISj_ES.mean()),
+           "mean_ISc_ES": float(split.ISc_ES[_v].mean()) if _v.any() else float("nan"),
+           "mean_ISj_ES": float(split.ISj_ES[_v].mean()) if _v.any() else float("nan"),
+           "n_ec_invalid": int((~_v).sum()),
            "mean_jump_frac_cf": float(split.jump_frac_cf.mean()),
            "mean_jump_frac_cf_lm": float(split.jump_frac_cf_lm.mean()),
            "frac_days_cf_jump_5pct": float((split.bns_cf_p < 0.05).mean())}
@@ -718,7 +736,10 @@ def parse_args(argv=None):
     p.add_argument("--volatile", type=lambda s: s.split(","), default=None,
                    help="comma-separated dates to label 'volatile'. For --source extract this ALSO "
                         "defines the extraction universe when --dates is not given (so these dates are "
-                        "the ones pulled, not just labeled)")
+                        "the ones pulled, not just labeled). TAXONOMY NOTE: the replication driver "
+                        "passes its MWCB dates in this list, so every two-regime stage here reads "
+                        "'volatile' as volatile-INCLUDING-MWCB; Table 5 keeps MWCB as its own panel. "
+                        "Comparisons across those exhibits must say which composition they use")
     p.add_argument("--benchmark", type=lambda s: s.split(","), default=None,
                    help="comma-separated dates to treat as benchmark; for --source extract they join the "
                         "extraction universe (when --dates is absent)")

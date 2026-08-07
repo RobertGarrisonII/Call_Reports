@@ -177,16 +177,28 @@ def check_stack_reproduces_old_estimation():
 
 def check_cli_renders_bar_and_mean_group():
     here = os.path.dirname(os.path.abspath(__file__))
+    # 4200 bars/day at 30s bars -> ~140 bar rows/day, above the v0.9.64 per-day identification
+    # bar (1 + k*p + 10 = 77 rows for k=11, p=6). The old 1200-bar fixture sat BELOW it, which
+    # the pre-v0.9.64 mean-group silently tolerated by averaging lstsq minimum-norm
+    # pseudo-responses -- exactly the defect the guard now skips days for.
     r = sp.run([sys.executable, "run_table9_both_ways.py", "--source", "demo", "--n-demo", "4",
-                "--n-demo-bars", "1200", "--n-boot", "0", "--corr-window", "60",
+                "--n-demo-bars", "4200", "--n-boot", "0", "--corr-window", "60",
                 "--bar-seconds", "30"],
                capture_output=True, text=True, timeout=540, cwd=here)
     out = r.stdout
     ok = (r.returncode == 0 and "RealBar" in out and "MEAN-GROUP" in out
           and "fixed-effects panel VAR" in out and "n_days:" in out)
-    print("(7) CLI: RealBar column, panel note, and MEAN-GROUP block all render (rc=%d) : %s"
-          % (r.returncode, ok))
-    return ok
+    # And the guard itself must SAY so on an underdetermined fixture, not render silence.
+    r2 = sp.run([sys.executable, "run_table9_both_ways.py", "--source", "demo", "--n-demo", "4",
+                 "--n-demo-bars", "1200", "--n-boot", "0", "--corr-window", "60",
+                 "--bar-seconds", "30"],
+                capture_output=True, text=True, timeout=540, cwd=here)
+    guard = (r2.returncode == 0 and "identification bar" in r2.stdout
+             and "underdetermined=4" in r2.stdout and "n_days:" not in r2.stdout)
+    print("(7) CLI: RealBar column, panel note, MEAN-GROUP block render on an identified fixture "
+          "(rc=%d, %s); underdetermined fixture reports the skip instead of averaging "
+          "pseudo-responses (%s) : %s" % (r.returncode, ok, guard, ok and guard))
+    return ok and guard
 
 
 def main():

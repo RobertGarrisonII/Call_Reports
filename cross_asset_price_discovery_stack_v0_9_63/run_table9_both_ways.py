@@ -67,6 +67,22 @@ def _load(args):
             date, df = rec
             regime = "volatile" if str(date)[:10] in vol else "benchmark"
         out.append((date, regime, df))
+    # Frames are cached PRE-mask since v0.9.57 (the halt policy is applied at analysis time so
+    # the frame on disk stays a faithful record). Every other consumer masks on load; this
+    # driver estimates the paper's HEADLINE table, so silently skipping the mask here means
+    # Table 9 alone would be estimated halt-INCLUDED -- LULD/MWCB windows contributing spliced
+    # pseudo-returns to exactly the volatile sessions the table is about.
+    if getattr(args, "halt_mask", True):
+        import market_halts as mh
+        masked, n_rows = [], 0
+        for date, regime, df in out:
+            mdf, rep = mh.mask_frame(df)
+            masked.append((date, regime, mdf))
+            n_rows += sum(rep.values())
+        if n_rows:
+            print(f"halt mask: NaN'd {n_rows} leg-rows across {len(masked)} sessions "
+                  f"(--no-halt-mask to skip)")
+        out = masked
     return out
 
 
@@ -129,6 +145,15 @@ def build_parser():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--n-jobs", type=int, default=None)
     ap.add_argument("--out-dir", default="")
+    # v0.9.64: loaded frames are cached PRE-mask (v0.9.57 policy); this driver must therefore
+    # apply the halt mask itself, exactly as run_analysis does. Before this flag existed the
+    # headline table was the ONE estimator running halt-included.
+    ap.add_argument("--halt-mask", dest="halt_mask", action="store_true", default=True,
+                    help="NaN each leg's market columns inside that leg's halt windows on load "
+                         "(DEFAULT; the finite-row design mask then excludes halt, seam, and "
+                         "touching lag windows)")
+    ap.add_argument("--no-halt-mask", dest="halt_mask", action="store_false",
+                    help="estimate on the raw frames, halts included (A/B use only)")
     ap.add_argument("--n-demo", type=int, default=8)
     ap.add_argument("--n-demo-bars", type=int, default=6000)
     ap.add_argument("--demo-refresh", type=float, default=0.3,
@@ -154,7 +179,8 @@ def main(argv=None):
     # not run there -- exactly the kind of choice that should be visible in the output.
     import correlation_svar as cs
     n_lags, crit, ic = cs.resolve_n_lags(sessions, a.n_lags, pmax=a.pmax,
-                                         spec=a.spec, corr_window=a.corr_window)
+                                         spec=a.spec, corr_window=a.corr_window,
+                                         bar_seconds=a.bar_seconds, panel=a.panel)
     if crit is not None:
         if n_lags is None:
             print("could not select a lag (no session had > pmax+5 usable rows); "
@@ -187,6 +213,14 @@ def main(argv=None):
     pd.set_option("display.width", 240)
     print(tbl.to_string())
     mg = getattr(tbl, "mean_group", None)
+    if mg is not None and mg["point"].empty:
+        skip = mg.get("n_skipped") or {}
+        print()
+        print("MEAN-GROUP: no day cleared the per-day identification bar (%s). A per-day VAR(p)"
+              % (", ".join(f"{k}={v}" for k, v in skip.items() if v) or "no usable days"))
+        print("on k variables needs > 1 + k*p + 10 usable bars; before v0.9.64 such days were")
+        print("fitted anyway and lstsq's minimum-norm pseudo-responses were averaged in. Lower")
+        print("--n-lags, use a coarser --bar-seconds, or run more/longer sessions.")
     if mg is not None and not mg["point"].empty:
         print()
         print("MEAN-GROUP (per-day SVAR, cross-day mean; the slope-heterogeneity check on the")
@@ -201,6 +235,10 @@ def main(argv=None):
         print(disp.to_string())
         print("n_days:")
         print(mg["n_days"].to_string())
+        skip = mg.get("n_skipped") or {}
+        if any(skip.values()):
+            print("days excluded: " + ", ".join(f"{k}={v}" for k, v in skip.items() if v)
+                  + "  (underdetermined = fewer effective rows than VAR parameters/eq + 10)")
 
     # the headline: how much of each response is measurement artifact
     if isinstance(tbl.df.columns, pd.MultiIndex) and "Delta (HY-Pearson)" in tbl.df.columns.get_level_values(0):

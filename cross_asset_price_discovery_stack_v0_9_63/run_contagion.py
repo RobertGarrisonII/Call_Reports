@@ -37,7 +37,7 @@ import event_study_driver as esd
 import market_shocks as mk
 import stress_index as si
 
-_CALM = {"calm", "baseline", "quiet", "normal"}
+_CALM = {"calm", "baseline", "benchmark", "quiet", "normal"}
 _STRESS = {"stress", "volatile", "crisis", "turmoil"}
 EPS = 1e-12
 

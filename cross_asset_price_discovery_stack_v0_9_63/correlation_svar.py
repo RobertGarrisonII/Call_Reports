@@ -293,17 +293,33 @@ def _build_svar_frame_bar(df, feats, n_levels, target_qty, wspread_kind, bar_sec
                 V[name] = pd.Series(r[a], index=idx) ** 2                      # per-bar mean below
             elif f == "mdev":
                 V[name] = microprice_dev(df, a, min(n_levels, 5))
+    bar_sum = set()                                    # extra_fn columns aggregated as per-bar sums
     if extra_fn is not None:
         E = extra_fn(df).reindex(idx)
         for c in E.columns:
             V[c] = np.asarray(E[c], float)
-            _BAR_SUM.add(c)                                                    # counts: sum per bar
+            bar_sum.add(c)                                                     # counts: sum per bar
+    # Coverage floor scales with the GRID, not just the bar. bar_seconds//6 was calibrated on
+    # the 1s grid (60 sub-intervals per 60s bar -> require 10); on a 10ms frame the same
+    # constant admits bars with 10 of 6,000 sub-returns, where se(z) ~ 0.38 produces the
+    # +-9 Fisher-z outliers. Require a quarter of the bar's sub-interval capacity, floor 10.
+    dt = float(np.median(np.diff(idx.asi8))) / 1e9 if len(idx) > 1 else 1.0
+    cap = max(1.0, float(bar_seconds) / max(dt, 1e-9))
+    min_sub = max(10, int(0.25 * cap))
     g = V.groupby(bar)
+    n_fin = V.notna().groupby(bar).sum()               # per-bar finite counts, per column
     B = pd.DataFrame(index=pd.Index(sorted(bar.unique()), name="bar"))
     for c in V.columns:
         base = c.split("_")[0]
-        if c in _BAR_SUM or base in ("OFI",):
+        if c in bar_sum or base in ("OFI",):
             B[c] = g[c].sum(min_count=1)
+            # A partially-masked bar (halt boundary) SUMS only its observed sub-intervals; for a
+            # FLOW column that is structural attenuation correlated with exactly the stressed
+            # sessions. Require at least half the bar's sub-interval capacity observed. This
+            # floor is for SUM columns only: mean-aggregated state columns (spreads, RV, mdev)
+            # are unbiased under within-bar sparsity -- WtdSpread is ~25%-finite at the native
+            # grid by construction, and flooring it would NaN most bars outright.
+            B.loc[n_fin[c].reindex(B.index).fillna(0) < 0.5 * cap, c] = np.nan
         else:                                                                  # RV / spreads / mdev
             B[c] = g[c].mean()
     for c in list(B.columns):                                                  # spread LEVELS -> changes
@@ -312,7 +328,6 @@ def _build_svar_frame_bar(df, feats, n_levels, target_qty, wspread_kind, bar_sec
     # dependent: change in Fisher-z of the bar's realized correlation of the sub-returns.
     # A bar needs enough finite pairs and movement on both legs to yield a correlation at all.
     rs = pd.Series(r["SPY"], index=idx); re_ = pd.Series(r["ES"], index=idx)
-    min_sub = max(10, int(bar_seconds) // 6)
     rho = []
     for b, ii in rs.groupby(bar).groups.items():
         x = rs.loc[ii].to_numpy(float); y = re_.loc[ii].to_numpy(float)
@@ -327,9 +342,6 @@ def _build_svar_frame_bar(df, feats, n_levels, target_qty, wspread_kind, bar_sec
     X = B.to_numpy(float)
     mask = np.all(np.isfinite(X), axis=1)
     return X[mask], names, len(names) - 1
-
-
-_BAR_SUM = set()                                     # extra_fn columns registered as per-bar sums
 
 
 def _dcc_corr(df, r, dcc_returns):
@@ -829,24 +841,43 @@ def correlation_irf_mean_group(data, spec="informational", n_lags=6, horizon=10,
         min_obs_day = max(20, int(min_obs_day) // max(int(bar_seconds), 1))
     rows = []
     names_ref = None
+    n_skip = {"short": 0, "frozen_dep": 0, "underdetermined": 0, "estimation_failed": 0}
     for item in data:
         date = item[0]; regime = item[1] if len(item) == 3 else "all"; df = item[-1]
         X, names, ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
                                         corr_window, wspread_kind, extra_fn=extra_fn,
                                         bar_seconds=bar_seconds)
         if len(X) < max(min_obs_day, n_lags + 10):
+            n_skip["short"] += 1
             continue
         keep = X.std(axis=0) > EPS
         if not keep[ci]:                             # a day with a frozen dependent variable
+            n_skip["frozen_dep"] += 1
+            continue
+        if not keep.all():
+            # A frozen regressor is unidentified on that day; leaving it in hands lstsq a
+            # singular design whose minimum-norm answer looks like a coefficient. Drop it from
+            # THIS day's system (the dependent stays last, so ci is re-derived, not shifted).
+            X = X[:, keep]
+            names = [nm for nm, k_ in zip(names, keep) if k_]
+            ci = len(names) - 1
+        # A per-day VAR(p) on k variables estimates 1 + k*p coefficients PER EQUATION, and
+        # lstsq on an underdetermined design returns the minimum-norm solution without
+        # complaint -- pseudo-responses that would be averaged into the mean group with full
+        # weight. Require the effective sample to clear the parameter count with margin.
+        if len(X) - n_lags < 1 + X.shape[1] * n_lags + 10:
+            n_skip["underdetermined"] += 1
             continue
         try:
             A, Sigma, _ = var_ols(X, n_lags)         # per-day intercept = day FE, trivially
             Theta = orthogonalized_irf(A, Sigma, horizon, ident)
-        except Exception:
+        except (np.linalg.LinAlgError, ValueError, FloatingPointError):
+            n_skip["estimation_failed"] += 1
             continue
         resp = (np.sum([Theta[h][ci, :] for h in range(horizon + 1)], axis=0)
                 if cumulative else Theta[0][ci, :])
-        names_ref = names
+        if names_ref is None or len(names) > len(names_ref):
+            names_ref = names
         for j, nm in enumerate(names):
             if j == ci:
                 continue
@@ -855,14 +886,15 @@ def correlation_irf_mean_group(data, spec="informational", n_lags=6, horizon=10,
     per_day = pd.DataFrame(rows)
     if per_day.empty:
         return {"point": pd.DataFrame(), "se": pd.DataFrame(), "tstat": pd.DataFrame(),
-                "n_days": pd.DataFrame(), "per_day": per_day, "n_lags": int(n_lags)}
+                "n_days": pd.DataFrame(), "per_day": per_day, "n_lags": int(n_lags),
+                "n_skipped": n_skip}
     g = per_day.groupby(["shock", "regime"])["resp_x100"]
     mean = g.mean().unstack(); sd = g.std(ddof=1).unstack(); n = g.count().unstack()
     se = sd / np.sqrt(n)
     order = [nm for nm in (names_ref or []) if nm in mean.index] or list(mean.index)
     mean, se, n = mean.reindex(order), se.reindex(order), n.reindex(order)
     return {"point": mean, "se": se, "tstat": mean / se.replace(0.0, np.nan),
-            "n_days": n, "per_day": per_day, "n_lags": int(n_lags)}
+            "n_days": n, "per_day": per_day, "n_lags": int(n_lags), "n_skipped": n_skip}
 
 
 # ── Table 9 with inference: bootstrap SE + Romano-Wolf joint significance ──────
