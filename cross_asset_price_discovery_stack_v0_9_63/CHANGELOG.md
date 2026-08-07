@@ -1,5 +1,129 @@
 # Changelog
 
+## v0.9.64 -- the final audit: 41 findings verified, the headline table re-masked, the memory bombs defused
+
+A ten-lens audit of the whole stack (syntax, hangs, races, resource limits, methodology),
+followed by main-loop verification of every finding. Two waves of fixes; the behavioral ones are
+pinned by the new `test_audit_fixes.py` gate (12 checks) plus extensions to existing gates.
+
+### The two that changed reported numbers most
+
+* **Table 9 was estimated halt-INCLUDED.** v0.9.57 made saved frames pre-mask (correctly -- the
+  artifact must be the data, not the policy), and every consumer except one masks on load. The
+  exception was `run_table9_both_ways._load` -- the driver of the paper's HEADLINE table -- which
+  did a raw `pickle.load`. Since v0.9.57, LULD/MWCB windows contributed spliced pseudo-returns to
+  exactly the volatile sessions the table is about. The loader now applies `mask_frame` on load,
+  prints the row count masked, and `--no-halt-mask` remains as the A/B escape.
+* **`run_contagion` never recognized 'benchmark'.** `_CALM = {calm, baseline, quiet, normal}` --
+  but every real run labels its calm days "benchmark", so `_pick_regime` silently fell back to
+  `sessions[0]` (sorted-first: 2020-03-09, a circuit-breaker day) as the CALM exhibit for the
+  Hawkes and pricing-error tables. "benchmark" is now in the set, and the pick is pinned.
+
+### Estimation-surface corrections (Wave 1)
+
+* **Mean-group**: per-day VARs with fewer effective rows than `1 + k*p + 10` are SKIPPED --
+  lstsq returns the minimum-norm solution on an underdetermined design without complaint, and
+  those pseudo-responses were averaged into the mean group at full weight. The frozen-regressor
+  keep mask is now actually APPLIED (it was computed and thrown away, leaving a singular design
+  in the fit); the bare `except` is narrowed to linalg errors; every skip is counted and
+  reported (`n_skipped`, a "days excluded" line, and an explicit message when NO day clears the
+  bar instead of a silently missing block).
+* **RealBar coverage floors scale with the grid**: `min_sub = bar_seconds//6` was a 1s-grid
+  constant -- at 10ms it admitted bars with 10 of 6,000 sub-returns, whose Fisher-z estimation
+  noise produced the +-9.6 outliers. Now a quarter of bar capacity (floor 10) for the per-bar
+  rho, and HALF capacity for sum-aggregated FLOW columns so a halt-boundary bar cannot enter
+  with structurally attenuated volume (state columns keep NaN-skipping means -- WtdSpread is
+  ~25%-finite by construction and must not be floored). `_BAR_SUM` is a per-call local, no
+  longer a module global mutated across calls.
+* **Lag selection scores the design that is fitted**: `panel`/`bar_seconds` are forwarded into
+  `select_svar_lag` from the both-ways table and the Table 9 CLI -- selecting under stacked
+  seam-crossing lags and estimating under within-day FE answered a different question at a
+  different order. STAGE 6 no longer forwards STAGE 4c's SVAR-frame BIC lag into
+  `run_analysis`'s VECM stages (different model; the frequency-scaled default is restored).
+* **`table_rigobon` regimes are exogenous now**: it split on the residuals' own rolling
+  volatility -- conditioning on the endogenous variable, which the module's own docs forbid.
+  With >=2 session labels the ex-ante date classification is the regime instrument; the
+  vol-split survives only as a labeled single-regime fallback, and the identification verdict
+  rows (var-ratio spread, relative eigengap, yes/NO) are in the table itself.
+* **`table_regime_is` / `table_tick_correction` stop stacking day-level log-price LEVELS**
+  (every overnight gap was a within-sample "return" inside the MS-VECM and the IS
+  decomposition): both estimate PER DAY on each session's longest contiguous unmasked run and
+  aggregate across days (means + n_days; leader by day vote).
+* **MWCB DiD carries wild-cluster-bootstrap p-values** (restricted WCR, Webb weights at G<=12)
+  next to the CRVE t for the DiD and RD rows -- the few-cluster regime METHODS_VIGNETTE
+  prescribes, wired into the actual table at last.
+* **Jump split carries `kappa`/`ec_valid` per day** (mirroring `pds.estimate_day`): on a
+  non-correcting day every IS number is a quotient of same-signed alphas, and those rows were
+  averaged into `mean_ISc_ES`/`mean_ISj_ES`. The IS means now skip them and report
+  `n_ec_invalid`; jump-FRACTION means are unchanged (QV ratios, kappa-free).
+* **FEVD honesty**: `fevd_from_irf` sums squared responses per shock, which partitions variance
+  only under UNCORRELATED structural shocks -- an assumption the paper's own tandem-flow result
+  contradicts. The docstring states it, and `run_irf` reports the measured per-regime
+  `ofi_innovation_corr` next to the shares with a note.
+* **Notes and defaults**: Table 5's `log_OR_z` labeled as an iid-bars Woolf scale (significance
+  belongs to the permutation null, which preserves each market's serial dependence); the
+  volatile-includes-MWCB taxonomy stated in the manifest and `--volatile` help (Table 5 keeps
+  MWCB separate -- cross-exhibit comparisons must say which composition they use); RealBar's
+  "no MA at any lag" softened to "no window-length MA; estimation noise leaves at most MA(1)";
+  `paper_tables` defaults aligned with the driver (corr_window=100, n_lags=6).
+
+### Run-killers, memory, and the driver (Wave 2)
+
+* **The DCC bootstrap cost explosion**: the day-cluster bootstrap rebuilds every drawn
+  session's SVAR frame per draw -- with the DCC column DEFAULT ON since v0.9.56 that re-fit the
+  GARCH once per session per draw (n_boot fits per estimator block; estimated 17-33h at 1s,
+  weeks at 10ms). `build_svar_frame` now memoizes single-slot per frame on `df.attrs` (session
+  objects are shared across draws, so every draw inside an estimator block hits), and
+  `_dcc_corr` memoizes its rho independently (a spec change must not re-fit the GARCH).
+* **The panel-design memory bombs**: `panel_var_ols` and `select_lag_var_panel` now estimate
+  from per-session accumulated Grams in 200k-row chunks -- the stacked rows x k*p design (tens
+  of GB at 10ms, built PER CONCURRENT BOOTSTRAP DRAW) is never materialized, and lag selection
+  accumulates ONCE at pmax and scores every candidate from leading-column submatrices (the
+  common-sample design for p' < p is exactly that subset). `pds.panel_vecm` gets the same
+  treatment (its Ls-list -> vstack -> column_stack -> lstsq chain transiently held hundreds of
+  GB at the fine grid); the cluster meat comes from the same per-session cross-products.
+  Exactness is pinned to 1e-9 against the materialized-design path in the gate.
+* **`mask_frame` no longer copies when there is nothing to mask**: masks are resolved first;
+  a no-halt session returns the ORIGINAL frame annotated -- the unconditional `df.copy()`
+  doubled residency (premask + masked) for a no-op on most sessions.
+* **Frames pickle is written atomically** (tmp + `os.replace`): a crash mid-write left a
+  truncated `frames_*.pkl` that the driver's newest-first glob would FIND and feed to STAGE 3.
+* **Fine-grid runs stop writing artifacts nothing reads**: the two fine extract-only
+  invocations pass `--no-dataset` (a 10ms parquet consolidation nothing downstream loads), and
+  STAGE 6b passes `--no-dataset --no-save-frames` (it LOADS the fine frames; re-pickling tens
+  of GB of identical frames into its run dir was pure I/O).
+* **Derivation trust boundary**: `derive_coarse_frame` CEIL-anchors the coarse grid
+  (`_align_books` can trim the fine start off-grid; the old first-row anchor built a
+  phase-offset grid whose book rows sat at wrong timestamps and whose flow reindexed to
+  all-NaN -- undetected, because offset+integer-seconds points still exist in a 10ms index). A
+  `--verify-existing` MISMATCH now ROLLS BACK the derived caches written in the same run before
+  exiting 3 (they were left behind for later runs to cache-HIT), and the driver handles rc=3
+  distinctly from rc=2 instead of one `|| info` whose message was false for both. Cache writes
+  use `os.link` no-clobber so a concurrent direct extraction cannot be silently overwritten.
+* **A dead worker pool no longer discards the batch**: loky's `TerminatedWorkerError` (the OOM
+  killer, almost always) is contained in `_parallel_sessions` -- completed sessions are kept,
+  the remainder finishes sequentially in-process, and the log says why and what to lower.
+* **Driver robustness**: STAGES 4/5/6 are `|| info`-guarded so a red analysis stage still
+  reaches the STAGE 7 manifest (the gates, STAGES 1 and 3, stay hard); the STAGE 3
+  failure-branch `sed` can no longer kill the script before its own guidance prints; the
+  `--source load` fine-frames discovery runs even when STAGE 2 is not in `--stages`; STAGE 0
+  warns when free disk under the output/cache volumes is below a two-grid run's appetite; the
+  usage header says subset re-runs need `--source load`.
+* **Documented, not fixed (inherent limits, now stated where they bind)**: the volatile-day
+  RANKING (largest 2022-26 intraday ranges) is an input no repo script recomputes -- a referee
+  needs their own daily OHLC (`run_paper_replication.sh` sample block); the FPCA liquidity
+  state embeds full-session look-ahead, fine for within-day conditioning, invalid as a
+  real-time signal (`functional_liquidity`); autoscale's reserve models the parent as fixed
+  while the extraction parent ACCUMULATES completed frames, so late-batch fine-grid OOM means
+  lower WORKERS or raise RESERVE_GB (`autoscale.reserve_gb`).
+
+### Gates
+
+* New `test_audit_fixes.py` (12 checks) in the STAGE 1 list; `test_panel_svar` check 7 fixture
+  resized above the per-day identification bar and extended to pin the underdetermined-day
+  reporting; vendor-fetch timeouts (`MST_LAKEQUERY_TIMEOUT`, default 3600s) on all three
+  `sp.run` paths shipped with the audit-scout commit.
+
 ## v0.9.63 -- Table 9 becomes a real panel SVAR, and the dependent variable stops fighting back
 
 Two design questions from the coauthors, both of which found real defects:

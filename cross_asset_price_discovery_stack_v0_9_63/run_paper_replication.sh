@@ -61,6 +61,9 @@
 #   ./run_paper_replication.sh --source extract         # full paper sample via MayStreet
 #   ./run_paper_replication.sh --source load --pickle output/frames_*.pkl
 #   ./run_paper_replication.sh --stages 1,4,5           # re-run selected stages
+#       NOTE: a subset that skips STAGE 2 has no frames of its own -- pair it with
+#       --source load --pickle output/.../frames_1s.pkl (fine frames beside it are
+#       found automatically) or STAGES 4-6 will have nothing to estimate on
 #   ./run_paper_replication.sh --dry-run                # print the commands only
 #   ./run_paper_replication.sh --n-lags 6               # the paper's fixed lag, for comparison
 #   ./run_paper_replication.sh --n-lags bic --pmax 20   # data-driven lag (default), wider search
@@ -146,6 +149,13 @@ QC_ACTION="warn"      # warn | drop | raise -- what to do with a session whose b
 # is gone, and the one weekday-mismatched pair (2025-01-07 Tue vs 2024-01-29 Mon) is replaced by
 # 2025-01-27 Mon vs 2024-01-29 Mon (364 d). New pair: 2025-08-01 Fri vs 2024-08-09 Fri (357 d).
 # validate_sample.py passes this list clean: all pairs same weekday, 350-371 d apart.
+#
+# REPRODUCIBILITY LIMIT, stated rather than implied: validate_sample.py checks the PAIRING
+# rules (weekday match, ~1y gap, market open), but no script in this repo computes the
+# "largest intraday-range days in 2022-2026" RANKING that selected the volatile list -- that
+# needs a daily OHLC feed the stack does not pull. The list is therefore an INPUT to the
+# pipeline, not a derived object; a referee reproducing the selection must rank ranges from
+# their own daily data (SPY high-low over close), then verify the pairing here.
 VOLATILE="2024-12-18,2026-06-05,2025-10-10,2024-09-03,2025-04-03,2024-08-05,2024-07-24,2025-01-27,2023-03-09,2025-08-01"
 BASELINE="2023-12-20,2025-06-13,2024-10-18,2023-09-05,2024-04-04,2023-08-07,2023-07-19,2024-01-29,2022-03-24,2024-08-09"
 MWCB="2020-03-09,2020-03-12,2020-03-16,2020-03-18"
@@ -266,6 +276,19 @@ print("stack imports OK")
 EOF
   info "cores=${AS_CORES}  ram=${AS_RAM}GiB  extraction_workers=${AS_EXTRACT} (${N_SESS} sessions)  cpu_jobs=${NJ}"
   info "  sizing comes from autoscale.py; override with CORES/RAM_GB/WORKERS/BOOT_WORKERS/PEAK_GB_GUESS"
+  # Disk is a run-killer nothing else checks (v0.9.64): a two-grid run writes fine frames
+  # (~tens of GB), the coarse frames, the caches and the run dirs; ENOSPC mid-pickle leaves
+  # truncated artifacts. Advisory, not a gate -- the operator may know their filesystem better.
+  for _d in "$OUT" "${CACHE_DIR:-}"; do
+    [ -n "$_d" ] || continue
+    mkdir -p "$_d" 2>/dev/null || true
+    _free_gb="$(df -Pk "$_d" 2>/dev/null | awk 'NR==2 {print int($4/1048576)}' || echo "")"
+    if [ -n "$_free_gb" ] && [ "$_free_gb" -lt 50 ] 2>/dev/null; then
+      info "  WARNING: only ${_free_gb} GiB free under ${_d}. A two-grid extract run writes"
+      info "  fine frames + caches measured in tens of GB; ENOSPC mid-write truncates pickles."
+      info "  Free space or point --extract-cache / the output dir at a larger volume."
+    fi
+  done
   if [ "${AS_EXTRACT}" -lt "${AS_CORES}" ] 2>/dev/null && [ "${AS_EXTRACT}" -lt "${N_SESS}" ] 2>/dev/null; then
     info "  NOTE: extraction is capped at ${AS_EXTRACT} by the per-worker MEMORY budget"
     info "  (PEAK_GB_GUESS), not by cores. STAGE 2 measures the real peak and prints the value"
@@ -352,6 +375,7 @@ if have_stage 1; then
            test_pull_once.py \
            test_replay_fast_snap.py \
            test_panel_svar.py \
+           test_audit_fixes.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -414,12 +438,15 @@ if have_stage 2; then
         N_ALL="$(echo "$VOLATILE,$BASELINE,$MWCB" | tr ',' '\n' | grep -c . || echo 1)"
         AS_FINE="$(PEAK_GB_GUESS="${FINE_PEAK_GB:-96}" $PY autoscale.py workers --sessions "$N_ALL" 2>/dev/null || echo 1)"
         # shellcheck disable=SC2086
+        # --no-dataset: this invocation exists to produce the fine FRAMES pickle and fill the
+        # session cache. Consolidating a 10ms parquet dataset here as well wrote ~100x-row
+        # artifacts nothing downstream reads (STAGE 6b loads the frames), tens of GB per run.
         if run_show $PY autoscale.py measure -- $PY run_analysis.py --source extract \
             --dates "${VOLATILE},${BASELINE},${MWCB}" \
             --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
             --interval "$FINE_INTERVAL" --n-levels 10 --max-workers "$AS_FINE" \
             --qc-action "$QC_ACTION" $CACHE_FLAGS \
-            --output-dir "$OUT" --save-dataset --only extract; then
+            --output-dir "$OUT" --no-dataset --only extract; then
           FINE_FRAMES="$(find "${OUT}" -name "frames_${FINE_INTERVAL}.pkl" 2>/dev/null \
                          | xargs -r ls -1t 2>/dev/null | head -1 || true)"
         fi
@@ -428,10 +455,23 @@ if have_stage 2; then
         fi
         if [ -n "${FINE_FRAMES:-}" ]; then
           FINE_DONE=1
+          # rc semantics matter here (v0.9.64): 2 = grid misalignment (nothing derived,
+          # harmless -- direct pull covers it); 3 = VERIFIED MISMATCH -- derive_frames rolls
+          # back its own cache writes and nothing derived may be trusted this run. The old
+          # single '|| info' claimed "direct caches were kept" for BOTH, and for rc=3 the
+          # pre-rollback caches would then have served suspect derived frames as cache HITs.
+          DERIVE_RC=0
           run_show $PY derive_frames.py --pickle "$FINE_FRAMES" --target "$INTERVAL" \
               --fine-interval "$FINE_INTERVAL" --cache-dir "$CACHE_DIR" --levels 10 \
-              --clock receipt --verify-existing \
-            || info "derivation reported issues (see above) -- direct caches were kept; the coarse extraction below re-pulls whatever the cache is missing"
+              --clock receipt --verify-existing || DERIVE_RC=$?
+          case "$DERIVE_RC" in
+            0) : ;;
+            3) info "WARNING: derivation MISMATCHED the direct extraction on >=1 session."
+               info "Derived cache writes from this run were rolled back; the coarse extraction"
+               info "below re-pulls every uncached day directly. Investigate the mismatch report"
+               info "above before re-enabling pull-once for this sample." ;;
+            *) info "derivation unavailable (rc=${DERIVE_RC}; see above) -- the coarse extraction below re-pulls whatever the cache is missing" ;;
+          esac
         else
           info "fine extraction produced no frames -- falling back to a direct ${INTERVAL} pull"
         fi
@@ -488,7 +528,10 @@ fi
 # (and derived the coarse ones from them) -- clearing the variable here made STAGE 2b re-brand
 # that as "no frames" and stages 3/5/6b lost the fine grid entirely
 FINE_FRAMES="${FINE_FRAMES:-}"
-if [ "$WITH_FINE" -eq 1 ] && have_stage 2; then
+# The --source load discovery must run even when STAGE 2 is not in --stages (v0.9.64): a
+# subset re-run like "--stages 5,6 --source load --pickle frames_1s.pkl" was losing the fine
+# grid entirely because the FINE_FRAMES lookup was gated behind have_stage 2.
+if [ "$WITH_FINE" -eq 1 ] && { have_stage 2 || [ "$SOURCE" = "load" ]; }; then
   case "$SOURCE" in
     demo)
       info "fine grid: skipped on --source demo (synthetic sessions have no vendor tape)"
@@ -523,12 +566,13 @@ if [ "$WITH_FINE" -eq 1 ] && have_stage 2; then
         [ "$RESUME" -eq 0 ] && FINE_CACHE_FLAGS="$FINE_CACHE_FLAGS --no-resume"
       fi
       # shellcheck disable=SC2086
+      # --no-dataset: frames + cache are the deliverable here too (see the STAGE 2 pull-once note)
       if run_show $PY autoscale.py measure -- $PY run_analysis.py --source extract \
           --dates "$FDATES" \
           --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
           --interval "$FINE_INTERVAL" --n-levels 10 --max-workers "$AS_FINE" \
           --qc-action "$QC_ACTION" $FINE_CACHE_FLAGS \
-          --output-dir "$OUT" --save-dataset --only extract; then
+          --output-dir "$OUT" --no-dataset --only extract; then
         FINE_FRAMES="$(find "${OUT}" -name "frames_${FINE_INTERVAL}.pkl" 2>/dev/null \
                        | xargs -r ls -1t 2>/dev/null | head -1 || true)"
       fi
@@ -597,7 +641,10 @@ if have_stage 3 && [ "$SOURCE" != "demo" ]; then
         fi
       fi
     else
-      BAD="$(sed -n 's/^BAD \([0-9-]*\).*/\1/p' "${OUT}/qc_frames.txt" | tr '\n' ' ')"
+      # 2>/dev/null + || true: when qc_frames CRASHES (as opposed to failing the gate) the out
+      # file may not exist; under set -e a bare sed then killed the script HERE, before any of
+      # the guidance below printed -- the one moment the operator needs it most.
+      BAD="$(sed -n 's/^BAD \([0-9-]*\).*/\1/p' "${OUT}/qc_frames.txt" 2>/dev/null | tr '\n' ' ' || true)"
       if [ -n "$BAD" ] && [ "$SOURCE" = "extract" ]; then
         info "root-causing the flagged session(s) -- both tools re-fetch that day's raw messages"
         for d in $BAD; do
@@ -654,7 +701,7 @@ if have_stage 4; then
   say "STAGE 4  Table 5 + Table 7 with the corrected nulls"
   info "reports: raw corner shares (as published), independence GIVEN the observed"
   info "marginals, the corner log odds ratio, and the frequency-matched binomial null"
-  run_show $PY - "$OUT" "$FRAMES" "$MWCB" <<'EOF'
+  run_show $PY - "$OUT" "$FRAMES" "$MWCB" <<'EOF' || info "STAGE 4 FAILED -- see $LOG; continuing to STAGE 5"
 import sys, glob, pickle, warnings; warnings.simplefilter("ignore")
 import numpy as np, pandas as pd, tandem_order_flow as tof
 out, frames_glob, mwcb = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -876,12 +923,14 @@ if have_stage 5; then
   [ -n "$NJ" ] && T9ARGS="$T9ARGS --n-jobs $NJ"
   if [ "$SOURCE" = "demo" ]; then
     # shellcheck disable=SC2086
-    run_show $PY run_table9_both_ways.py --source demo --corr-window "$CORR_WINDOW" $T9ARGS
+    run_show $PY run_table9_both_ways.py --source demo --corr-window "$CORR_WINDOW" $T9ARGS \
+      || info "STAGE 5 (demo Table 9) FAILED -- see $LOG; continuing"
   else
     # 1-second: the paper's headline window (100 bars = 100 seconds)
     # shellcheck disable=SC2086
     run_show $PY run_table9_both_ways.py --source load --pickle "$FRAMES" \
-        --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS
+        --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS \
+      || info "STAGE 5 (1s Table 9) FAILED -- see $LOG; continuing"
     # 10-millisecond: the paper uses a 1-second window there, i.e. 100 bars again.
     # STAGE 2b resolves FINE_FRAMES when the fine grid ran; the old name-substitution stays as the
     # fallback so hand-extracted fine frames beside the 1s pickle are still found.
@@ -889,7 +938,8 @@ if have_stage 5; then
     if [ -n "$FINE_T9" ] && [ "$FINE_T9" != "$FRAMES" ] && { [ "$DRY" -eq 1 ] || [ -f "$FINE_T9" ]; }; then
       # shellcheck disable=SC2086
       run_show $PY run_table9_both_ways.py --source load --pickle "$FINE_T9" \
-          --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS
+          --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS \
+        || info "STAGE 5 (${FINE_INTERVAL} Table 9) FAILED -- see $LOG; continuing"
     else
       info "no ${FINE_INTERVAL} frames found — re-run --source extract (STAGE 2b extracts them) for"
       info "the fine-grid pair, which is where the Epps gap should be largest"
@@ -908,14 +958,19 @@ if have_stage 6; then
   # stages fit DIFFERENT models (the fixed-beta VECM behind the information shares, the jump
   # split, the ECM-SDE), whose lag run_analysis frequency-scales per grid; handing them the
   # SVAR-frame BIC lag pinned every VECM to a criterion resolved on another model's design.
+  # '|| info': under set -e an analysis-stage failure here used to kill the script before the
+  # STAGE 7 manifest, so a multi-hour run with a red STAGE 6 left no record of what DID run.
+  # The gates (STAGES 1 and 3) stay hard; the analysis stages are best-effort past them.
   case "$SOURCE" in
     demo)  # shellcheck disable=SC2086
-           run $PY run_analysis.py --source demo $QFLAG --legacy --output-dir "$OUT" ;;
+           run $PY run_analysis.py --source demo $QFLAG --legacy --output-dir "$OUT" \
+             || info "STAGE 6 FAILED -- see $LOG; continuing to the manifest" ;;
     *)     # shellcheck disable=SC2086
            run $PY run_analysis.py --source load --pickle "$FRAMES" \
                --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
                --interval "$INTERVAL" --legacy \
-               --output-dir "$OUT" --save-dataset $QFLAG ;;
+               --output-dir "$OUT" --save-dataset $QFLAG \
+             || info "STAGE 6 FAILED -- see $LOG; continuing to the manifest" ;;
   esac
 fi
 
@@ -951,11 +1006,13 @@ if [ "$WITH_FINE" -eq 1 ] && have_stage 6 && [ "$SOURCE" != "demo" ]; then
       info "  ~56M rows x ~120 columns and the LP runs ~200 horizons x 300 bootstraps -- expect"
       info "  hours and tens of GB. The 1s mains remain the quotable estimates; see the header."
     fi
+    # --no-dataset --no-save-frames: STAGE 6b LOADS the fine frames -- re-consolidating a 10ms
+    # parquet and re-pickling tens of GB of identical frames into this run dir was pure I/O.
     # shellcheck disable=SC2086
     run $PY run_analysis.py --source load --pickle "$FINE_FRAMES" \
         --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
         --interval "$FINE_INTERVAL" \
-        $ONLY_FLAG \
+        $ONLY_FLAG --no-dataset --no-save-frames \
         --output-dir "$OUT" $FQ \
       || info "STAGE 6b FAILED -- the 1s results above are unaffected; see $LOG"
   else

@@ -74,7 +74,17 @@ def derive_coarse_frame(fine: pd.DataFrame, target: str, fine_interval: str | No
         raise ValueError("target %s is not a coarser integer multiple of the fine grid (%.4gs)"
                          % (target, dt_f))
     freq = pd.tseries.frequencies.to_offset(target)
-    coarse_idx = pd.date_range(fine.index[0], fine.index[-1], freq=freq)
+    # CEIL-anchor the coarse grid (v0.9.64). _align_books can trim the first fine rows, so
+    # fine.index[0] may sit OFF the coarse grid (e.g. 09:30:00.020). Anchoring date_range
+    # there built a phase-offset grid whose points still exist in the fine index (offset +
+    # integer seconds stays 10ms-aligned, so the misalignment guard below never fired), put
+    # book rows at the wrong timestamps relative to a direct extraction, and -- because the
+    # flow keys are floor()ed onto the TRUE grid -- reindexed every flow column to all-NaN.
+    start = fine.index[0].ceil(freq)
+    end = fine.index[-1].floor(freq)
+    if start > end:
+        raise ValueError("fine frame too short to contain one aligned %s bar" % target)
+    coarse_idx = pd.date_range(start, end, freq=freq)
     missing = coarse_idx.difference(fine.index)
     if len(missing):
         raise ValueError("coarse grid points absent from the fine index (misaligned grids): "
@@ -165,8 +175,24 @@ def derive_sessions(sessions, target: str, fine_interval: str | None, cache_dir:
                 os.makedirs(cache_dir, exist_ok=True)
                 tmp = cpath + ".tmp%d" % os.getpid()
                 coarse.to_pickle(tmp)
-                os.replace(tmp, cpath)
-                rep["cached"] = cpath
+                # os.link is a no-clobber write: if a direct extraction (or a concurrent run
+                # sharing EXTRACT_CACHE) landed the file between the exists() check above and
+                # now, the link fails and THEIR frame wins -- os.replace would have silently
+                # clobbered a direct cache with a derived one, inverting the cache policy.
+                try:
+                    os.link(tmp, cpath)
+                    rep["cached"] = cpath
+                except FileExistsError:
+                    rep["cached"] = "existing cache kept (concurrent writer won)"
+                except OSError:                       # filesystem without hard links
+                    if not os.path.exists(cpath):
+                        os.replace(tmp, cpath)
+                        rep["cached"] = cpath
+                    else:
+                        rep["cached"] = "existing cache kept (concurrent writer won)"
+                finally:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
         out.append((label, r, coarse))
         reports[label] = rep
     return out, reports
@@ -218,8 +244,25 @@ def main(argv=None) -> int:
             pickle.dump([(d, r, f) for d, r, f in derived], fh, protocol=4)
         print("derived frames -> %s" % a.out)
     if bad:
-        print("\n%d session(s) MISMATCH the direct extraction -- the direct caches were kept; "
-              "investigate before trusting derivation for uncached sessions." % bad)
+        # ROLLBACK (v0.9.64): a verified mismatch indicts the DERIVATION, so every derived
+        # frame this run cached for sessions without a direct cache is suspect too. Leaving
+        # them in place meant a later coarse extraction cache-HIT silently served them even
+        # though this exit code said not to trust them (and the driver ran on).
+        rolled = []
+        for label, rep in reports.items():
+            c = rep.get("cached")
+            if isinstance(c, str) and os.path.sep in c and os.path.exists(c):
+                try:
+                    os.unlink(c); rolled.append(label)
+                except OSError:
+                    pass
+        print("\n%d session(s) MISMATCH the direct extraction -- the direct caches were kept"
+              % bad)
+        if rolled:
+            print("rolled back %d derived cache write(s) from this run (%s): the derivation is "
+                  "suspect for ALL sessions until the mismatch is explained"
+                  % (len(rolled), ", ".join(rolled)))
+        print("investigate before trusting derivation for uncached sessions.")
         return 3
     return 0
 

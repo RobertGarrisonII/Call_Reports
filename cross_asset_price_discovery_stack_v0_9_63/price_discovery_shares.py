@@ -385,37 +385,61 @@ def panel_vecm(sessions, n_lags=5, names=("SPY", "ES"), criterion=None, pmax=10)
             a = np.log(np.asarray(m_spy, float)); b = np.log(np.asarray(m_es, float))
             pairs.append((a, b))                 # NaN flows to the design mask; compression splices
         n_lags, _ = select_lag_pooled(pairs, pmax=pmax, criterion=criterion)
-    dYs, ECs, Ds, Ls, Gs = [], [], [], [], []
+    # v0.9.64: estimated from per-session CHUNKED cross-products. The stacked design
+    # [z, z*D, const, 2*n_lags lag columns] is rows x (3+2p); at a 10ms grid with
+    # frequency-scaled lags the old build (per-session lag lists -> vstack -> column_stack ->
+    # lstsq workspace) transiently held hundreds of GB. The Grams are (3+2p)^2 per session,
+    # the finite-row mask is applied chunk-by-chunk with identical semantics (drop the halt,
+    # the seam, and every lag window touching either), and the cluster meat comes from the
+    # same per-session cross-products -- nothing row-sized survives the loop.
+    K = 3 + 2 * int(n_lags)
+    chunk = 200_000
+    XtX = np.zeros((K, K)); XtY = np.zeros((K, 2))
+    per = []; n_all = 0
     for _gi, (label, regime, m_spy, m_es) in enumerate(sessions):
         p1 = np.log(np.asarray(m_spy, float)); p2 = np.log(np.asarray(m_es, float))
         z = (p1 - p2); z = z - np.nanmean(z)              # day FE on EC level (NaN-aware)
         dp1 = np.diff(p1); dp2 = np.diff(p2); T = len(dp1)
-        dYs.append(np.column_stack([dp1[n_lags:T], dp2[n_lags:T]]))
-        ECs.append(z[n_lags:T])
-        Ds.append(np.full(T - n_lags, 1.0 if regime == "volatile" else 0.0))
-        lag = [np.ones(T - n_lags)]
-        for L in range(1, n_lags + 1):
-            lag.append(dp1[n_lags - L:T - L]); lag.append(dp2[n_lags - L:T - L])
-        # finite rows only, PER SESSION and before stacking: halt-masked rows are NaN, and the
-        # inline design here does not go through _design_within_day's mask. Filtering after the
-        # lag columns are built drops the halt, the seam, and every lag window touching either.
-        _dYi = np.column_stack([dp1[n_lags:T], dp2[n_lags:T]])
-        _Li = np.column_stack(lag)
-        _oki = (np.all(np.isfinite(_dYi), axis=1) & np.isfinite(z[n_lags:T])
-                & np.all(np.isfinite(_Li), axis=1))
-        dYs[-1] = _dYi[_oki]
-        ECs[-1] = ECs[-1][_oki]
-        Ds[-1] = Ds[-1][_oki]
-        Ls.append(_Li[_oki])
-        Gs.append(np.full(int(_oki.sum()), _gi))          # session id for day-clustered SEs
-    dY = np.vstack(dYs); ec = np.concatenate(ECs); D = np.concatenate(Ds); Lall = np.vstack(Ls)
-    groups = np.concatenate(Gs)
-    X = np.column_stack([ec, ec * D, Lall])               # [ z , z*D , const+lags ]
-    B, resid = _ols(dY, X)
+        d_flag = 1.0 if regime == "volatile" else 0.0
+        XtX_g = np.zeros((K, K)); XtY_g = np.zeros((K, 2)); YtY_g = np.zeros((2, 2))
+        Xsum_g = np.zeros(K); Ysum_g = np.zeros(2); n_g = 0
+        for c0 in range(n_lags, T, chunk):
+            c1 = min(c0 + chunk, T)
+            dYc = np.column_stack([dp1[c0:c1], dp2[c0:c1]])
+            cols = [z[c0:c1], z[c0:c1] * d_flag, np.ones(c1 - c0)]
+            for L in range(1, n_lags + 1):
+                cols.append(dp1[c0 - L:c1 - L]); cols.append(dp2[c0 - L:c1 - L])
+            Xc = np.column_stack(cols)
+            ok = np.all(np.isfinite(dYc), axis=1) & np.all(np.isfinite(Xc), axis=1)
+            if not ok.all():
+                dYc = dYc[ok]; Xc = Xc[ok]
+            XtX_g += Xc.T @ Xc; XtY_g += Xc.T @ dYc; YtY_g += dYc.T @ dYc
+            Xsum_g += Xc.sum(axis=0); Ysum_g += dYc.sum(axis=0); n_g += len(dYc)
+        per.append({"XtX": XtX_g, "XtY": XtY_g, "YtY": YtY_g, "Xsum": Xsum_g,
+                    "Ysum": Ysum_g, "n": n_g, "vol": d_flag})
+        XtX += XtX_g; XtY += XtY_g; n_all += n_g
+    try:
+        B = np.linalg.solve(XtX, XtY)                     # min-norm fallback matches lstsq on
+    except np.linalg.LinAlgError:                         # a singular design (e.g. no volatile
+        B = np.linalg.pinv(XtX) @ XtY                     # session -> the z*D column is zero)
     alpha_base = B[0, :].copy(); alpha_int = B[1, :].copy()
     alpha_vol = alpha_base + alpha_int
-    Om_b = np.cov(resid[D == 0], rowvar=False, bias=True)
-    Om_v = np.cov(resid[D == 1], rowvar=False, bias=True)
+
+    def _regime_cov(flag):
+        # np.cov(resid[subset], bias=True) == E'E/n - mean mean', from per-session Grams
+        E = np.zeros((2, 2)); s = np.zeros(2); n = 0
+        for pg in per:
+            if pg["vol"] != flag or pg["n"] == 0:
+                continue
+            E += pg["YtY"] - pg["XtY"].T @ B - B.T @ pg["XtY"] + B.T @ pg["XtX"] @ B
+            s += pg["Ysum"] - B.T @ pg["Xsum"]
+            n += pg["n"]
+        if n == 0:
+            return np.full((2, 2), np.nan)
+        m = s / n
+        return E / n - np.outer(m, m)
+
+    Om_b = _regime_cov(0.0); Om_v = _regime_cov(1.0)
 
     def _shares(alpha, Om):
         lo, hi, mid = hasbrouck_is(alpha, Om); cs = gonzalo_granger(alpha)
@@ -424,16 +448,26 @@ def panel_vecm(sessions, n_lags=5, names=("SPY", "ES"), criterion=None, pmax=10)
             d.update({f"IS_mid_{nm}": mid[j], f"MIS_{nm}": mis[j], f"CS_{nm}": cs[j]})
         return d
 
-    XtXinv = np.linalg.inv(X.T @ X)                       # day-clustered SE on the z*D interaction (col 1)
-    se = []; G = None
+    # day-clustered SE on the z*D interaction (col 1): meat from per-session cross-products,
+    # s_g = X_g' u_g = XtY_g - XtX_g B; same Liang-Zeger small-cluster correction as _cluster_se
+    XtXinv = np.linalg.pinv(XtX)
+    G = sum(1 for pg in per if pg["n"] > 0)
+    se = []
     for k in range(2):
-        se_k, G = _cluster_se(X, resid[:, k], groups, XtXinv)
-        se.append(float(se_k[1]))
+        meat = np.zeros((K, K))
+        for pg in per:
+            if pg["n"] == 0:
+                continue
+            s_g = pg["XtY"][:, k] - pg["XtX"] @ B[:, k]
+            meat += np.outer(s_g, s_g)
+        c = (G / (G - 1.0)) * ((n_all - 1.0) / (n_all - K)) if (G > 1 and n_all > K) else np.nan
+        V = (XtXinv @ meat @ XtXinv) * c
+        se.append(float(np.sqrt(max(V[1, 1], 0.0))))
     from scipy import stats as _stats
     pv = (lambda t: float(2.0 * _stats.t.sf(abs(t), df=G - 1))) if (G and G > 1) else (lambda t: float("nan"))
     ti_spy = alpha_int[0] / (se[0] + EPS); ti_es = alpha_int[1] / (se[1] + EPS)
     return {"alpha_benchmark": alpha_base, "alpha_volatile": alpha_vol,
-            "alpha_interaction": alpha_int, "n_lags": int(n_lags), "n_obs": int(dY.shape[0]),
+            "alpha_interaction": alpha_int, "n_lags": int(n_lags), "n_obs": int(n_all),
             "t_interaction_spy": ti_spy, "t_interaction_es": ti_es,
             "se_interaction_spy": se[0], "se_interaction_es": se[1],
             "p_interaction_spy": pv(ti_spy), "p_interaction_es": pv(ti_es),

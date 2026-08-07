@@ -131,7 +131,15 @@ def asset_fpca(df, asset, n_levels=10, side="both", representation="log", n_comp
 def fpc_state_series(df, asset, n_levels=10, k=1, side="both", representation="log"):
     """One asset's leading (k-th) FPC score: a data-driven scalar liquidity state
     (1s), oriented so higher = more total book depth. Drop-in for the per-asset
-    state in liquidity_conditional_vecm."""
+    state in liquidity_conditional_vecm.
+
+    FULL-SESSION LOOK-AHEAD, disclosed: the eigenfunctions (and the mean curve) are
+    estimated from the WHOLE session before any score is computed, so the state at 10:00
+    embeds book-shape modes fitted partly on 15:30 data. That is standard for functional
+    DESCRIPTIVE states and harmless for the within-day conditional estimators here (the
+    conditioning variable is deterministic given the day), but this state must NOT be used
+    as a real-time signal or in any forecasting exercise without re-fitting the FPCA on an
+    expanding window. The same applies to relative_fpc_state below."""
     res = asset_fpca(df, asset, n_levels, side, representation, n_components=max(k, 1))
     return res["scores"][:, k - 1]
 

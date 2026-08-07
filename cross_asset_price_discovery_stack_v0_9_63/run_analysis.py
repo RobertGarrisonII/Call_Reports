@@ -896,8 +896,14 @@ def run_stages(sessions, args, ts=None, t0=None):
         to_save = getattr(args, "_premask_sessions", None) or sessions
         _variant = "pre-mask" if getattr(args, "_premask_sessions", None) else \
             "as-estimated (no pre-mask list on args -- masked-at-rest if masking ran)"
-        with open(fpath, "wb") as fh:
+        # tmp + os.replace: this pickle is the file every downstream stage loads, and at a fine
+        # grid it is tens of GB -- a crash (or the OOM killer) mid-write used to leave a
+        # truncated frames_*.pkl that the driver's newest-first glob would then FIND and feed
+        # to STAGE 3, which dies on the partial pickle instead of falling back.
+        tmp = fpath + ".tmp%d" % os.getpid()
+        with open(tmp, "wb") as fh:
             pickle.dump([(str(d), r, f) for d, r, f in to_save], fh, protocol=4)
+        os.replace(tmp, fpath)
         LOG.info("Session frames -> %s  (%d session(s), %s, the List[(date, regime, df)] "
                  "shape --source load expects)", fpath, len(to_save), _variant)
 

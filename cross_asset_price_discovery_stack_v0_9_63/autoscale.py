@@ -143,7 +143,15 @@ def _clamp(x, lo, hi):
 
 
 def reserve_gb(ram=None):
-    """RAM held back for OS/parent/extraction-tool/fragmentation: ~1/8 RAM, clamped to [16, 48] GB."""
+    """RAM held back for OS/parent/extraction-tool/fragmentation: ~1/8 RAM, clamped to [16, 48] GB.
+
+    KNOWN LIMIT: the reserve models the parent as a fixed overhead, but the extraction PARENT
+    ACCUMULATES every completed session's frame (the results list) while workers keep peaking --
+    on a fine-grid run each finished 10ms frame adds GBs to the parent for the rest of the batch,
+    so late in a large batch the true reserve requirement grows past this clamp. If the OOM killer
+    takes a WORKER late in a fine run at the 'right' worker count, this accumulation is the likely
+    reason: lower WORKERS by one, or raise RESERVE_GB toward the summed size of the frames the run
+    will hold (sessions x ~frame GB at the target grid)."""
     ov = _env_int("RESERVE_GB")
     if ov is not None and ov >= 0:
         return ov

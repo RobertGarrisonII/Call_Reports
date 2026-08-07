@@ -1538,10 +1538,28 @@ def _parallel_sessions(func, items, n_jobs: int, backend: str, on_done):
         return results
     try:                                                   # process backend: joblib loky preferred
         from joblib import Parallel, delayed
-        for i, r in Parallel(n_jobs=n_jobs, return_as="generator_unordered")(
-                delayed(_idx_call)(i, func, it) for i, it in enumerate(items)):
-            results[i] = r; on_done(r)
-        return results
+        try:
+            for i, r in Parallel(n_jobs=n_jobs, return_as="generator_unordered")(
+                    delayed(_idx_call)(i, func, it) for i, it in enumerate(items)):
+                results[i] = r; on_done(r)
+            return results
+        except Exception as exc:
+            # A killed worker (the OOM reaper at this worker count, almost always) raises
+            # TerminatedWorkerError / BrokenProcessPool out of the GENERATOR -- which used to
+            # abort the whole batch, discarding every session already completed and paid for.
+            # Contain it: keep what finished, run the remainder sequentially in THIS process
+            # (bounded memory -- one session at a time), and say what happened and why.
+            if type(exc).__name__ not in ("TerminatedWorkerError", "BrokenProcessPool"):
+                raise
+            missing = [i for i in range(n) if results[i] is None]
+            log.error("worker pool died (%s) with %d/%d session(s) unfinished -- at this worker "
+                      "count that is usually the OOM killer. Completed sessions are KEPT; "
+                      "finishing the rest sequentially. Lower --max-workers (or the autoscale "
+                      "peak-GB guess) to avoid the slow path.",
+                      type(exc).__name__, len(missing), n)
+            for i in missing:
+                results[i] = func(items[i]); on_done(results[i])
+            return results
     except (ImportError, TypeError):                       # stdlib fallback (or old joblib w/o return_as)
         from concurrent.futures import ProcessPoolExecutor, as_completed
         with ProcessPoolExecutor(max_workers=n_jobs) as ex:

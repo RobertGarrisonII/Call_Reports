@@ -223,12 +223,29 @@ def build_svar_frame(df, spec="informational", n_levels=10, target_qty=None,
                              On a 10ms frame the sub-returns are the fine grid: the two-grid
                              design exists exactly so this estimator has them."""
     feats = PRESETS[spec] if isinstance(spec, str) else list(spec)
+    # Single-slot memo (v0.9.64): the day-cluster bootstrap resamples WHOLE sessions and
+    # rebuilds every drawn session's frame, so with corr_method='dcc' the GARCH was re-fit
+    # once per session per draw -- n_boot fits per estimator block, hours at 1s and weeks at
+    # 10ms, all returning the identical series. The session frame OBJECTS are shared across
+    # draws, so the last build is cached on df.attrs; one slot bounds extra residency at a
+    # single X per session while every draw inside an estimator block hits. Callers treat the
+    # returned X as read-only (all downstream ops -- X[:, keep], vstack, resampling -- copy).
+    key = (tuple(feats), int(n_levels), target_qty, str(corr_method), int(corr_window),
+           str(wspread_kind), int(bar_seconds), id(extra_fn) if extra_fn is not None else None)
+    cacheable = dcc_returns is None
+    if cacheable:
+        hit = df.attrs.get("_svar_frame_memo")
+        if hit is not None and hit[0] == key:
+            return hit[1]
     idx = df.index
     cols = {}
     r = {a: _returns_bps(df, a) for a in ("SPY", "ES")}
     if corr_method == "bar":
-        return _build_svar_frame_bar(df, feats, n_levels, target_qty, wspread_kind,
-                                     bar_seconds, extra_fn, r)
+        out = _build_svar_frame_bar(df, feats, n_levels, target_qty, wspread_kind,
+                                    bar_seconds, extra_fn, r)
+        if cacheable:
+            df.attrs["_svar_frame_memo"] = (key, out)
+        return out
     for a in ("ES", "SPY"):                                                    # futures first
         for f in feats:
             if f == "qspr":
@@ -262,7 +279,10 @@ def build_svar_frame(df, spec="informational", n_levels=10, target_qty=None,
     names = list(V.columns)                                                    # dCorr is last
     X = V.to_numpy()
     mask = np.all(np.isfinite(X), axis=1)
-    return X[mask], names, len(names) - 1
+    out = (X[mask], names, len(names) - 1)
+    if cacheable:
+        df.attrs["_svar_frame_memo"] = (key, out)
+    return out
 
 
 def _fisher_z(rho):
@@ -346,15 +366,26 @@ def _build_svar_frame_bar(df, feats, n_levels, target_qty, wspread_kind, bar_sec
 
 def _dcc_corr(df, r, dcc_returns):
     """DCC conditional correlation series (length len(df), leading NaN). Falls back to
-    NaN if dcc_garch is unavailable or the fit fails."""
+    NaN if dcc_garch is unavailable or the fit fails.
+
+    The fitted rho depends ONLY on the frame's returns, not on corr_window or the regressor
+    spec, so it memoizes on df.attrs independently of the frame memo above -- a spec or
+    window change re-assembles the frame but must not re-fit the GARCH."""
+    if dcc_returns is None:
+        hit = df.attrs.get("_dcc_rho_memo")
+        if hit is not None and len(hit) == len(df):
+            return hit
     try:
         import dcc_garch as dg
         ret = dcc_returns if dcc_returns is not None else np.column_stack(
             [np.diff(np.log(np.asarray(ca._mid(df, "SPY"), float))), np.diff(np.log(np.asarray(ca._mid(df, "ES"), float)))])
         fit = dg.dcc_garch_x(ret)
-        return np.concatenate([[np.nan], np.asarray(fit["rho"], float)])
+        out = np.concatenate([[np.nan], np.asarray(fit["rho"], float)])
     except Exception:
-        return np.full(len(df), np.nan)
+        out = np.full(len(df), np.nan)
+    if dcc_returns is None:
+        df.attrs["_dcc_rho_memo"] = out
+    return out
 
 
 # ── panel VAR design: within-day lags + day fixed effects ─────────────────────
@@ -391,45 +422,118 @@ def _panel_var_design(Xs, p, fe=True, start=None):
     return np.vstack(Ys), np.vstack(Zs), np.concatenate(Gs)
 
 
-def panel_var_ols(Xs, p, fe=True):
+def _panel_gram(Xs, p, fe=True, start=None, chunk=200_000):
+    """Accumulated cross-products (ZtZ, ZtY, YtY, n, k, n_sessions) of the exact design
+    ``_panel_var_design`` builds -- WITHOUT materializing it. The stacked design is rows x
+    (k*p [+1]); at a 10ms grid that is tens of GB per fit (and every concurrent bootstrap
+    draw built its own copy). The Grams are (k*p)^2 regardless of rows; the only O(rows)
+    work is chunked matmuls over views of each session's array. Column layout matches
+    _panel_var_design exactly ([intercept +] lag-1 block .. lag-p block), which
+    select_lag_var_panel exploits: the design for p' < p is a leading-column subset."""
+    st = int(p if start is None else max(start, p))
+    ZtZ = ZtY = YtY = None
+    n_rows = 0; n_sess = 0; k = None
+    for X in Xs:
+        X = np.asarray(X, float); T = X.shape[0]
+        if T <= st + 2:
+            continue
+        Xd = X - X.mean(axis=0) if fe else X
+        k = Xd.shape[1]
+        m = (0 if fe else 1) + k * p
+        if ZtZ is None:
+            ZtZ = np.zeros((m, m)); ZtY = np.zeros((m, k)); YtY = np.zeros((k, k))
+        n_g = T - st
+        for c0 in range(0, n_g, chunk):
+            c1 = min(c0 + chunk, n_g)
+            Y = Xd[st + c0: st + c1]
+            cols = [] if fe else [np.ones(c1 - c0)]
+            for L in range(1, p + 1):
+                cols.append(Xd[st - L + c0: st - L + c1])
+            Z = np.column_stack(cols) if cols else np.zeros((c1 - c0, 0))
+            ZtZ += Z.T @ Z
+            ZtY += Z.T @ Y
+            YtY += Y.T @ Y
+        n_rows += n_g; n_sess += 1
+    return ZtZ, ZtY, YtY, n_rows, k, n_sess
+
+
+def _gram_solve(ZtZ, ZtY, YtY):
+    """OLS slope + residual cross-product from Grams. -> (B, rss) with
+    rss = (Y-ZB)'(Y-ZB), symmetrized (the full quadratic form, exact under pinv too)."""
+    if ZtZ is None or ZtZ.shape[0] == 0:
+        return np.zeros((0, YtY.shape[0])), YtY.copy()
+    try:
+        B = np.linalg.solve(ZtZ, ZtY)
+    except np.linalg.LinAlgError:
+        B = np.linalg.pinv(ZtZ) @ ZtY
+    rss = YtY - ZtY.T @ B - B.T @ ZtY + B.T @ ZtZ @ B
+    return B, (rss + rss.T) / 2.0
+
+
+def panel_var_ols(Xs, p, fe=True, return_resid=False, chunk=200_000):
     """Pooled VAR(p) on the panel design (within-day lags, day FE). Returns
     (A list, Sigma, resid, groups) -- the same contract as ``var_ols`` plus the day id
-    per residual row, so day-cluster machinery can consume it."""
-    Y, Z, groups = _panel_var_design(Xs, p, fe=fe)
-    if Y is None:
+    per residual row, so day-cluster machinery can consume it.
+
+    v0.9.64: estimated from per-session accumulated Grams (see ``_panel_gram``) so the
+    stacked rows x k*p design is never materialized. ``resid``/``groups`` are None unless
+    ``return_resid=True`` (they are the only O(rows) output; every current caller discards
+    them, and each concurrent bootstrap draw used to hold its own multi-GB design)."""
+    ZtZ, ZtY, YtY, n, k, n_sess = _panel_gram(Xs, p, fe=fe, chunk=chunk)
+    if n == 0 or k is None:
         raise ValueError("no session long enough for the requested lag order")
-    k = Y.shape[1]
-    if Z.shape[1] == 0:
-        resid = Y
-        A = []
-    else:
-        B, resid = pds._ols(Y, Z)
-        off = 0 if fe else 1
-        A = [B[off + (i - 1) * k: off + i * k, :].T for i in range(1, p + 1)]
-    dof = max(resid.shape[0] - Z.shape[1] - (len(Xs) * k if fe else 0) // max(k, 1), 1)
-    Sigma = (resid.T @ resid) / dof
+    B, rss = _gram_solve(ZtZ, ZtY, YtY)
+    off = 0 if fe else 1
+    A = [B[off + (i - 1) * k: off + i * k, :].T for i in range(1, p + 1)]
+    m = ZtZ.shape[0] if ZtZ is not None else 0
+    dof = max(n - m - (n_sess * k if fe else 0) // max(k, 1), 1)
+    Sigma = rss / dof
+    resid = groups = None
+    if return_resid:
+        st = p
+        rs, gs = [], []
+        for g, X in enumerate(Xs):
+            X = np.asarray(X, float); T = X.shape[0]
+            if T <= st + 2:
+                continue
+            Xd = X - X.mean(axis=0) if fe else X
+            cols = [] if fe else [np.ones(T - st)]
+            for L in range(1, p + 1):
+                cols.append(Xd[st - L:T - L])
+            Z = np.column_stack(cols) if cols else np.zeros((T - st, 0))
+            rs.append(Xd[st:] - (Z @ B if Z.shape[1] else 0.0))
+            gs.append(np.full(T - st, g))
+        resid = np.vstack(rs); groups = np.concatenate(gs)
     return A, Sigma, resid, groups
 
 
-def select_lag_var_panel(Xs, pmax=12, criterion="bic", fe=True):
+def select_lag_var_panel(Xs, pmax=12, criterion="bic", fe=True, chunk=200_000):
     """Lag-order selection on the PANEL design: every candidate scored on the common
     sample (rows pmax.. per session), lags within-day, day FE. The stacked-selection it
-    replaces scored candidates whose lag windows crossed the overnight seams."""
+    replaces scored candidates whose lag windows crossed the overnight seams.
+
+    v0.9.64: the Grams are accumulated ONCE at pmax and every candidate p is scored by
+    taking the leading ([intercept +] p*k)-column submatrices -- the common-sample design
+    for p is exactly that subset. One pass over the data instead of pmax+1 stacked builds
+    (which at a 10ms grid transiently held tens of GB per candidate)."""
+    ZtZ, ZtY, YtY, n, k, _ = _panel_gram(Xs, pmax, fe=fe, start=pmax, chunk=chunk)
     rows = []
+    off = 0 if fe else 1
     for p in range(0, pmax + 1):
-        Y, Z, _ = _panel_var_design(Xs, p, fe=fe, start=pmax)
-        if Y is None or Y.shape[0] < Z.shape[1] + 5:
+        if n == 0 or k is None:
             rows.append((p, np.nan, np.nan, np.nan, np.nan)); continue
-        if Z.shape[1]:
-            _, resid = pds._ols(Y, Z)
+        m = off + k * p
+        if n < m + 5:
+            rows.append((p, np.nan, np.nan, np.nan, np.nan)); continue
+        if m == 0:
+            Sig = YtY / n
         else:
-            resid = Y
-        n, k = resid.shape
-        Sig = (resid.T @ resid) / n
+            _B, rss = _gram_solve(ZtZ[:m, :m], ZtY[:m], YtY)
+            Sig = rss / n
         sign, ld = np.linalg.slogdet(Sig + np.eye(k) * EPS)
         if sign <= 0:
             rows.append((p, np.nan, np.nan, np.nan, np.nan)); continue
-        K = Z.shape[1] * k                           # free slope params across equations
+        K = m * k                                    # free slope params across equations
         aic = ld + 2.0 * K / n
         bic = ld + np.log(n) * K / n
         hq = ld + 2.0 * np.log(np.log(max(n, 3))) * K / n

@@ -361,18 +361,28 @@ def mask_frame(df, assets=("SPY", "ES"), tz: str = TZ):
     if df is None or len(df) == 0:
         return df, rep
     attrs = df.attrs if hasattr(df, "attrs") else {}
-    out = df.copy()
-    out.attrs = dict(attrs)
     _MARKET = ("price", "quantity", "mid", "nbbo", "trade", "vwap", "px", "ofi")
+    # Resolve every leg's mask FIRST and copy only if something will actually be NaN'd
+    # (v0.9.64). Most sessions have no halt, and the unconditional df.copy() held premask
+    # and masked frames simultaneously -- at a 10ms grid that is GBs per session of pure
+    # no-op residency. On the no-halt path the ORIGINAL frame is returned (attrs annotated);
+    # callers already treat the return as their new reference, not a scratch buffer.
+    todo = []
     for a in assets:
         key = f"halt_windows_{a}"
         wins = attrs[key] if key in attrs else attrs.get("halt_windows")
         wins = [(pd.Timestamp(x), pd.Timestamp(y)) for x, y in wins] if wins else None
         if wins is None and key in attrs:            # positive empty: this leg did not halt
             continue
-        m = halt_mask(out.index, windows=wins, tz=tz)
-        if not m.any():
-            continue
+        m = halt_mask(df.index, windows=wins, tz=tz)
+        if m.any():
+            todo.append((a, m))
+    if not todo:
+        df.attrs["halt_masked"] = dict(rep)
+        return df, rep
+    out = df.copy()
+    out.attrs = dict(attrs)
+    for a, m in todo:
         cols = [c for c in out.columns if c.startswith(f"{a}_")
                 and any(t in c.lower() for t in _MARKET)
                 and not c.lower().endswith(("_ssr",)) and "_luld" not in c.lower()]
