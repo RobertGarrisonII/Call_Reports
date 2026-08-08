@@ -23,25 +23,47 @@ EPS = 1e-10
 
 # ── univariate GARCH(1,1)-X ──────────────────────────────────────────────────
 def _garch_filter(eps, omega, alpha, beta, gamma, X):
-    """GARCH(1,1)-X conditional-variance recursion, driven off Python floats.
+    """GARCH(1,1)-X conditional-variance recursion.
 
-    Sequential, so it cannot be vectorised -- but the loop body must not touch numpy. Indexing a
-    numpy array element-wise boxes a fresh Python float per access, and this is the single hottest
-    function in the stack: 65% of a `mean_variance` run, called ~2,200 times per fit by the
-    L-BFGS numerical gradients. The boxing is also what made the per-session process pool scale so
-    poorly (per-fit time 18.3s alone -> 57.7s with four workers): the cost is allocator and memory
-    traffic, a resource the workers share, not arithmetic, which they do not. Squaring is hoisted
-    out as one vectorised op and the rest runs on lists, so the arithmetic and its ordering are
-    unchanged -- bit-identical output, and it speeds up the serial path as well as the pooled one."""
+    FAST PATH (v0.9.66): h_t = om + al*e2_{t-1} + be*h_{t-1} + xg_{t-1} is a LINEAR
+    constant-coefficient AR(1) in h, i.e. exactly ``scipy.signal.lfilter`` -- C speed instead
+    of a T-step Python loop re-run ~2,000 times per fit by the numerical gradients. At a 10ms
+    grid (T ~ 2.3M) the loop made ONE marginal fit take ~40 minutes and STAGE 5's fine Table 9
+    hang for days; the filter does the same arithmetic in ~10ms. The floor is the recursion's
+    only nonlinearity and never binds on standardized data with admissible parameters, so:
+    filter first, and only if the floor WOULD have engaged (min h <= EPS, or non-finite) fall
+    back to the exact floored loop. Fast-path numbers are identical by construction -- the
+    same first-order recurrence evaluated in the same order.
+    """
     eps = np.asarray(eps, float)
     T = len(eps)
     v = np.var(eps)
     h0 = float(v + EPS) if (np.isfinite(v) and v > 0) else float(EPS)
     if T <= 1:
         return np.full(max(T, 0), h0)
-    e2 = (eps * eps).tolist()                                # one vectorised square, then plain floats
-    xg = [0.0] * T if X is None else (X @ np.atleast_1d(gamma)).tolist()
-    om = float(omega); al = float(alpha); be = float(beta); eps_f = float(EPS)
+    e2v = eps * eps
+    xgv = None if X is None else np.asarray(X @ np.atleast_1d(gamma), float)
+    om = float(omega); al = float(alpha); be = float(beta)
+    if 0.0 <= be < 1.0 and np.isfinite(om) and np.isfinite(al):
+        from scipy.signal import lfilter
+        u = om + al * e2v[:-1]
+        if xgv is not None:
+            u = u + xgv[:-1]
+        rest, _zf = lfilter([1.0], [1.0, -be], u, zi=np.array([be * h0]))
+        h = np.empty(T); h[0] = h0; h[1:] = rest
+        if np.all(np.isfinite(h)) and float(h.min()) > EPS:
+            return h
+    return _garch_filter_loop(e2v, h0, om, al, be, xgv)
+
+
+def _garch_filter_loop(e2v, h0, om, al, be, xgv):
+    """The exact floored recursion, as plain Python floats (the pre-v0.9.66 hot loop, kept as
+    the fallback for parameter corners where the variance floor engages, and as the reference
+    implementation the fast path is gated against)."""
+    T = len(e2v)
+    e2 = e2v.tolist()
+    xg = [0.0] * T if xgv is None else xgv.tolist()
+    eps_f = float(EPS)
     out = [h0] * T
     prev = h0
     for t in range(1, T):
@@ -105,20 +127,36 @@ def garch_x_fit(eps, X=None):
 
 # ── DCC(1,1) second stage ────────────────────────────────────────────────────
 def _dcc_corr_path(Z, a, b):
-    """Bivariate DCC correlation path r_t, as three running scalars instead of 2x2 arrays.
+    """Bivariate DCC correlation path r_t.
 
-    The Q recursion is inherently sequential, so the loop cannot be vectorised -- but at k=2 the
-    state is only (q11, q12, q22), and carrying it as Python floats removes ~8 numpy dispatches
-    per bar. That dispatch overhead, not the algebra, is what made a DCC fit take ~25 s at
-    T=1300 and left mean_variance.py unable to finish: `_dcc_filter` is called afresh inside
-    EVERY likelihood evaluation, so the per-bar constant is multiplied by several hundred
-    thousand. Same recursion, same numbers."""
+    FAST PATH (v0.9.66): each Q component follows the same LINEAR AR(1) recursion
+    q_t = c + a*news_{t-1} + b*q_{t-1}, so all three run through ``scipy.signal.lfilter`` at
+    C speed and rho vectorizes afterwards -- same recurrence, same evaluation order, same
+    numbers. This is inside EVERY likelihood evaluation of the Engle fit; at 10ms lengths the
+    per-eval Python loop was seconds, times hundreds of Nelder-Mead evaluations."""
     Z = np.asarray(Z, float)
     T = Z.shape[0]
     z0, z1 = Z[:, 0], Z[:, 1]
     b11 = float(np.dot(z0, z0) / T); b12 = float(np.dot(z0, z1) / T); b22 = float(np.dot(z1, z1) / T)
     om = 1.0 - a - b
     c11, c12, c22 = om * b11, om * b12, om * b22
+    if T > 1 and 0.0 <= b < 1.0 and np.isfinite(a) and np.isfinite(b):
+        from scipy.signal import lfilter
+        den = [1.0, -b]
+        q11 = np.empty(T); q12 = np.empty(T); q22 = np.empty(T)
+        q11[0], q12[0], q22[0] = b11, b12, b22
+        q11[1:], _ = lfilter([1.0], den, c11 + a * z0[:-1] * z0[:-1], zi=np.array([b * b11]))
+        q12[1:], _ = lfilter([1.0], den, c12 + a * z0[:-1] * z1[:-1], zi=np.array([b * b12]))
+        q22[1:], _ = lfilter([1.0], den, c22 + a * z1[:-1] * z1[:-1], zi=np.array([b * b22]))
+        d = np.sqrt(np.maximum(q11, EPS) * np.maximum(q22, EPS))
+        return np.clip(q12 / d, -1.0, 1.0)
+    return _dcc_corr_path_loop(z0, z1, b11, b12, b22, c11, c12, c22, a, b)
+
+
+def _dcc_corr_path_loop(z0, z1, b11, b12, b22, c11, c12, c22, a, b):
+    """The pre-v0.9.66 scalar loop, kept as the fallback for pathological (a, b) and as the
+    reference the fast path is gated against."""
+    T = len(z0)
     q11, q12, q22 = b11, b12, b22
     r = np.empty(T)
     for t in range(T):

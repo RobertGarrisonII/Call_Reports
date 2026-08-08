@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.9.66 -- the STAGE 5 hang: DCC at C speed, and a fine-grid budget
+
+A real run sat in STAGE 5 for 24+ hours. Root cause, in the code's own audit vocabulary: the
+GARCH/DCC filters are per-bar Python loops re-run inside EVERY likelihood evaluation, and at
+the 10ms grid (~2.3M bars/session) one GARCH marginal fit took ~40 minutes -- x2 legs x24
+sessions before any bootstrap. (Runs on pre-v0.9.64 code hit the other known form: the DCC
+re-fit per session per bootstrap draw that the memo fixed.)
+
+* **lfilter fast paths, exact by construction.** The GARCH(1,1)-X variance recursion and the
+  Engle-DCC Q recursions are LINEAR constant-coefficient AR(1)s in their state, i.e. exactly
+  `scipy.signal.lfilter` -- same recurrence, same evaluation order, C speed. A full
+  `garch_x_fit` at T=2.34M drops from ~40 min to ~13 s (~190x). The variance floor is the one
+  nonlinearity: the filter runs first and falls back to the exact floored loop only if the
+  floor would have engaged; both reference loops are kept and the fast paths are gated
+  against them to 1e-13.
+* **Fine-grid Table 9 gets a BUDGET** (the driver, STAGE 5): `--no-dcc` by default at the fine
+  grid -- the cDCC second stage is inherently sequential (its news term feeds back through
+  Q's own diagonal), so it remains hours/session at 10ms even with the fast GARCH, and a 10ms
+  conditional-correlation path mostly measures ES tick staleness anyway (the same reason
+  STAGE 6b's curated list excludes dcc). RealBar is the fine grid's lag-robust column by
+  design. `FINE_T9_DCC=1` opts back in; `FINE_N_BOOT` (default 199) caps the fine bootstrap
+  (each fine draw refits the pooled panel on ~56M rows; the Epps GAP is a point-estimate
+  contrast). The 1s pass keeps `N_BOOT` and the DCC column, both now fast.
+* **A long estimation is now watchable**: `table_correlation_irf_both_ways` prints a flushed
+  per-column heartbeat (start, method, n_boot, elapsed) and a mean-group marker, so the
+  console between the lag table and the finished exhibit is no longer indistinguishable from
+  a hang.
+* Note for the constant-correlation gate: with the properly-scaled GARCH (v0.9.65) the DCC
+  column's selected lag on null data is ~5 -- small and WINDOW-INDEPENDENT (the recursion's
+  own smoothing), not the old p*~1 of the degenerate fit; test_svar_lag_artifact and the
+  STAGE 4c caution text were updated in v0.9.65 accordingly.
+
 ## v0.9.65 -- the three missing audit lenses, and the improvements batch
 
 The v0.9.64 audit ran seven of its ten finder lenses; this release runs the missing three

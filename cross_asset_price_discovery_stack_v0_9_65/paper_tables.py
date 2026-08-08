@@ -270,12 +270,22 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
     base = ("Impact" if not cumulative else f"Cumulative ({horizon}-step)") + \
            f" orthogonalized response of d-correlation, x100; identification = {ident}; VAR({n_lags})." + lag_note
     out, nums = {}, {}
+    import time as _time
     for label, method in methods:
+        # Flushed progress heartbeat (v0.9.66, after a silent 24h STAGE 5): each estimator
+        # block is minutes at 1s and can be HOURS at 10ms with a bootstrap -- without these
+        # lines the console shows nothing between the lag table and the finished exhibit,
+        # which is indistinguishable from a hang.
+        _t0 = _time.time()
+        print("  [table9] %s column: estimating (%s, n_boot=%d) ..."
+              % (label, method, int(n_boot or 0)), flush=True)
         if n_boot and n_boot > 0:
             res = csv.correlation_irf_inference(sessions, corr_method=method, n_boot=n_boot,
                                                 alpha=0.10, **kw)
             pt = res["point"]
             if pt.empty:
+                print("  [table9] %s column: EMPTY (no regime had enough observations, %.0fs)"
+                      % (label, _time.time() - _t0), flush=True)
                 continue
             nums[label] = pt
             disp = res["table"]
@@ -283,9 +293,12 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
             pt = csv.correlation_irf(sessions, corr_method=method,
                                      **{k: v for k, v in kw.items() if k not in ("seed", "n_jobs")})
             if pt.empty:
+                print("  [table9] %s column: EMPTY (no regime had enough observations, %.0fs)"
+                      % (label, _time.time() - _t0), flush=True)
                 continue
             nums[label] = pt
             disp = _fmt_df(pt, 3)
+        print("  [table9] %s column: done (%.0fs)" % (label, _time.time() - _t0), flush=True)
         for c in disp.columns:
             out[(label, str(c))] = disp[c]
     if not nums:
@@ -318,6 +331,7 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
                  "pre-v0.9.63 stacked estimation.")
     tbl = Table(title, disp, note, numeric=nums.get("Pearson"))
     if mean_group:
+        print("  [table9] mean-group block: per-day SVARs ...", flush=True)
         mg = csv.correlation_irf_mean_group(sessions, spec=spec, n_lags=n_lags, horizon=horizon,
                                             ident=ident, cumulative=cumulative,
                                             corr_method="bar" if with_bar else "rolling",

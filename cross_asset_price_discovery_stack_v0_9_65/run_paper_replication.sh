@@ -81,6 +81,8 @@
 #   PYTHON=python3            interpreter (default: python3)
 #   N_JOBS=8                  bootstrap/extraction workers (default: all cores)
 #   MST_LAKEQUERY_RETRIES=3   vendor-query attempts before a fetch is believed to have failed
+#   FINE_N_BOOT=199           bootstrap draws for the FINE-grid Table 9 (1s keeps N_BOOT)
+#   FINE_T9_DCC=1             re-enable the DCC column at the fine grid (hours/session; see STAGE 5)
 #   MST_LAKEQUERY_BACKOFF=5   seconds before the first retry (doubles each attempt)
 # ==============================================================================
 set -euo pipefail
@@ -946,9 +948,24 @@ if have_stage 5; then
     # fallback so hand-extracted fine frames beside the 1s pickle are still found.
     FINE_T9="${FINE_FRAMES:-${FRAMES/1s/${FINE_INTERVAL}}}"
     if [ -n "$FINE_T9" ] && [ "$FINE_T9" != "$FRAMES" ] && { [ "$DRY" -eq 1 ] || [ -f "$FINE_T9" ]; }; then
+      # FINE-GRID BUDGET (v0.9.66, after a real 24h+ hang here). Two overrides on the shared
+      # T9ARGS, appended so argparse's last-wins takes them:
+      #   --no-dcc      The cDCC second stage is inherently sequential (its news term feeds
+      #                 back through Q's own diagonal), so at ~2.3M bars each of hundreds of
+      #                 likelihood evaluations walks the full series -- hours per session even
+      #                 with the v0.9.66 lfilter GARCH. And statistically, ~99% of 10ms ES
+      #                 snapshots are stale tick repeats, so a 10ms conditional-correlation
+      #                 path mostly measures staleness. RealBar is the fine grid's lag-robust
+      #                 column BY DESIGN; DCC stays default-ON at 1s, where it is meaningful
+      #                 and (post-lfilter) fast. FINE_T9_DCC=1 opts back in, cost accepted.
+      #   --n-boot      FINE_N_BOOT (default 199): each fine draw refits the pooled panel on
+      #                 ~56M rows; 199 draws bound the fine pair to hours, not days, and the
+      #                 Epps GAP -- the point of this pass -- is a point-estimate contrast.
+      FINE_T9_EXTRA="--n-boot ${FINE_N_BOOT:-199}"
+      [ "${FINE_T9_DCC:-0}" != "1" ] && FINE_T9_EXTRA="$FINE_T9_EXTRA --no-dcc"
       # shellcheck disable=SC2086
       run_show $PY run_table9_both_ways.py --source load --pickle "$FINE_T9" \
-          --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS \
+          --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS $FINE_T9_EXTRA \
         || info "STAGE 5 (${FINE_INTERVAL} Table 9) FAILED -- see $LOG; continuing"
     else
       info "no ${FINE_INTERVAL} frames found — re-run --source extract (STAGE 2b extracts them) for"

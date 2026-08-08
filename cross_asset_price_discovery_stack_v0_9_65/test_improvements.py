@@ -281,11 +281,51 @@ def check_memo_soundness():
     return ok
 
 
+def check_lfilter_fast_paths():
+    """v0.9.66 (the 24h STAGE 5 hang): the GARCH and Engle-DCC recursions run through
+    scipy.signal.lfilter -- same recurrence, same evaluation order, C speed. The fast paths
+    must MATCH the reference loops exactly, fall back when the variance floor engages, and
+    the driver must budget the fine-grid Table 9 (--no-dcc + FINE_N_BOOT)."""
+    import dcc_garch as dg
+    rng = np.random.default_rng(0)
+    e = rng.normal(0, 1, 30_000)
+    ok_g = True
+    for om, al, be in ((0.05, 0.08, 0.90), (0.1, 0.0, 0.0), (1e-9, 0.05, 0.94)):
+        fast = dg._garch_filter(e, om, al, be, 0.0, None)
+        h0 = float(np.var(e) + dg.EPS)
+        loop = dg._garch_filter_loop(e * e, h0, om, al, be, None)
+        ok_g &= np.allclose(fast, loop, rtol=0, atol=1e-13)
+    e_deg = np.zeros(500); e_deg[::50] = 1e-8                # floor binds -> fallback path
+    fast_d = dg._garch_filter(e_deg, 1e-12, 0.0, 0.5, 0.0, None)
+    loop_d = dg._garch_filter_loop(e_deg * e_deg, float(np.var(e_deg) + dg.EPS),
+                                   1e-12, 0.0, 0.5, None)
+    ok_floor = np.array_equal(fast_d, loop_d)
+    Z = rng.normal(size=(30_000, 2)); Z[:, 1] = 0.6 * Z[:, 0] + 0.8 * Z[:, 1]
+    z0, z1 = Z[:, 0], Z[:, 1]; T = len(Z)
+    ok_d = True
+    for a, b in ((0.04, 0.93), (0.0, 0.0), (0.2, 0.6)):
+        b11 = float(z0 @ z0 / T); b12 = float(z0 @ z1 / T); b22 = float(z1 @ z1 / T)
+        om_ = 1 - a - b
+        fast = dg._dcc_corr_path(Z, a, b)
+        loop = dg._dcc_corr_path_loop(z0, z1, b11, b12, b22,
+                                      om_ * b11, om_ * b12, om_ * b22, a, b)
+        ok_d &= np.allclose(fast, loop, rtol=0, atol=1e-12)
+    with open(os.path.join(HERE, "run_paper_replication.sh")) as fh:
+        drv = fh.read()
+    budget = "FINE_T9_EXTRA" in drv and "FINE_N_BOOT" in drv and "FINE_T9_DCC" in drv
+    ok = ok_g and ok_floor and ok_d and budget
+    print("(12) lfilter fast paths: GARCH filter == loop across params (%s), floor-binding "
+          "fallback identical (%s), DCC path == loop (%s); driver budgets the fine Table 9 "
+          "(%s) : %s" % (ok_g, ok_floor, ok_d, budget, ok))
+    return ok
+
+
 def main():
     checks = [check_gfevd, check_weighted_mean_group, check_rigobon_overid_row,
               check_realbar_lag_diagnostic, check_gram_conditioning, check_rank_sample,
               check_garch_scale_invariance, check_dcc_masked_alignment,
-              check_is_relative_guard, check_romano_wolf_degenerate, check_memo_soundness]
+              check_is_relative_guard, check_romano_wolf_degenerate, check_memo_soundness,
+              check_lfilter_fast_paths]
     res = []
     for fn in checks:
         try:
