@@ -32,6 +32,25 @@ re-fit per session per bootstrap draw that the memo fixed.)
   own smoothing), not the old p*~1 of the degenerate fit; test_svar_lag_artifact and the
   STAGE 4c caution text were updated in v0.9.65 accordingly.
 
+### Found in the first full v0.9.65 run's log
+
+* **No frame was EVER source-tagged, so every run re-paid the full vendor pull.** The ES
+  book-source tag was gated on `locals().get("_es_from_ladder")` -- a variable a refactor had
+  removed -- so since v0.9.46: (a) the completion line misreported `ES book=replay` while the
+  ES leg was really the CME ladder; (b) session_qc's ladder-specific checks (monotone depth,
+  coverage, staleness) never engaged; (c) the cache resume rejected EVERY cached frame as
+  "predates tagging" and re-extracted the whole sample every run -- including defeating
+  pull-once (the freshly DERIVED coarse caches were rejected one second after being written,
+  and the observed run re-pulled all 24 sessions at 1s for ~3 hours). The tag is now written
+  from the branch actually taken; untagged frames sitting at the SOURCE-KEYED cache filename
+  (which only a run requesting that source ever writes -- the build branch has no fallback)
+  are accepted and HEALED in place, so existing caches from v0.9.46-65 runs become usable
+  instead of dead weight; legacy-named untagged files still re-extract (genuinely unknowable).
+* **derive_coarse_frame defragmented**: per-column insertion into a live frame emitted a
+  pandas PerformanceWarning per column per session (thousands of log lines on a 24-session
+  run) and paid a consolidation per insert; columns are now collected and materialized once.
+  Same values, same order, pinned by the no-warning gate.
+
 ## v0.9.65 -- the three missing audit lenses, and the improvements batch
 
 The v0.9.64 audit ran seven of its ten finder lenses; this release runs the missing three

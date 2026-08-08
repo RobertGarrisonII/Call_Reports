@@ -1284,21 +1284,39 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
             df = pd.read_pickle(_cp)
             _got_src = df.attrs.get("book_source_ES") if hasattr(df, "attrs") else None
             if _got_src != _want_src:
-                if _got_src is None:
-                    # v0.9.42-45 frames: the join dropped the ES frame's attrs, so a frame from that
-                    # window cannot PROVE which source built it -- and a pre-v0.9.42 replay frame
-                    # looks exactly the same. Mixed sources in one dataset is the inconsistency the
-                    # aggregated default exists to prevent, so unknown re-extracts. One-time cost:
-                    # frames written from v0.9.46 on always carry the tag.
-                    log.warning("%s: cached frame at %s predates ES book-source tagging and cannot "
-                                "prove which source built it -- re-extracting once; the fresh frame "
+                if _got_src is None and _cp == cpath:
+                    # UNTAGGED but at the SOURCE-KEYED filename. The source-keyed name has only
+                    # ever been written by a run that REQUESTED that source, and the build branch
+                    # is deterministic (no fallback), so name == request == actual. And
+                    # v0.9.46-65 had a tagging bug (the tag gated on a variable a refactor
+                    # removed), so every frame those versions cached is untagged -- rejecting
+                    # them re-extracted the ENTIRE sample on every run, 10-25 min of vendor I/O
+                    # per session for data already on disk. Accept, tag in memory, and HEAL the
+                    # cache file so the next resume hits without this branch.
+                    df.attrs["book_source_ES"] = _want_src
+                    try:
+                        _tmp = _cp + ".tag%d" % os.getpid()
+                        df.to_pickle(_tmp)
+                        os.replace(_tmp, _cp)
+                        log.info("%s: cached frame accepted by its source-keyed name and healed "
+                                 "with book_source_ES=%s (%s)", label, _want_src, _cp)
+                    except OSError as _exc:
+                        log.info("%s: cached frame accepted by name; tag heal failed (%s) -- "
+                                 "will re-heal next run", label, _exc)
+                elif _got_src is None:
+                    # LEGACY-named file with no tag: genuinely unknowable (pre-v0.9.42 replay
+                    # frames look identical). Mixed sources in one dataset is the inconsistency
+                    # the aggregated default exists to prevent, so unknown re-extracts.
+                    log.warning("%s: legacy-named cached frame at %s carries no source tag and "
+                                "its name proves nothing -- re-extracting once; the fresh frame "
                                 "is tagged and future resumes will hit", label, _cp)
+                    continue
                 else:
                     log.warning("%s: cached frame at %s was built with es_book_source=%s but this "
                                 "run asked for %s -- re-extracting rather than silently reusing it "
                                 "(the two carry identical columns, so nothing downstream would "
                                 "notice)", label, _cp, _got_src, _want_src)
-                continue
+                    continue
             qc = session_qc(df)
             progress_cb("DONE (cache hit)")
             return (label, regime, df, "reused cached %s: %d rows (%s)" % (label, len(df), _cp), None, qc)
@@ -1329,12 +1347,14 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
     # benchmark the replay was measured against. See aggregated_book.py for what is given up.
     if cfg.get("es_book_source", "aggregated") == "aggregated":
         import aggregated_book as ab
+        _es_source_used = "aggregated"
         es = ab.session_from_aggregated(ymd, contract, "futures", levels=cfg["levels"],
                                         interval=cfg["interval"],
                                         session=(cfg["start_time"], cfg["end_time"]), tz=cfg["tz"],
                                         data_source=cfg["data_source"], clock=cfg["clock"],
                                         price_scale=cfg["futures_scale"], progress_cb=progress_cb)
     else:
+        _es_source_used = "replay"
         # the message replay, kept reachable: --es-book-source replay. Needed if a future question
         # asks for futures QUEUE dynamics, which the aggregated ladder cannot answer.
         es = lob.reconstruct_session(ymd, contract, "futures", levels=cfg["levels"],
@@ -1451,8 +1471,12 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
     df.attrs["roll_offset_days"] = int(_roll_d)
     if _roll_rep is not None:                      # in a roll window and the measurement ran
         df.attrs["roll_measurement"] = _roll_rep
-    if locals().get("_es_from_ladder"):            # so session_qc knows to run the LADDER checks
-        df.attrs["book_source_ES"] = "aggregated"  # (the crossed test is vacuous on that leg)
+    # Tag with the source that ACTUALLY built the ES leg. v0.9.46-65 gated this on
+    # `locals().get("_es_from_ladder")` -- a variable a refactor had removed -- so NO frame was
+    # ever tagged: the completion line misreported 'ES book=replay' on ladder frames, the
+    # ladder-specific QC checks never engaged, and the cache resume rejected every cached frame
+    # as 'predates tagging', silently re-paying the full vendor pull on EVERY run.
+    df.attrs["book_source_ES"] = _es_source_used   # session_qc keys the LADDER checks on this
     progress_cb("qc")
     qc = session_qc(df, crossed_tol=float(cfg.get("crossed_tol", 0.005)))
     df.attrs["qc"] = qc
@@ -1462,7 +1486,7 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
     # The ES book source goes in the completion line because the log is where a reader learns it.
     # The 2026-08-04 run printed "book=reconstruct" on all 24 sessions while every ES leg came from
     # the ladder -- the string was hardcoded from the pre-v0.9.42 path.
-    _src = df.attrs.get("book_source_ES", "replay")
+    _src = df.attrs.get("book_source_ES", "UNTAGGED")
     diag = ("extracted %s (ES=%s, ES book=%s): %d rows, flow=%s | median SPY=%.2f ES=%.2f "
             "(ES/SPY=%.1f)" % (label, contract, _src, len(df), cfg["with_flow"], med_spy, med_es, ratio))
     warns = []

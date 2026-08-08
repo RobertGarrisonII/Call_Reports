@@ -89,15 +89,19 @@ def derive_coarse_frame(fine: pd.DataFrame, target: str, fine_interval: str | No
     if len(missing):
         raise ValueError("coarse grid points absent from the fine index (misaligned grids): "
                          + str(missing[:3].tolist()))
-    out = pd.DataFrame(index=coarse_idx)
     sum_cols = [c for c in fine.columns if c.endswith(SUM_SUFFIXES)]
     px_cols = [c for c in fine.columns if c.endswith(PX_SUFFIX)]
     vwap_cols = [c for c in fine.columns if c.endswith(VWAP_SUFFIX)]
     state_cols = [c for c in fine.columns if c not in set(sum_cols) | set(px_cols) | set(vwap_cols)]
+    # Columns are collected in a dict and materialized ONCE (v0.9.66): per-column insertion
+    # into a live DataFrame fragmented it into ~200 single-column blocks, spamming a
+    # PerformanceWarning per column per session (thousands of log lines on a 24-session run)
+    # and costing a consolidation per insert. Same values, same column order.
+    cols = {}
     # state/book: the coarse row IS the fine row at the same timestamp
     sel = fine.loc[coarse_idx, state_cols]
     for c in state_cols:
-        out[c] = sel[c].to_numpy()
+        cols[c] = sel[c].to_numpy()
     # flow: left-labeled bins -> group sub-bins by their floor onto the coarse grid
     if sum_cols or px_cols or vwap_cols:
         key = fine.index.floor(freq)
@@ -111,9 +115,9 @@ def derive_coarse_frame(fine: pd.DataFrame, target: str, fine_interval: str | No
             # their sums stay 0.0 and derived == direct exactly.
             nf = fine[c].notna().groupby(key).sum().reindex(coarse_idx).fillna(0)
             s[nf == 0] = np.nan
-            out[c] = s.to_numpy()
+            cols[c] = s.to_numpy()
         for c in px_cols:
-            out[c] = g[c].last().reindex(coarse_idx).to_numpy()      # .last() skips NaN
+            cols[c] = g[c].last().reindex(coarse_idx).to_numpy()     # .last() skips NaN
         for c in vwap_cols:
             root = c[: -len(VWAP_SUFFIX)]
             bv, sv = f"{root}_trade_buy_volume", f"{root}_trade_sell_volume"
@@ -122,9 +126,10 @@ def derive_coarse_frame(fine: pd.DataFrame, target: str, fine_interval: str | No
                 num = (fine[c] * w).groupby(key).sum().reindex(coarse_idx)
                 den = w.groupby(key).sum().reindex(coarse_idx)
                 with np.errstate(invalid="ignore", divide="ignore"):
-                    out[c] = (num / den.where(den > 0)).to_numpy()
+                    cols[c] = (num / den.where(den > 0)).to_numpy()
             else:
-                out[c] = g[c].last().reindex(coarse_idx).to_numpy()
+                cols[c] = g[c].last().reindex(coarse_idx).to_numpy()
+    out = pd.DataFrame(cols, index=coarse_idx)
     # estimation memos (correlation_svar caches X/rho on attrs) must NOT travel onto a frame
     # with different data -- their fingerprint would go stale anyway, but a memoized fine-grid
     # X is hundreds of MB of dead weight to copy and cache.

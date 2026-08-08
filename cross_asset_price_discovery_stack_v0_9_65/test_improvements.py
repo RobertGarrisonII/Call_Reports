@@ -320,12 +320,43 @@ def check_lfilter_fast_paths():
     return ok
 
 
+def check_source_tag_and_defrag():
+    """v0.9.66 (a real run's log): the ES book-source tag gated on a variable a refactor had
+    removed, so NO frame was ever tagged -- the cache resume rejected every cached frame and
+    re-paid the full vendor pull on every run. Pins: the dead-variable gate is gone, the tag
+    is written from the branch actually taken, the heal-on-resume path exists, and
+    derive_coarse_frame no longer fragments (thousands of PerformanceWarning log lines)."""
+    import inspect
+    import warnings as _w
+    import mstbook_loader as ml_mod
+    src = inspect.getsource(ml_mod)
+    dead_gate_gone = 'if locals().get("_es_from_ladder")' not in src   # the executable form
+                                                                       # (a comment still cites it)
+    tag_real = '_es_source_used' in src and 'df.attrs["book_source_ES"] = _es_source_used' in src
+    heal = "accepted by its source-keyed name and healed" in src
+    import derive_frames as dv
+    from test_pull_once import _event_stream, _frame_at
+    t0, n, q, tr = _event_stream()
+    fine = _frame_at("10ms", t0, n, q, tr)
+    with _w.catch_warnings(record=True) as rec:
+        _w.simplefilter("always")
+        derived = dv.derive_coarse_frame(fine, "1s", "10ms")
+    frag = [x for x in rec if "fragmented" in str(x.message)]
+    no_frag = len(frag) == 0 and len(derived) > 0
+    ok = dead_gate_gone and tag_real and heal and no_frag
+    print("(13) ES source tag: dead-variable gate removed (%s), tag written from the real "
+          "branch (%s), untagged source-keyed caches healed on resume (%s); "
+          "derive_coarse_frame emits no fragmentation warnings (%s) : %s"
+          % (dead_gate_gone, tag_real, heal, no_frag, ok))
+    return ok
+
+
 def main():
     checks = [check_gfevd, check_weighted_mean_group, check_rigobon_overid_row,
               check_realbar_lag_diagnostic, check_gram_conditioning, check_rank_sample,
               check_garch_scale_invariance, check_dcc_masked_alignment,
               check_is_relative_guard, check_romano_wolf_degenerate, check_memo_soundness,
-              check_lfilter_fast_paths]
+              check_lfilter_fast_paths, check_source_tag_and_defrag]
     res = []
     for fn in checks:
         try:
