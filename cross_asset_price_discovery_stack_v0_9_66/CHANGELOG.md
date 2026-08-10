@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.9.67 -- hotfix: BLAS-portable gate tolerances
+
+The first v0.9.66 run on a foreign machine failed its own STAGE 1 gate: `test_improvements`
+check (5) demanded the equilibrated Gram solve match lstsq to 1e-6 relative on a
+1e12-column-norm-spread design -- a threshold the shipping machine passed at 9.3e-07 by LUCK.
+Across neighboring seeds the same construction lands anywhere in 4e-7..9e-6, and a different
+BLAS reduction order moves the fixed seed too. Nothing in the STACK regressed; the gate was
+mis-calibrated.
+
+* Check (5) now pins the tracking bound at 1e-4 (raw-vs-equilibrated "contrast" assertion
+  removed: LAPACK's pivoted solve tolerates PURE diagonal scaling about as well as the
+  equilibrated form -- van der Sluis; the Gram catastrophe needs genuine near-collinearity --
+  so demanding raw be 100x worse asserted a falsehood).
+* Check (12)'s lfilter-vs-loop comparisons allow rtol=1e-9 for FMA contraction drift (a C
+  lfilter may fuse multiply-adds the Python loop cannot; ~1 ulp/step over 30k steps). A wrong
+  recurrence differs at O(1), so neither change loses discriminating power.
+
 ## v0.9.66 -- the STAGE 5 hang: DCC at C speed, and a fine-grid budget
 
 A real run sat in STAGE 5 for 24+ hours. Root cause, in the code's own audit vocabulary: the
