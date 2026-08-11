@@ -9,13 +9,12 @@ policy (halt snapshots and reopen seams excluded from every estimator), the fixe
 with per-day `ec_valid` screening, and day-clustered or permutation inference throughout.
 Stack version v0.9.67.*
 
-One housekeeping note before the findings: the four report files are two identical pairs —
-the two 1 s reports match byte-for-byte (analysis lags auto-scale to 5 at 1 s) and the two
-10 ms reports match (auto-scale to 60). The 15-vs-60 lag contrast you ran affects the Table 9
-system, whose output lands in `table9_both_ways_*.csv` and the STAGE 5 console block rather
-than these stage reports — send those and I will add the lag-sensitivity section. Everything
-below is therefore the **two-frequency comparison**, which turns out to be the more
-interesting axis anyway.
+One housekeeping note before the findings: the four stage-report files are two identical
+pairs — the two 1 s reports match byte-for-byte (analysis lags auto-scale to 5 at 1 s) and the
+two 10 ms reports match (auto-scale to 60). The 15-vs-60 lag contrast lives in the Table 9
+system, whose `table9_both_ways_*.csv` outputs you have now sent; Section 7 analyzes that
+experiment. Sections 1–6 are the **two-frequency comparison** (1 s vs 10 ms), which turns out
+to be an equally interesting axis.
 
 ---
 
@@ -203,12 +202,93 @@ Cholesky ordering.
    own MA structure to the search bound, our mechanical restatement of footnote 17) does not
    afflict the price-discovery estimates. The Table 9 lag question is exactly where your
    15-vs-60 comparison belongs; the RealBar and DCC dependent variables are the window-free
-   columns to quote there.
+   columns to quote there. Section 7 runs that comparison on your two outputs.
 5. **Book-state beats the quoted spread as the liquidity conditioner**: R² for |SPY returns|
    0.318 vs 0.138, with partial R² 0.179 for the state given the spread — the paper's
    liquidity narrative strengthens under the richer state variable.
 
-## 7. Sample and data caveats for the appendix
+## 7. Table 9 at 15 versus 60 lags: the window artifact made visible
+
+Your two STAGE 5 runs estimate the same Eq. (5) correlation system on the same data — 1 s
+grid, 100-bar rolling window, fixed-effects panel VAR (lags built within-day, day fixed
+effects, day-cluster bootstrap SEs, Romano–Wolf joint stars) — differing only in the imposed
+lag depth, VAR(15) versus VAR(60); the 60-lag run also carries the DCC column. This is the
+cleanest demonstration we have of the point in §6.4.
+
+**The rolling-window columns are not lag-robust.** The Pearson impact responses shrink by a
+factor of three to more than ten between p = 15 and p = 60 (several cells collapse to zero at
+the reported precision), and the Romano–Wolf star pattern reshuffles: ten Pearson cells carry
+stars in at least one run, only two keep them in both (RV_ES/volatile, 0.342 → 0.031, and
+WtdSpread_SPY/benchmark, 0.092 → 0.027), seven of the nine starred at p = 15 lose them at
+p = 60, and OFI_ES/benchmark is starred only at p = 60. HY, which shares the rolling window,
+shrinks the same way (RV_ES volatile 0.134 → 0.029; WtdSpread_ES benchmark −0.138 → −0.031).
+The Epps-artifact share is itself lag-dependent: the HY−Pearson delta is nearly three-quarters
+of the published-design response at p = 15 (RV_ES benchmark: −0.380 against 0.517) and about a
+quarter at p = 60 (−0.030 against 0.130).
+
+| Pearson (impact response ×100) | volatile p=15 | volatile p=60 | benchmark p=15 | benchmark p=60 |
+|---|---|---|---|---|
+| Spread_ES | −0.014** (0.004) | −0.000 (0.001) | −0.012 (0.006) | 0.002 (0.001) |
+| WtdSpread_ES | 0.073* (0.026) | 0.000 (0.001) | −0.060*** (0.011) | −0.001 (0.005) |
+| OFI_ES | 0.005 (0.006) | 0.000 (0.002) | −0.021 (0.009) | −0.014*** (0.003) |
+| RV_ES | 0.342** (0.094) | 0.031** (0.008) | 0.517*** (0.053) | 0.130 (0.053) |
+| Spread_SPY | −0.028 (0.011) | 0.002 (0.001) | −0.043*** (0.012) | 0.002 (0.003) |
+| WtdSpread_SPY | 0.061*** (0.015) | 0.002 (0.002) | 0.092*** (0.016) | 0.027** (0.007) |
+| OFI_SPY | 0.003 (0.003) | 0.001 (0.001) | −0.007** (0.002) | 0.002 (0.001) |
+| RV_SPY | 0.144 (0.060) | −0.018 (0.012) | 0.176 (0.064) | 0.056 (0.036) |
+
+The mechanism is the one we identified analytically: with a 100-bar rolling window the
+dependent variable is a moving-average object of order ≈ W, so at p = 15 nearly all of that
+structure sits in the residual — the one-σ orthogonalized impact responses are measured
+against a residual that still contains the window — while at p = 60 much of it has been
+absorbed and the yardstick changes. Since p < W in both runs, neither magnitude is the
+"right" one, and a criterion left to choose p simply chases W (the BIC-at-the-bound result,
+our mechanical restatement of footnote 17).
+
+**The window-free column is sign-stable but not magnitude-stable.** RealBar responses scale
+up roughly three- to seven-fold going to p = 60, with standard errors moving in the same
+direction, so magnitudes are not comparable across lag depths in this column either. But the
+inference is far more stable: the three cells starred at both depths are the same three
+(WtdSpread_ES/volatile, OFI_ES/benchmark, RV_ES/benchmark), no starred cell changes sign
+between runs, and no cell is significant with opposite signs in the two runs.
+
+| RealBar (Δ Fisher-z ×100) | volatile p=15 | volatile p=60 | benchmark p=15 | benchmark p=60 |
+|---|---|---|---|---|
+| Spread_ES | 0.372 (0.159) | 1.521 (0.630) | −0.313*** (0.057) | −0.578 (0.502) |
+| WtdSpread_ES | 0.960*** (0.160) | 5.412*** (0.729) | −0.077 (0.107) | 0.456 (0.617) |
+| OFI_ES | −0.083 (0.090) | 0.711 (0.419) | −0.317** (0.078) | −1.538*** (0.370) |
+| RV_ES | 0.281 (0.167) | 6.106*** (1.013) | 1.604*** (0.322) | 11.750*** (0.808) |
+| Spread_SPY | −0.010 (0.251) | 0.984 (0.683) | 0.157 (0.237) | 1.051 (0.754) |
+| WtdSpread_SPY | 0.329 (0.139) | 0.810 (0.776) | 0.393* (0.138) | 1.255 (0.452) |
+| OFI_SPY | 0.033 (0.103) | 1.249*** (0.309) | −0.010 (0.091) | −0.387 (0.423) |
+| RV_SPY | 0.717** (0.205) | 1.973 (0.738) | 0.210 (0.561) | 1.480 (0.569) |
+
+(MicroDev rows are omitted from both panels: no MicroDev cell is significant in any column of
+either run.)
+
+**What survives everywhere — the quotable core.** Across both lag depths and all measurement
+designs: (i) volatility shocks raise subsequent correlation — RV_ES is the only shock starred
+in Pearson, HY, and RealBar in both runs; (ii) book-liquidity (weighted-spread) shocks are,
+with RV, the only other shocks that stay jointly significant across designs and depths, with
+a regime-dependent sign pattern — the ES-side response is positive in the volatile regime and
+negative on benchmark days in every starred cell, while the SPY-side response is positive
+where starred; (iii) ES order-flow-imbalance shocks lower benchmark-day correlation in the
+window-free column at both depths (−0.317** → −1.538***); (iv) microprice-deviation shocks do
+nothing anywhere. The DCC column (60-lag run only) agrees in miniature: its starred cells are
+the weighted-spread rows and RV_SPY/benchmark, with the smallness and window-independence
+expected of a recursive filter.
+
+**Recommendation.** Publish Table 9 from the window-free columns (RealBar, with DCC as
+corroboration), present it as a sign-and-significance exhibit rather than a magnitudes
+exhibit, fix the lag depth ex ante on the bar grid (where the selection criterion is not
+chasing the window), and keep the Pearson-vs-HY pair in the appendix as the demonstration
+that the published design's magnitudes were window artifacts to first order — which is
+precisely what this 15-vs-60 experiment shows. Orthogonalized impact responses are
+denominated in the size of each equation's innovation, and deepening the lag polynomial
+re-sizes those innovations in every column; signs and joint significance are the
+transportable content of this system.
+
+## 8. Sample and data caveats for the appendix
 
 - **Rolls.** 2020-03-18: calendar pick ESM0 carries 69.5% of two-contract volume; 2024-12-18:
   ESH5 carries 64.2%. Report the measured shares; do not splice (10–12 point calendar-spread
@@ -227,7 +307,7 @@ Cholesky ordering.
   ESH5 2024-12-18 recorded a disagreement we have not yet diagnosed; until then the ladder
   validation exhibit should stay out of the draft.
 
-## 8. What we would change in the paper, concretely
+## 9. What we would change in the paper, concretely
 
 1. Recast "futures dominate price discovery" as **"futures leadership is a stress
    phenomenon"**: near parity (1 s) to modest ES lead (10 ms) unconditionally; +12 to +20
@@ -244,6 +324,10 @@ Cholesky ordering.
 6. Add the innovation-level tandem correlation (0.74 → 0.83 in stress) as the direct
    measurement of the paper's title phenomenon, and the GFEVD as its variance-accounting
    consequence.
+7. Rebuild Table 9 on the window-free dependent variables (RealBar, DCC) as a
+   sign-and-significance exhibit with the lag depth fixed ex ante, and move the
+   Pearson-vs-HY contrast to the appendix as the measurement-artifact demonstration
+   (§7).
 
-*Next: the 15-vs-60 lag Table 9 comparison from your two STAGE 5 outputs, and the ESH5
-validation diagnosis.*
+*Next: the ESH5 validation diagnosis (`validate_ESH5_20241218.txt`), and the 2025-06-13
+minority-contract decision.*
