@@ -1,58 +1,41 @@
-# Cross-Asset Price Discovery at Two Frequencies: Findings from the Corrected Replication
+# Revisiting "Cross-Asset Tandem Trading and Extraordinary Volatility": What We Changed, Why, and What We Found
 
-*Preliminary — for co-author circulation only. Stack version v0.9.67.*
+*Preliminary — for internal circulation. Plain-language edition. Stack version v0.9.67 —
+August 11, 2026.*
 
-## 1. Summary of findings
+## 1. What this report is
 
-1. **Futures leadership is conditional, not unconditional.** On the full 24-session panel the
-   working paper's headline — ES dominates price discovery — does not survive as an
-   unconditional claim: at 1 s the component share of ES is 0.38 and its information share
-   0.48 (near parity, SPY slightly ahead); at 10 ms ES regains a modest lead (IS 0.54,
-   CS 0.46). But **in the stressed regime ES is clearly ahead at both frequencies**, and the
-   volatile-minus-benchmark gap is significant at the 5% level by day permutation at both
-   grids. The futures market leads exactly when the paper's mechanism — tandem trading under
-   extraordinary volatility — is operating. This is a sharper and, we think, more defensible
-   claim than unconditional dominance.
-2. **Tandem trading survives the corrected nulls at 1 s and is directly measurable at the
-   innovation level — but the action-time claim does not survive.** Against independence
-   *given the observed marginals*, the corner log-odds ratio rises monotonically from baseline
-   (1.10) to volatile (1.39) to MWCB (1.47). The measured correlation of SPY and ES order-flow
-   *innovations* is 0.74 on benchmark days and 0.83 on volatile days. However, at the
-   frequency-matched binomial null, the observed off-corner mass is only 1.32× the null at
-   10 ms and 0.97× in action time (vs 33.5× at 1 s): the published Table 7 comparison of all
-   three rows against the per-second null overstates the fine-frequency evidence by orders of
-   magnitude.
-3. **The liquidity mechanism is a fine-grid phenomenon.** The state-dependent error-correction
-   loading — the paper's "arbitrage weakens when the book thins" channel — is sharply
-   identified at 10 ms (t = 5.2 on the mid, t = 11.7 on the microprice) and statistically
-   invisible at 1 s (t = 0.25 / 1.35). Equilibrium half-life on stressed books is roughly
-   three minutes.
-4. **Discontinuities are where the futures lead is largest.** At 10 ms, ES's information share
-   in the jump component (0.56) exceeds its continuous-component share (0.39), and on
-   2020-03-09 the co-jump tape shows ES leading SPY into common jumps 7,610 times against
-   1,669 (4.6:1) with 94.8% sign agreement.
-5. **Two of the paper's identification devices need restating.** The Hasbrouck bounds at 1 s
-   are nearly vacuous ([0.00, 1.00]-style) and tighten dramatically at 10 ms — the fine grid
-   is the right place to quote IS. And Rigobon heteroskedasticity identification fails its own
-   pre-test on this sample (variance-ratio spread 0.055 < 0.15): the regimes differ in scale,
-   not in relative heteroskedasticity, so the Cholesky bracket — not het-ID — is what we can
-   honestly report.
+We rebuilt the paper's analysis pipeline from the ground up, re-examined its methodology end
+to end, and re-ran everything on a fresh 2022–2026 sample plus the March-2020 circuit-breaker
+days. This report explains, in plain terms: how the original paper measured things, where
+those methods were fragile, what we changed, why the changes are better, and what the answers
+look like now. Technical terms are explained the first time they appear and collected in a
+short glossary at the end.
 
-The sample is listed in Exhibit 1; terms and estimators used throughout are defined in
-Section 2. All recommendations are collected in Section 10.
+The short version: the paper's central ideas survive — the two markets really do trade in
+tandem, and futures really do lead — but both claims come out sharper and more *conditional*
+than the published versions. Futures leadership turns out to be a stress phenomenon, not a
+general law. Tandem trading is real and intensifies under stress, but one of the paper's most
+dramatic-looking numbers was an artifact of comparing against the wrong benchmark. And the
+liquidity mechanism at the heart of the paper's story is invisible at the frequency the paper
+measured — and unmistakable at the frequency we now measure.
 
-## 2. Sample, definitions, and methods
+## 2. The question and the data
 
-**The sample.** 24 sessions in three regimes: the ten largest-intraday-range SPY sessions of
-2022–2026 (the **volatile** panel), each paired with a same-weekday session 350–371 calendar
-days earlier (target 364) as its **benchmark**, plus the four March-2020 **MWCB** sessions.
-The pairing rules (same weekday, ~1 year prior, market open) are machine-checked by
-`validate_sample.py`, and the range ranking is reproducible from a daily OHLC file via
-`rank_sample.py`. Data are the SPY consolidated NBBO/ladder against the front-month ES CME
-venue ladder, from one vendor pull at 10 ms with the 1 s frames derived exactly from it. All
-estimates apply the halt-mask policy (halt snapshots and reopen seams excluded from every
-estimator), the fixed-(1,−1) VECM with per-day `ec_valid` screening, and day-clustered or
-permutation inference throughout.
+**The question.** The S&P 500 trades in two major forms at once: SPY, an exchange-traded fund,
+and ES, a futures contract. They track the same index, so their prices should move together —
+and arbitrage traders make money keeping them together. The paper asks what happens on the
+wildest days: Do the two markets trade *in tandem* — buying and selling in the same direction
+at the same moments? Which market *sets* the price and which one follows (what economists call
+"price discovery")? And does the answer change when liquidity dries up — when the standing
+orders that normally cushion the market get pulled?
+
+**The data.** 24 full trading days, in three groups: the ten most volatile SPY sessions of
+2022–2026 (the largest high-to-low intraday ranges), a calm "twin" for each of those days,
+and the four days in March 2020 when the market-wide circuit breaker halted all trading.
+Each volatile day's twin is the same weekday roughly one year earlier — same day of the week,
+similar market structure, no crisis — so every "wild day" result can be compared against a
+matched "normal day" baseline rather than against an average.
 
 **Exhibit 1a. Volatile sessions and their paired benchmarks.**
 
@@ -73,274 +56,272 @@ permutation inference throughout.
 
 | session | weekday | Level-1 halt begins | note |
 |---|---|---|---|
-| 2020-03-09 | Mon | 09:34 | co-jump tape of Section 6 |
+| 2020-03-09 | Mon | 09:34 | the co-jump analysis of §6.1 |
 | 2020-03-12 | Thu | 09:35 | |
-| 2020-03-16 | Mon | 09:30 (at the open) | Rule-201 SSR in force all session |
+| 2020-03-16 | Mon | 09:30 (at the open) | short-selling restricted all session |
 | 2020-03-18 | Wed | 12:56 | |
 
-*Each MWCB session contains one Level-1 market-wide circuit-breaker halt (7% S&P 500
-decline; 15-minute halt). The 900 halt seconds and the reopen seams are masked from every
-estimator. Roll-affected sessions (2020-03-18, 2024-12-18, 2025-06-13) are discussed in
-Section 9.*
+*Each March-2020 session contains one Level-1 market-wide circuit-breaker (MWCB) halt: the
+S&P 500 fell 7%, and all trading stopped for 15 minutes.*
 
-**Terms.**
+For every one of these days we have the full *order book* for both markets — not just the
+price, but the whole ladder of standing buy and sell orders with their sizes — snapshotted
+every 10 milliseconds. That is roughly 2.3 million snapshots per market per day. A one-second
+version of the same data is built directly from those snapshots, which matters more than it
+sounds (Section 5).
 
-- **Grid / frame.** A *frame* is one snapshot row of both order books (quotes, depth by
-  level, and derived flows) at a timestamp. The *fine grid* samples frames every 10 ms; the
-  *coarse grid* (1 s) is derived from the same vendor pull — each 1 s frame is the last 10 ms
-  snapshot of its second, with flow variables summed within the second — so the two grids are
-  the same data at two resolutions, never two pulls.
-- **Mid / microprice.** Mid = (best bid + best ask)/2. The microprice is the depth-weighted
-  quote average over the top book levels — a sub-tick fair-value proxy that shades toward the
-  side the depth imbalance predicts the price will move.
-- **Spread.** The quoted best-level bid–ask spread, in basis points of mid.
-- **WtdSpread** (weighted spread). The round-trip cost, in bps of mid, of executing a fixed
-  multi-level target size against each side of the book (the target is the median cumulative
-  depth of the top three levels), computed by walking the ladder. Always ≥ the quoted
-  spread; it widens when the book thins *behind* the touch, which the quoted spread cannot
-  see.
-- **OFI** (order-flow imbalance). The Cont–Kukanov–Stoikov measure: the signed resting-depth
-  change implied by each book update — depth arriving at or improving the bid counts
-  positive, at or improving the ask negative — summed over the top ten levels and over the
-  bar. A fleeting-quote filter removes sub-grid transient quotes at 10 ms.
-- **RV** (realized variance). The mean of squared mid log-returns (bps) over the correlation
-  window in the rolling designs; the per-bar sum of squared returns in the bar design.
-- **MicroDev.** Microprice minus mid, in bps — a sub-tick directional-pressure proxy.
-- **Book state s.** log(total ES depth) − log(total SPY depth), standardized: the relative
-  liquidity state used as the conditioning variable.
-- **IS** (information share, Hasbrouck). A market's share of the variance of the common
-  efficient-price innovation. Identified only up to the ordering of contemporaneous shocks,
-  so it is reported as [lower, upper] bounds over both orderings; we quote the midpoint when
-  one number is needed.
-- **CS** (component share, Gonzalo–Granger). A market's weight in the common permanent
-  component, computed from the error-correction loadings; unlike IS it does not depend on an
-  ordering.
-- **ECM-SDE** (state-dependent error correction). The VECM on log mids with cointegrating
-  vector fixed at (1,−1), where the loading on the error-correction term z is interacted
-  with the book state: ΔP_t = (α + δ·s_t)·z_{t−1} + lags. δ measures "arbitrage weakens as
-  the book thins"; the implied equilibrium half-life is evaluated at quantiles of s.
-- **Action time.** Event-time aggregation: bars advance one order arrival at a time rather
-  than by the clock, so each bar holds the same amount of trading activity by construction.
-- **CMOF / log-odds ratio / corner asymmetry** (Tables 5–7). Per bar, each market's order
-  flow is signed; the 2×2 sign table's "corners" are the bars where both markets press the
-  same way (co-moving order flow). The log-odds ratio measures the dependence in that table;
-  the corner asymmetry is the sell-corner minus buy-corner local log odds (a Rule-201
-  fingerprint if nonzero).
-- **MWCB / SSR.** Market-wide circuit breaker (Level 1: 7% decline, 15-minute halt);
-  short-sale restriction (Rule 201).
+## 3. How the original paper went about it
 
-**Methods.**
+Six pillars of the original methodology, in plain terms:
 
-- **Hayashi–Yoshida (HY).** A correlation estimator that sums return cross-products over
-  *overlapping event intervals* rather than a fixed clock grid. It is consistent when the two
-  assets' quotes update asynchronously, and therefore free of the *Epps effect* — the
-  mechanical decay of sampled correlation at frequencies finer than the quote-update scale.
-  The HY−Pearson gap measures how much of a grid-sampled estimate is Epps artifact.
-- **RealBar.** Our window-free dependent variable for the correlation system: realized
-  correlation computed on non-overlapping 60 s bars, Fisher-z (arctanh) transformed, then
-  first-differenced. Because there is no fixed-width rolling window, the window-length MA
-  artifact — a spurious dynamic at exactly the window lag — cannot arise; only a bounded
-  MA(1) from per-bar estimation noise remains.
-- **DCC** (dynamic conditional correlation, Engle). GARCH-standardized returns driving a
-  recursive correlation update. Window-free and smooth, but near-integrated on this sample
-  (persistence a + b = 0.9999), so we use it as corroboration rather than a headline.
-- **Lee–Mykland.** A jump classifier that compares each return to a *local* rolling
-  volatility estimate; at fine grids it separates the jump component of quadratic variation
-  from the diffusion component.
-- **Rigobon het-ID** (identification through heteroskedasticity). Uses shifts in the
-  *relative* variances of the two markets across volatility regimes to identify the
-  contemporaneous response matrix without a Cholesky ordering. It requires the regimes to
-  actually change relative variances — a testable pre-condition, which this sample fails
-  (Section 7).
-- **Romano–Wolf.** A stepdown multiple-testing correction controlling the family-wise error
-  rate across all cells of a table; the "joint stars" in Exhibits 7–8.
-- **Wild-cluster bootstrap / Webb weights.** Cluster-robust bootstrap inference designed for
-  few clusters (24 days; six-point Webb weights when a subsample has as few as G = 4
-  clusters).
-- **Day-level permutation test.** Regime labels are permuted across days and the statistic
-  recomputed; exact under exchangeability, and the appropriately sized test at N = 24 days.
-- **GFEVD** (generalized FEVD, Pesaran–Shin). A forecast-error variance decomposition
-  evaluated at the *measured* innovation correlation instead of an orthogonalizing ordering;
-  shares do not sum to one under correlated shocks, which is the honest statement when flow
-  is common.
+1. **Sample and handling.** Ten volatile days from 2014–2017 with paired calm days, plus the
+   2020 circuit-breaker days. The 15-minute trading halts on the circuit-breaker days stayed
+   in the dataset.
+2. **One-second measurement.** Prices and order flow were sampled once per second, and every
+   estimate in the paper was computed on that one-second grid.
+3. **Tandem-trading tests.** Time was cut into bars; in each bar, each market was scored as
+   net buying or net selling. The paper counted how often the two markets pressed in the same
+   direction and compared that count to a *coin-flip world*: each market buying or selling
+   with 50/50 odds, independently of the other. It then re-used the same benchmark rate
+   (about 0.4%) when it re-cut the data at finer time scales, including "action time" (bars
+   that advance one order at a time).
+4. **What moves the correlation.** The correlation between the two markets' returns was
+   measured through a 100-second *rolling window* (each second, recompute the correlation of
+   the last 100 seconds), and a statistical model (a VAR — a regression of current values on
+   many past values) asked which order-book variables move that correlation. The number of
+   past values ("lags") was chosen by an automatic criterion.
+5. **The liquidity mechanism.** The paper's story — arbitrage weakens when the order book
+   thins, letting prices drift apart — was tested on the one-second grid, largely by
+   splitting each day into high-liquidity and low-liquidity buckets and comparing.
+6. **Statistical confidence.** Significance was computed treating every second as an
+   independent observation, and the direction-of-causality questions were resolved either by
+   assuming an ordering ("futures move first within the second") or by a
+   variance-regime-shift technique (Rigobon identification).
 
-## 3. Price discovery across frequencies and regimes
+## 4. The weaknesses in that approach
 
-**Full-panel means (24 sessions, all `ec_valid`):**
+Each weakness below is numbered to match the pillar above.
 
-**Exhibit 2. Full-panel price-discovery shares by sampling frequency.**
+1. **Halted markets were counted as trading.** When trading halts for 15 minutes and reopens
+   at a very different price, a dataset that keeps the halt turns the entire gap into one
+   giant one-second "return" — like a heart-rate monitor recording a terrifying spike because
+   it was unplugged and plugged back in. On circuit-breaker days, that one fake observation
+   can dominate a whole day's statistics — in exactly the sessions the paper cares most
+   about.
+2. **One second is too slow to see who moves first.** These markets react to each other in
+   milliseconds. Sampled once per second, nearly all of the adjustment between SPY and ES
+   happens "within the same tick" — like photographing a hummingbird with a one-second
+   exposure and asking which wing moved first. The standard leadership score (the Hasbrouck
+   information share) senses this: rather than a number, it returns bounds, and at one second
+   the bounds on a typical day are [0.004, 0.861] — a statistical shrug. Any point estimate
+   quoted inside that range is really the *assumed ordering* talking, not the data.
+3. **The coin-flip benchmark is too easy to beat.** The coin-flip world bundles two separate
+   claims: each market is a fair coin, *and* the two are independent. On a crash day, both
+   markets are mostly selling — each "coin" is heavily biased — so the two agree constantly
+   even with no cross-market link at all. Rejecting the coin-flip null therefore does not
+   demonstrate tandem trading; a one-sided day rejects it on its own. Worse, the benchmark
+   rate is not portable across time scales: the chance that both markets are active and
+   agree in a bar depends mechanically on how many orders land in that bar. Comparing a
+   48% observed rate at action time against a 0.4% per-second benchmark is comparing
+   apples to a yardstick built for oranges.
+4. **A rolling window manufactures its own dynamics.** A 100-second moving average remembers
+   every event for exactly 100 seconds. Feed that into a model that hunts for time patterns,
+   and it will faithfully "discover" 100-second dynamics — an echo we ourselves added, like
+   measuring a room's acoustics with a microphone that has its own reverb. The automatic
+   lag-selection criterion then chases that echo (it always picks the maximum allowed), and —
+   as we demonstrate directly in Section 6.4 — the headline coefficients change wholesale
+   when the lag setting changes. Results that depend on a knob setting are measuring the
+   knob.
+5. **The mechanism was tested at the wrong speed, with a fragile design.** Arbitrage capital
+   responds to a thinning book within seconds; averaged to one-second resolution the effect
+   is faint, and the day-by-day liquidity-bucket splits flip sign from one day to the next.
+6. **The stars were too generous, and one identification tool had no grip.** Treating 23,400
+   seconds from the same trading day as independent observations is like polling one
+   household a thousand times and reporting a thousand-person survey: the effective sample is
+   24 *days*, not millions of seconds. This is how the paper's flagship regression got a
+   t-statistic of 253. Separately, the Rigobon technique requires the volatile regime to
+   change the two markets' variances by *different proportions* — and on this sample stress
+   scales both markets almost identically, like trying to tell which speaker is louder when
+   someone turned up the master volume. The technique has nothing to grab.
+
+## 5. The improvements, and why they are better
+
+1. **Halt masking, everywhere.** Every snapshot inside a halt window, and the messy reopening
+   seam after it, is excluded from every estimator — no exceptions, enforced by automated
+   tests. *Why better:* circuit-breaker-day estimates now describe actual trading, not the
+   unplugged monitor.
+2. **Two measurement speeds, one data pull.** Everything is now measured twice: on the
+   original one-second grid and on a 10-millisecond grid, with the one-second data *derived
+   from the same 10 ms pull*. At 10 ms the markets' reactions are genuinely spread over time,
+   so "who moves first" becomes measurable rather than assumed — the leadership bounds
+   tighten from [0.004, 0.861] to [0.244, 0.523] on the same day. *Why better:* the fine
+   grid answers the question the one-second grid could only assume away; and because both
+   grids come from one pull, any difference between them is a difference of resolution,
+   never a difference of data. (The ES side was also rebuilt from the exchange's own order
+   ladder, cross-checked by independently replaying the message feed.)
+3. **Two corrected benchmarks for tandem trading.** First, an independence benchmark that
+   *keeps each market's actual buy/sell mix* and only randomizes the link between them — so
+   beating it demonstrates cross-market coordination, not just a one-sided day. Second, each
+   time scale is judged against its own coincidence rate, computed from the actual number of
+   orders per bar at that scale. *Why better:* the first isolates exactly the paper's claim;
+   the second makes cross-frequency comparisons meaningful.
+4. **Window-free correlation measures.** The correlation dynamics are re-estimated on
+   dependent variables that have no rolling window to echo: *RealBar* (correlation computed
+   fresh on non-overlapping 60-second bars) as the headline, a conditional-correlation model
+   (DCC) as corroboration, and the Hayashi–Yoshida estimator — which is immune to the
+   sampling distortion called the Epps effect — to measure how much of the published design
+   was measurement artifact. We also ran the old design at two lag settings (15 and 60) as a
+   controlled experiment. *Why better:* what survives on the window-free measures is market
+   behavior; what changes with the knob was never real.
+5. **The mechanism estimated where it operates.** The arbitrage-weakening story is now
+   estimated at 10 ms, in a single pooled model across all days (with each day keeping its
+   own baseline) in which the strength of error correction is allowed to depend continuously
+   on the state of the order book. *Why better:* it measures the mechanism at the speed it
+   actually works, and replaces twenty fragile day-by-day splits with one powerful test.
+6. **Honest statistics.** Confidence is now computed by clustering at the day level (24
+   days = 24 independent observations), by bootstrap methods built for few clusters, and by
+   permutation tests — shuffle the "volatile"/"calm" labels across days thousands of times
+   and ask how often chance beats the real gap. Tables with many cells get a joint
+   correction so that one star in twenty isn't there by luck. And instead of pretending the
+   Rigobon technique works here, we test its precondition, report that it fails, and give
+   the honest bracket from the two possible orderings. *Why better:* every star that
+   survives now means something, and a referee cannot take the headline results down by
+   attacking the error bars.
+
+## 6. The results
+
+### 6.1 Who sets the price: futures leadership is a stress phenomenon
+
+Two standard scores summarize who is doing the price-setting. The *information share* (IS)
+asks: of the news that permanently moves the common price, what fraction shows up in ES
+first? The *component share* (CS) asks: when the two prices drift apart, whose price does the
+pair converge back toward? Both run from 0 to 1; above 0.5 means futures lead.
+
+**Exhibit 2. Full-panel price-discovery shares by sampling frequency (24 sessions).**
 
 | | 1 s | 10 ms |
 |---|---|---|
-| mean IS_ES (midpoint of Hasbrouck bounds) | 0.484 | 0.542 |
-| mean CS_ES (Gonzalo–Granger) | 0.384 | 0.455 |
-| days with invalid error correction | 0 of 24 | 0 of 24 |
+| mean IS_ES (midpoint of bounds) | 0.484 | 0.542 |
+| mean CS_ES | 0.384 | 0.455 |
 
-The 2014–2017 sample's futures dominance does not reappear unconditionally on 2022–2026 data.
-Two things changed relative to the working paper's estimates: the halt windows no longer
-contribute pseudo-returns (the four MWCB days previously entered with the 900-second halt and
-its reopen seam included), and the ES leg is now the venue ladder with the price-level replay
-validated against it. At 1 s, SPY carries slightly more than half of the common trend on the
-average day.
+*How to read it: at one second, the two markets are essentially at parity (SPY slightly ahead
+on CS); at 10 ms, ES has a modest lead. Nowhere is there the published-era dominance.*
 
-**The regime split — the paper's central comparison — survives at both grids:**
+The picture changes when the days are split by regime:
 
-**Exhibit 3. ES component share by regime, with day-level permutation p-values.**
+**Exhibit 3. ES component share by regime.**
 
-| CS_ES | benchmark | volatile | difference | permutation p (day-level) |
+| CS_ES | benchmark | volatile | difference | permutation p |
 |---|---|---|---|---|
 | 1 s | 0.269 | 0.466 | +0.197 | 0.048 |
 | 10 ms | 0.387 | 0.504 | +0.117 | 0.047 |
 
-ES's share of the permanent component rises materially in the stressed regime at both
-frequencies. The pooled fixed-effects panel VECM (lags built within-day, day fixed effects,
-day-clustered SEs) shows the same sign — at 10 ms the volatile-interaction t-statistics are
-−1.50 (SPY) and −1.60 (ES), p ≈ 0.13–0.15 — but with only 24 day-clusters the pooled
-interaction does not clear conventional thresholds. With N = 24 days, the day-level
-permutation test is the appropriately sized test, and it rejects at both grids.
+*How to read it: on calm days SPY leads; on volatile days the futures' share of price-setting
+jumps by 12–20 points, at both measurement speeds. The "permutation p" answers "if we
+shuffled the volatile/calm labels at random, how often would chance produce a gap this big?"
+— about 5% — so the pattern is unlikely to be luck, even with only 24 days.*
 
-**Why to quote the 10 ms information shares.** At 1 s the Hasbrouck bounds are close to
-uninformative on most days — e.g., 2023-08-07 gives IS_ES ∈ [0.004, 0.861] — because at that
-sampling interval nearly all SPY–ES adjustment is contemporaneous and the ordering assumption
-does all the work. At 10 ms the same day's bounds are [0.244, 0.523]. Asynchrony at the fine
-grid breaks the simultaneity; the bounds become estimates rather than restatements of the
-ordering. This materially strengthens the paper's measurement section.
+The sharpest version of this result comes from the biggest moves. At 10 ms we can classify
+each price change as ordinary wiggle or as a *jump* (a move too large and fast for the
+prevailing volatility). ES's information share is higher in the jump component than in the
+ordinary component (0.56 vs 0.39), and on 2020-03-09 — the first circuit-breaker day — when
+both markets jumped together, ES moved first 7,610 times and SPY first 1,669 times: a 4.6-to-1
+ratio, with the two markets' jumps agreeing in direction 94.8% of the time. This exhibit needs
+no model assumptions at all: it is simply counting who moved first.
 
-## 4. Tandem order flow against the corrected nulls
+**Bottom line:** the paper's headline should change from "futures dominate price discovery" to
+"futures *take over* price discovery under stress." That is a sharper claim, it is exactly the
+paper's mechanism at work, and — unlike unconditional dominance — it is what the data show.
 
-The published Table 5 rejected a Binomial(n, ½) null that bundles "each market is a fair coin"
-with "the markets are independent"; the marginals alone reject it. Against independence
-*conditional on the observed marginals* — the null that isolates cross-market trading — the
-dependence is still decisively present and **increases with stress**:
+### 6.2 Tandem trading: real, rising with stress — and one headline number was the yardstick's fault
 
-**Exhibit 4. Tandem order flow against the marginal-preserving independence null (revised
-Table 5).**
+Against the corrected benchmark that keeps each market's actual buy/sell mix, coordinated
+trading is still clearly present, and it strengthens with stress:
 
-| Panel | PCMOF/indep. | log-odds ratio | corner asymmetry |
+**Exhibit 4. Tandem order flow against the corrected independence benchmark (revised Table 5).**
+
+| Panel | observed / benchmark | log-odds ratio | corner asymmetry |
 |---|---|---|---|
 | A. Baseline | 1.27 | 1.098 | −0.014 |
 | B. Volatile | 1.34 | 1.385 | −0.008 |
 | C. MWCB | 1.37 | 1.470 | −0.019 |
-| C′. MWCB ex-SSR | 1.36 | 1.413 | −0.021 |
+| C′. MWCB ex-restricted day | 1.36 | 1.413 | −0.021 |
 
-The corner asymmetry is approximately zero in every panel: no Rule 201 fingerprint at the
-pooled level, so the dependence is symmetric tandem trading rather than mechanically
-constrained selling. (2020-03-16 was short-sale-restricted all session and is reported both
-ways.)
+*How to read it: "observed / benchmark" is how much more often the two markets press the same
+way than independence predicts, given each market's own mix that day. The log-odds ratio is a
+standard strength-of-association measure — the key fact is that it climbs steadily from calm
+days to volatile days to circuit-breaker days. The near-zero "corner asymmetry" says buying
+coordination and selling coordination are equally strong — so this is genuine two-way tandem
+trading, not a side effect of short-selling rules.*
 
-**The frequency-matched null changes Table 7's message.** The per-second null (0.4% per
-corner) is not portable across aggregations, because the null depends entirely on per-bar
-order counts:
+An even more direct measurement: after stripping each market's order flow of what is
+predictable from its own past, the *surprises* in SPY flow and ES flow are correlated 0.74 on
+calm days and 0.83 on volatile days. That is the paper's title phenomenon measured directly —
+common trading pressure hitting both markets at once, rising under stress.
 
-**Exhibit 5. Off-corner mass against the frequency-matched null (revised Table 7).**
+The correction cuts the other way at fine time scales. Judged against its own coincidence
+rate, each aggregation tells a different story:
 
-| Aggregation | observed off-corners | null at actual counts | ratio |
+**Exhibit 5. Same-direction trading against the frequency-matched benchmark (revised Table 7).**
+
+| Aggregation | observed | benchmark at actual counts | ratio |
 |---|---|---|---|
 | 1 second | 11.9% | 0.35% | 33.5 |
 | 10 ms | 30.1% | 22.9% | 1.32 |
 | action time | 48.4% | 50.1% | 0.97 |
 
-The 48.4% action-time figure that reads as overwhelming against 0.4% is almost exactly its
-own null. The defensible statement is: tandem dependence is strong and highly significant at
-the one-second aggregation, and attenuates toward the null as bars shrink to the arrival
-scale; a *level* comparison across frequencies is not meaningful, because each aggregation
-carries its own null.
+*How to read it: at one second, coordinated trading is 33 times its chance rate —
+overwhelming. At 10 ms it is 1.3 times chance. At action time it is exactly at chance. The
+published table compared all three observed rates against the same 0.4% benchmark, which made
+the action-time row look like the strongest evidence in the paper; correctly benchmarked, it
+is no evidence at all.*
 
-**Tandem flow at the innovation level.** The correlation of SPY and ES OFI innovations is
-0.742 (benchmark) and 0.835 (volatile) — direct, model-free evidence of common flow, rising
-under stress. This has a knock-on consequence for the variance decomposition: the orthogonal
-FEVD, which assumes uncorrelated flow shocks, attributes 95% of ES return variance to "ES
-flow"; the generalized (Pesaran–Shin) decomposition at the measured correlation attributes
-65% to ES flow and 35–43% to SPY flow, with the caveat that under tandem flow part of each
-share is common flow counted toward both shocks.
+**Bottom line:** tandem trading is a one-second-scale phenomenon — the markets coordinate
+over hundreds of milliseconds, not order by order. Table 5 survives its correction and gets a
+cleaner story (dependence rising monotonically with stress); Table 7's cross-frequency
+comparison should be replaced with per-frequency ratios.
 
-## 5. Liquidity-conditional price discovery and the ECM-SDE
+### 6.3 The liquidity mechanism: invisible at 1 s, unmistakable at 10 ms
 
-The paper's mechanism — price discovery migrates and error correction weakens when liquidity
-withdraws — shows up strongly at the fine grid and weakly at 1 s:
+Think of arbitrage as a rubber band keeping SPY and ES prices tied together. The paper's
+mechanism says: when the order book thins, the band slackens. Our test interacts the strength
+of the "snap-back" (error correction) with the state of the order book, pooled across all
+days:
 
-**Exhibit 6. The state-dependent error-correction loading (a₁, SPY leg) across frequencies.**
+**Exhibit 6. The state-dependent error-correction test across frequencies.**
 
 | | 1 s | 10 ms |
 |---|---|---|
-| t-statistic (mid) | 0.25 | 5.24 |
+| t-statistic (mid price) | 0.25 | 5.24 |
 | t-statistic (microprice) | 1.35 | 11.70 |
-| median IS_ES along the liquidity curve (mid / microprice) | 0.21 / 0.34 | 0.67 / 0.74 |
-| implied equilibrium half-life (stressed states) | ~10 s | ~3 min |
+| price-gap half-life on stressed books | — | ~3 min |
 
-At 10 ms, moving along the relative-liquidity state shifts the adjustment burden exactly as
-the paper argues: κ falls and the half-life lengthens as the book thins, and the ES share of
-discovery along the entire curve sits at 0.58–0.63 (0.62–0.63 on the microprice). The
-depth-state and FPCA-state day-by-day splits are heterogeneous in sign day to day —
-the pooled interacted estimator, not the per-day quantile splits, is the exhibit to lead with.
+*How to read it: a t-statistic near zero means "no detectable effect"; above ~2 means real. At
+one second the mechanism is undetectable. At 10 ms it is one of the strongest effects in the
+whole study: when books thin, the snap-back visibly weakens, and a price gap that would
+normally close in seconds takes about three minutes to close halfway.*
 
-**Cross-impact confirms the direction of causation in stress.** Within each grid, the average
-cross-impact coefficient roughly triples from benchmark to volatile days (10 ms: 0.020 → 0.060;
-1 s: 0.198 → 0.268), and the asymmetry runs the right way for the paper's thesis: on the MWCB
-days the impact of ES flow on SPY returns (0.13–0.25) is two to five times the impact of SPY
-flow on ES returns (0.02–0.06). Futures flow moves the ETF; the reverse channel is an order of
-magnitude weaker.
+Two corroborating facts. First, *cross-impact*: order flow in ES moves SPY's price two to
+five times more strongly than SPY's flow moves ES on the circuit-breaker days — the causal
+arrow points from futures to ETF exactly when it matters. Second, the order-book state
+predicts SPY's volatility far better than the usual liquidity measure, the quoted spread
+(explaining 32% of the variation versus 14%) — the book-depth variables the paper introduced
+are the right conditioning variables.
 
-## 6. Jumps and co-jumps
+**Bottom line:** the paper's mechanism is confirmed — but only the fine grid can see it. The
+revision should lead with the 10 ms pooled test and drop the fragile day-by-day bucket
+splits.
 
-At 10 ms with the Lee–Mykland local-volatility classifier, 58% of common-factor quadratic
-variation on the average day is discontinuous (the truncation estimate at 1 s is 17%, and 6%
-under LM — the fine grid is where jumps are measurable at all). Two results:
+### 6.4 What moves the correlation between the markets — and the experiment that settles the lag question
 
-- **ES leads more at the discontinuities than in the diffusion**: mean ISj_ES = 0.563 against
-  ISc_ES = 0.390. Price discovery's jump component is a futures phenomenon.
-- **Co-jump timing** (2020-03-09): of 24,346 common jumps, ES moves first 7,610 times, SPY
-  first 1,669 times (4.6:1), 15,067 simultaneous at 10 ms, with 94.8% sign agreement.
+The last system asks which order-book shocks (spreads widening, depth thinning, order-flow
+imbalance, volatility) drive *changes in the correlation* between the two markets' returns.
+Here we ran a controlled experiment: the identical model, on identical data, with the lag
+setting at 15 and then at 60.
 
-This is, in our view, the single sharpest exhibit for futures leadership the revision can
-offer — it is model-free, it is at the events that matter, and it does not depend on a
-Cholesky ordering.
-
-## 7. Identification and inference
-
-1. **Day-clustered and permutation inference.** The legacy pooled-iid t on the SPY-return ~
-   ES-flow regression is 253.3; day-clustered it is 4.62 (wild-cluster bootstrap p = 0.001).
-   The result survives, the stars change; a referee will insist, and the stack now does it
-   everywhere (24 clusters; Webb weights at the MWCB G = 4).
-2. **Rigobon het-ID fails its pre-test on this sample.** The variance-ratio spread across
-   regimes is 0.055 (threshold 0.15): the regimes scale both legs' variances nearly equally,
-   so the rotation is unidentified and the het-ID point estimates are numerical noise. The
-   two Cholesky orderings provide the honest bracket. (With MWCB days as their own third
-   regime the over-identification statistic is available as a specification test.)
-3. **The realized SPY–ES correlation is 0.932; the DCC persistence is a + b = 0.9999.** The
-   conditional-correlation path is near-integrated on this sample; level statements about
-   "correlation rising in stress" are safer made with per-bar realized correlation
-   (non-overlapping bars) than with the DCC path.
-4. **Lag robustness at the analysis layer.** The VECM-based shares barely move across lag
-   choices at 1 s (CS_ES 0.384–0.412 for p ∈ {3, 5, 10, 20}) — the lag sensitivity that
-   plagues the correlation system (the Eq. (5) SVAR, where BIC chases the correlation window's
-   own MA structure to the search bound, our mechanical restatement of footnote 17) does not
-   afflict the price-discovery estimates. The Table 9 lag question is exactly where the
-   15-vs-60 comparison belongs; Section 8 runs it.
-5. **Book-state beats the quoted spread as the liquidity conditioner**: R² for |SPY returns|
-   0.318 vs 0.138, with partial R² 0.179 for the state given the spread — the paper's
-   liquidity narrative strengthens under the richer state variable.
-
-## 8. Table 9 at 15 versus 60 lags: the window artifact made visible
-
-The two STAGE 5 runs estimate the same Eq. (5) correlation system on the same data — 1 s
-grid, 100-bar rolling window, fixed-effects panel VAR (lags built within-day, day fixed
-effects, day-cluster bootstrap SEs, Romano–Wolf joint stars) — differing only in the imposed
-lag depth, VAR(15) versus VAR(60); the 60-lag run also carries the DCC column. This is the
-cleanest demonstration we have of the point in §7.4.
-
-**The rolling-window columns are not lag-robust.** The Pearson impact responses shrink by a
-factor of three to more than ten between p = 15 and p = 60 (several cells collapse to zero at
-the reported precision), and the Romano–Wolf star pattern reshuffles: ten Pearson cells carry
-stars in at least one run, only two keep them in both (RV_ES/volatile, 0.342 → 0.031, and
-WtdSpread_SPY/benchmark, 0.092 → 0.027), seven of the nine starred at p = 15 lose them at
-p = 60, and OFI_ES/benchmark is starred only at p = 60. HY, which shares the rolling window,
-shrinks the same way (RV_ES volatile 0.134 → 0.029; WtdSpread_ES benchmark −0.138 → −0.031).
-The Epps-artifact share is itself lag-dependent: the HY−Pearson delta is nearly three-quarters
-of the published-design response at p = 15 (RV_ES benchmark: −0.380 against 0.517) and about a
-quarter at p = 60 (−0.030 against 0.130).
-
-**Exhibit 7. The published (Pearson) design at two lag depths.**
+**Exhibit 7. The published (rolling-window) design at two lag settings.** One-unit-shock
+responses of the correlation measure, ×100; day-clustered standard errors in parentheses;
+stars are jointly corrected (***/**/* = 1/5/10%).
 
 | shock | volatile p=15 | volatile p=60 | benchmark p=15 | benchmark p=60 |
 |---|---|---|---|---|
@@ -353,25 +334,13 @@ quarter at p = 60 (−0.030 against 0.130).
 | OFI_SPY | 0.003 (0.003) | 0.001 (0.001) | −0.007** (0.002) | 0.002 (0.001) |
 | RV_SPY | 0.144 (0.060) | −0.018 (0.012) | 0.176 (0.064) | 0.056 (0.036) |
 
-The mechanism is the one we identified analytically: with a 100-bar rolling window the
-dependent variable is a moving-average object of order ≈ W, so at p = 15 nearly all of that
-structure sits in the residual — the one-σ orthogonalized impact responses are measured
-against a residual that still contains the window — while at p = 60 much of it has been
-absorbed and the yardstick changes. Since p < W in both runs, neither magnitude is the
-"right" one, and a criterion left to choose p simply chases W (the BIC-at-the-bound result,
-our mechanical restatement of footnote 17).
+*How to read it: compare any cell across the p=15 and p=60 columns. Coefficients shrink up to
+tenfold and the pattern of stars scrambles — ten cells are starred in at least one run, and
+only two keep their stars in both. Nothing about the market changed between these columns;
+only a model setting did. This is the rolling window's echo being absorbed differently at
+different lag depths — the smoking gun for the weakness described in Section 4.4.*
 
-**The window-free column is sign-stable but not magnitude-stable.** RealBar responses scale
-up roughly three- to seven-fold going to p = 60, with standard errors moving in the same
-direction, so magnitudes are not comparable across lag depths in this column either —
-orthogonalized impact responses are denominated in the size of each equation's innovation,
-and deepening the lag polynomial re-sizes those innovations in every column. But the
-inference is far more stable: the three cells starred at both depths are the same three
-(WtdSpread_ES/volatile, OFI_ES/benchmark, RV_ES/benchmark), no starred cell changes sign
-between runs, and no cell is significant with opposite signs in the two runs. Signs and
-joint significance are the transportable content of this system.
-
-**Exhibit 8. The window-free (RealBar) column at two lag depths.**
+**Exhibit 8. The window-free (RealBar) measure at the same two lag settings.**
 
 | shock | volatile p=15 | volatile p=60 | benchmark p=15 | benchmark p=60 |
 |---|---|---|---|---|
@@ -384,63 +353,124 @@ joint significance are the transportable content of this system.
 | OFI_SPY | 0.033 (0.103) | 1.249*** (0.309) | −0.010 (0.091) | −0.387 (0.423) |
 | RV_SPY | 0.717** (0.205) | 1.973 (0.738) | 0.210 (0.561) | 1.480 (0.569) |
 
-(MicroDev rows are omitted from both exhibits: no MicroDev cell is significant in any column
-of either run.)
+*How to read it: sizes still move with the lag setting (coefficient sizes in this kind of
+model are denominated in model-dependent units, at either lag depth), but the* inference *is
+stable: the same three cells are significant at both settings, no significant cell changes
+sign, and no cell is significant with opposite signs in the two runs.*
 
-**What survives everywhere — the quotable core.** Across both lag depths and all measurement
-designs: (i) volatility shocks raise subsequent correlation — RV_ES is the only shock starred
-in Pearson, HY, and RealBar in both runs; (ii) book-liquidity (weighted-spread) shocks are,
-with RV, the only other shocks that stay jointly significant across designs and depths, with
-a regime-dependent sign pattern — the ES-side response is positive in the volatile regime and
-negative on benchmark days in every starred cell, while the SPY-side response is positive
-where starred; (iii) ES order-flow-imbalance shocks lower benchmark-day correlation in the
-window-free column at both depths (−0.317** → −1.538***); (iv) microprice-deviation shocks do
-nothing anywhere. The DCC column (60-lag run only) agrees in miniature: its starred cells are
-the weighted-spread rows and RV_SPY/benchmark, with the smallness and window-independence
-expected of a recursive filter.
+**What survives everywhere** — across both lag settings and every measurement design:
+volatility shocks raise the markets' correlation (ES volatility is the one shock significant
+in every design at both settings); order-book-depth shocks matter, with a sign that depends
+on regime (an ES-side book-thinning shock raises correlation on volatile days and lowers it
+on calm days); ES order-flow imbalance lowers calm-day correlation; and the microprice
+deviation variable does nothing anywhere.
 
-## 9. Sample and data caveats for the appendix
+**Bottom line:** the published Table 9's coefficient magnitudes were, to first order, echoes
+of the measurement window. The revision should rebuild the table on the window-free measure,
+present it as a signs-and-significance exhibit, fix the lag setting in advance, and move the
+published-design comparison to an appendix as the demonstration of the artifact.
 
-- **Rolls.** 2020-03-18: calendar pick ESM0 carries 69.5% of two-contract volume; 2024-12-18:
-  ESH5 carries 64.2%. Report the measured shares; do not splice (10–12 point calendar-spread
-  seams). **2025-06-13: the calendar rule picked the minority contract** (ESU5, 13.3% of
-  volume) — we must either re-extract pinned to ESM5 and say so, or keep the rule and report
-  the share; it cannot pass silently.
-- **2020-03-16** is Rule-201 restricted all session (reported in and out of the MWCB panel).
-- **Halt masking** excludes 900 halt seconds per MWCB session plus the reopen seams from every
-  estimator; the four 2020 sessions' estimates are on the ~22.5k (1 s) / 2.25M (10 ms)
-  tradable observations.
-- **Staleness at 10 ms** (79.6% zero-return snapshots for SPY, 89.2% for ES): second moments
-  at the fine grid come from noise-robust estimators and the fleeting-quote filter is engaged
-  on flow inputs; per-bar realized correlation, not tick-by-tick Pearson, is the fine-grid
-  correlation object.
-- One open validation item: the independent message-replay vs venue-ladder cross-check on
-  ESH5 2024-12-18 recorded a disagreement we have not yet diagnosed; until then the ladder
-  validation exhibit should stay out of the draft.
+### 6.5 What the honesty upgrades did to the stars
 
-## 10. Recommendations
+The flagship regression's t-statistic falls from 253 (treating every second as independent)
+to 4.6 with day-clustering — still decisively significant (p = 0.001), now honestly so. The
+regime differences in Exhibit 3 survive the permutation test at both frequencies. And the
+Rigobon identification technique, tested rather than assumed, turns out to have no grip on
+this sample (the stress regime scales both markets' variances nearly equally) — so the
+revision should report the assumption-based bracket and the failed precondition, not het-ID
+point estimates. Every result quoted in this report carries the corrected inference.
 
-1. Recast "futures dominate price discovery" as **"futures leadership is a stress
-   phenomenon"**: near parity (1 s) to modest ES lead (10 ms) unconditionally; +12 to +20
-   points of common-trend share in the volatile regime (permutation p < 0.05 at both grids);
-   largest at the discontinuities (jump IS 0.56; co-jump lead 4.6:1).
-2. Keep Table 5 with the marginal-preserving null and the log-odds ratio (monotone in stress);
-   **replace Table 7's cross-frequency level comparison with per-frequency ratios** and let
-   the action-time row say what it now says.
-3. Quote information shares at 10 ms (tight bounds), with 1 s as the robustness column.
-4. Lead the mechanism section with the interacted ECM-SDE at 10 ms (t = 5.2 / 11.7,
-   three-minute stressed half-lives) and the cross-impact asymmetry.
-5. Adopt day-cluster / wild-cluster / permutation inference throughout; retire the pooled-iid
-   stars; report the day-level permutation p as the headline with the clustered panel t
-   alongside; report the Rigobon verdict row and the Cholesky bracket, not the het-ID
-   coefficients.
-6. Add the innovation-level tandem correlation (0.74 → 0.83 in stress) as the direct
-   measurement of the paper's title phenomenon, and the GFEVD — presented explicitly as an
-   upper bound on separability — as its variance-accounting consequence.
-7. Rebuild Table 9 on the window-free dependent variables (RealBar, with DCC as
-   corroboration) as a sign-and-significance exhibit, with the lag depth fixed ex ante on the
-   bar grid, and move the Pearson-vs-HY contrast to the appendix as the measurement-artifact
-   demonstration (Section 8).
+## 7. What the paper should now say — recommendations
 
-*Next: the ESH5 validation diagnosis (`validate_ESH5_20241218.txt`), and the 2025-06-13
-minority-contract decision.*
+1. **Recast the headline**: "futures leadership is a stress phenomenon." Near parity on
+   average; a 12–20-point futures takeover in the volatile regime (chance probability ~5%);
+   largest at the discontinuities (jump share 0.56; co-jump lead 4.6:1).
+2. **Keep Table 5** on the corrected independence benchmark (dependence rising monotonically
+   with stress); **replace Table 7's** cross-frequency comparison with per-frequency ratios,
+   and let the action-time row say what it now says: at the order-by-order scale,
+   coordination is at chance.
+3. **Quote leadership shares at 10 ms** (where they are measurements, not assumptions), with
+   1 s as the robustness column.
+4. **Lead the mechanism section with the pooled 10 ms error-correction test** (t = 5.2 and
+   11.7; three-minute stressed half-lives) and the cross-impact asymmetry; drop the
+   day-by-day liquidity-bucket splits.
+5. **Adopt the honest inference everywhere**: day-clustering, few-cluster bootstrap,
+   permutation tests as the headline evidence at 24 days, joint corrections on
+   multi-cell tables; report the Rigobon precondition failure and the ordering bracket
+   instead of het-ID estimates.
+6. **Add the innovation-level tandem correlation** (0.74 calm → 0.83 volatile) as the direct
+   measurement of the title phenomenon.
+7. **Rebuild Table 9 window-free** (RealBar headline, DCC corroboration), signs and
+   significance only, lag setting fixed in advance; move the rolling-window-vs-HY contrast
+   to the appendix as the measurement-artifact demonstration.
+
+## 8. Caveats and open items
+
+- **Futures contract rolls.** On three sessions the calendar rule for choosing the futures
+  contract month is debatable: 2020-03-18 and 2024-12-18 land mid-roll (the chosen contract
+  carries 69.5% and 64.2% of volume), and on 2025-06-13 the rule picked the minority contract
+  (13.3% of volume). We must either re-extract that day pinned to the majority contract and
+  say so, or keep the rule and report the share — it cannot pass silently.
+- **2020-03-16** had short-selling restricted all session; every pooled result is reported
+  with and without it.
+- **Quote staleness at 10 ms.** At that speed most snapshots show no price change (80% for
+  SPY, 89% for ES); all fine-grid second-moment estimates use noise-robust methods, and
+  correlation at the fine grid is always computed on bars, never tick by tick.
+- **One open validation item.** Our independent replay of the ES message feed disagrees with
+  the vendor's order ladder on one day (2024-12-18); until that is diagnosed, the ladder
+  validation exhibit stays out of the draft.
+
+## Appendix: glossary
+
+- **SPY / ES.** The S&P 500 ETF (trades on stock exchanges) and the E-mini S&P 500 futures
+  contract (trades on CME). Same index, two markets.
+- **Order book / ladder.** The standing list of buy orders (bids) and sell orders (asks) at
+  each price, with sizes. "Depth" is how much size is resting there.
+- **Grid / frame.** A frame is one snapshot of both order books. The fine grid snapshots
+  every 10 ms; the coarse grid (1 s) is built from the same snapshots.
+- **Mid / microprice.** Mid = halfway between best bid and best ask. The microprice is a
+  depth-weighted version that leans toward where the book imbalance says price is headed.
+- **Spread / WtdSpread.** The quoted spread is the gap between best bid and best ask. The
+  weighted spread is the *effective* round-trip cost of actually executing a realistic size,
+  walking down the ladder — it sees book thinning that the quoted spread misses.
+- **OFI (order-flow imbalance).** Net buying-vs-selling pressure read off order-book changes:
+  depth arriving on the bid side counts positive, on the ask side negative.
+- **RV (realized variance).** A running measure of how violently the price has been moving.
+- **Price discovery.** Which market impounds new information into the price first.
+- **IS / CS (information share / component share).** The two standard 0-to-1 scores of price
+  discovery leadership; above 0.5 means the futures lead. IS is reported as bounds because
+  it depends on an ordering assumption; CS does not.
+- **Error correction / VECM.** The statistical model of two prices tied together: when they
+  drift apart, the model measures how fast each snaps back. The "state-dependent" version
+  (ECM-SDE) lets the snap-back strength depend on the order book's condition.
+- **VAR / lags.** A regression of current values on past values; the "lag" setting is how far
+  back the model looks.
+- **Rolling window.** Recomputing a statistic each period over the last W periods; smooths,
+  but also smears every event over exactly W periods.
+- **RealBar.** Correlation computed fresh on non-overlapping 60-second bars — no rolling
+  window, so no smearing.
+- **Hayashi–Yoshida (HY).** A correlation estimator built for asynchronous data; immune to
+  the *Epps effect*, the mechanical fade of measured correlation at very fine sampling.
+- **DCC.** A model-based conditional correlation (GARCH family); window-free corroboration.
+- **Lee–Mykland.** A statistical test that classifies each price move as ordinary or as a
+  jump, relative to prevailing local volatility.
+- **Rigobon identification.** A technique that uses volatility-regime shifts to establish
+  causal direction; requires the regimes to change the two markets' variances by different
+  proportions (testable — fails here).
+- **Cholesky ordering / bracket.** The assumption that one market moves first within the
+  sampling interval; computing results under both orderings gives an honest bracket.
+- **Day-clustering / wild-cluster bootstrap / Webb weights.** Ways of computing error bars
+  that treat each *day* (not each second) as one independent observation, built to work with
+  as few as 4–24 clusters.
+- **Permutation test.** Shuffle the group labels (volatile/calm) across days thousands of
+  times; the p-value is the fraction of shuffles that beat the real gap.
+- **Romano–Wolf correction.** Adjusts significance stars when a table has many cells, so a
+  few stars can't appear by luck alone.
+- **Action time.** Bars that advance one order arrival at a time instead of by the clock.
+- **MWCB.** Market-wide circuit breaker: at a 7% S&P 500 decline, all trading halts for 15
+  minutes.
+- **GFEVD.** A variance decomposition that respects the measured correlation between shocks
+  instead of assuming them uncorrelated.
+
+*Open items: the ESH5 2024-12-18 validation diagnosis, and the 2025-06-13 contract-month
+decision.*
