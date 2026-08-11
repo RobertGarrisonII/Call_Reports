@@ -120,17 +120,17 @@ tbody tr:last-child td { border-bottom: 1.1pt solid #000; }
 
 <div class="circ">Preliminary &mdash; for internal circulation</div>
 
-<h1>Revisiting &ldquo;Cross-Asset Tandem Trading and Extraordinary Volatility&rdquo;:<br>What We Changed, Why, and What We Found</h1>
+<h1>Revisiting &ldquo;Cross-Asset Tandem Trading and Extraordinary Volatility&rdquo;:<br>The Methodology Revisions and Their Results</h1>
 
 <p class="verline">Plain-language edition &mdash; Stack version v0.9.67 &mdash; August 11, 2026</p>
 
 <h2>1.&emsp;What this report is</h2>
 
-<p>We rebuilt the paper&rsquo;s analysis pipeline from the ground up, re-examined its methodology end
-to end, and re-ran everything on a fresh 2022&ndash;2026 sample plus the March-2020 circuit-breaker
-days. This report explains, in plain terms: how the original paper measured things, where
-those methods were fragile, what we changed, why the changes are better, and what the answers
-look like now. Technical terms are explained the first time they appear and collected in a
+<p>The paper&rsquo;s analysis pipeline was rebuilt from the ground up, its methodology re-examined
+end to end, and every estimate re-run on a fresh 2022&ndash;2026 sample plus the March-2020
+circuit-breaker days. This report explains, in plain terms: how the original paper measured
+things, where those methods were fragile, what was changed, why the changes are better, and
+what the answers look like now. Technical terms are explained the first time they appear and collected in a
 short glossary at the end.</p>
 
 <p>The short version: the paper&rsquo;s central ideas survive &mdash; the two markets really do trade in
@@ -139,7 +139,7 @@ than the published versions. Futures leadership turns out to be a stress phenome
 general law. Tandem trading is real and intensifies under stress, but one of the paper&rsquo;s most
 dramatic-looking numbers was an artifact of comparing against the wrong benchmark. And the
 liquidity mechanism at the heart of the paper&rsquo;s story is invisible at the frequency the paper
-measured &mdash; and unmistakable at the frequency we now measure.</p>
+measured &mdash; and unmistakable at the frequency the revision measures.</p>
 
 <h2>2.&emsp;The question and the data</h2>
 
@@ -193,7 +193,7 @@ matched &ldquo;normal day&rdquo; baseline rather than against an average.</p>
 <p class="tabnote"><em>Each March-2020 session contains one Level-1 market-wide circuit-breaker (MWCB) halt: the
 S&amp;P&nbsp;500 fell 7%, and all trading stopped for 15 minutes.</em></p>
 
-<p>For every one of these days we have the full <em>order book</em> for both markets &mdash; not just the
+<p>For every one of these days, the dataset contains the full <em>order book</em> for both markets &mdash; not just the
 price, but the whole ladder of standing buy and sell orders with their sizes &mdash; snapshotted
 every 10 milliseconds. That is roughly 2.3 million snapshots per market per day. A one-second
 version of the same data is built directly from those snapshots, which matters more than it
@@ -257,12 +257,11 @@ agree in a bar depends mechanically on how many orders land in that bar. Compari
 48% observed rate at action time against a 0.4% per-second benchmark is comparing
 apples to a yardstick built for oranges.</li>
 <li><strong>A rolling window manufactures its own dynamics.</strong> A 100-second moving average remembers
-every event for exactly 100 seconds. Feed that into a model that hunts for time patterns,
-and it will faithfully &ldquo;discover&rdquo; 100-second dynamics &mdash; an echo we ourselves added, like
-measuring a room&rsquo;s acoustics with a microphone that has its own reverb. The automatic
-lag-selection criterion then chases that echo (it always picks the maximum allowed), and &mdash;
-as we demonstrate directly in Section&nbsp;6.4 &mdash; the headline coefficients change wholesale
-when the lag setting changes. Results that depend on a knob setting are measuring the
+every event for exactly 100 seconds. Fed into a model that hunts for time patterns, it
+faithfully &ldquo;discovers&rdquo; 100-second dynamics &mdash; an echo introduced by the measurement
+itself, like a room&rsquo;s acoustics measured with a microphone that has its own reverb. The automatic lag-selection criterion then chases that echo (it always picks the
+maximum allowed), and &mdash; as Section&nbsp;6.4 demonstrates directly &mdash; the headline coefficients
+change wholesale when the lag setting changes. Results that depend on a knob setting are measuring the
 knob.</li>
 <li><strong>The mechanism was tested at the wrong speed, with a fragile design.</strong> Arbitrage capital
 responds to a thinning book within seconds; averaged to one-second resolution the effect
@@ -304,7 +303,7 @@ dependent variables that have no rolling window to echo: <em>RealBar</em> (corre
 fresh on non-overlapping 60-second bars) as the headline, a conditional-correlation model
 (DCC) as corroboration, and the Hayashi&ndash;Yoshida estimator &mdash; which is immune to the
 sampling distortion called the Epps effect &mdash; to measure how much of the published design
-was measurement artifact. We also ran the old design at two lag settings (15 and 60) as a
+was measurement artifact. The old design was also run at two lag settings (15 and 60) as a
 controlled experiment. <em>Why better:</em> what survives on the window-free measures is market
 behavior; what changes with the knob was never real.</li>
 <li><strong>The mechanism estimated where it operates.</strong> The arbitrage-weakening story is now
@@ -314,11 +313,11 @@ on the state of the order book. <em>Why better:</em> it measures the mechanism a
 actually works, and replaces twenty fragile day-by-day splits with one powerful test.</li>
 <li><strong>Honest statistics.</strong> Confidence is now computed by clustering at the day level (24
 days = 24 independent observations), by bootstrap methods built for few clusters, and by
-permutation tests &mdash; shuffle the &ldquo;volatile&rdquo;/&ldquo;calm&rdquo; labels across days thousands of times
-and ask how often chance beats the real gap. Tables with many cells get a joint
-correction so that one star in twenty isn&rsquo;t there by luck. And instead of pretending the
-Rigobon technique works here, we test its precondition, report that it fails, and give
-the honest bracket from the two possible orderings. <em>Why better:</em> every star that
+permutation tests &mdash; the &ldquo;volatile&rdquo;/&ldquo;calm&rdquo; labels are shuffled across days thousands
+of times to see how often chance beats the real gap. Tables with many cells get a joint
+correction so that one star in twenty isn&rsquo;t there by luck. And instead of assuming the
+Rigobon technique works here, the revision tests its precondition, reports the failure, and
+gives the honest bracket from the two possible orderings. <em>Why better:</em> every star that
 survives now means something, and a referee cannot take the headline results down by
 attacking the error bars.</li>
 </ol>
@@ -361,16 +360,16 @@ ahead on CS); at 10&#8202;ms, ES has a modest lead. Nowhere is there the publish
 
 <p class="tabnote"><em>How to read it: on calm days SPY leads; on volatile days the futures&rsquo; share of
 price-setting jumps by 12&ndash;20 points, at both measurement speeds. The &ldquo;permutation p&rdquo; answers
-&ldquo;if we shuffled the volatile/calm labels at random, how often would chance produce a gap this
-big?&rdquo; &mdash; about 5% &mdash; so the pattern is unlikely to be luck, even with only 24 days.</em></p>
+&ldquo;if the volatile/calm labels were shuffled at random, how often would chance produce a gap
+this big?&rdquo; &mdash; about 5% &mdash; so the pattern is unlikely to be luck, even with only 24 days.</em></p>
 
-<p>The sharpest version of this result comes from the biggest moves. At 10&#8202;ms we can classify
-each price change as ordinary wiggle or as a <em>jump</em> (a move too large and fast for the
+<p>The sharpest version of this result comes from the biggest moves. At 10&#8202;ms each price change
+can be classified as ordinary wiggle or as a <em>jump</em> (a move too large and fast for the
 prevailing volatility). ES&rsquo;s information share is higher in the jump component than in the
 ordinary component (0.56 vs 0.39), and on 2020-03-09 &mdash; the first circuit-breaker day &mdash; when
 both markets jumped together, ES moved first 7,610 times and SPY first 1,669 times: a 4.6-to-1
 ratio, with the two markets&rsquo; jumps agreeing in direction 94.8% of the time. This exhibit needs
-no model assumptions at all: it is simply counting who moved first.</p>
+no model assumptions at all: it is a simple count of which market moved first.</p>
 
 <p><strong>Bottom line:</strong> the paper&rsquo;s headline should change from &ldquo;futures dominate price discovery&rdquo; to
 &ldquo;futures <em>take over</em> price discovery under stress.&rdquo; That is a sharper claim, it is exactly the
@@ -434,10 +433,10 @@ comparison should be replaced with per-frequency ratios.</p>
 
 <h3>6.3&ensp;The liquidity mechanism: invisible at 1&#8202;s, unmistakable at 10&#8202;ms</h3>
 
-<p>Think of arbitrage as a rubber band keeping SPY and ES prices tied together. The paper&rsquo;s
-mechanism says: when the order book thins, the band slackens. Our test interacts the strength
-of the &ldquo;snap-back&rdquo; (error correction) with the state of the order book, pooled across all
-days:</p>
+<p>Arbitrage works like a rubber band keeping SPY and ES prices tied together. The paper&rsquo;s
+mechanism says: when the order book thins, the band slackens. The revised test interacts the
+strength of the &ldquo;snap-back&rdquo; (error correction) with the state of the order book, pooled
+across all days:</p>
 
 <table>
 <caption><span class="exnum">Exhibit 6.</span> The state-dependent error-correction test across frequencies.</caption>
@@ -471,8 +470,8 @@ splits.</p>
 
 <p>The last system asks which order-book shocks (spreads widening, depth thinning, order-flow
 imbalance, volatility) drive <em>changes in the correlation</em> between the two markets&rsquo; returns.
-Here we ran a controlled experiment: the identical model, on identical data, with the lag
-setting at 15 and then at 60.</p>
+A controlled experiment answers the lag question: the identical model, on identical data,
+with the lag setting at 15 and then at 60.</p>
 
 <table>
 <caption><span class="exnum">Exhibit 7.</span> The published (rolling-window) design at two lag settings. One-unit-shock
@@ -493,9 +492,9 @@ stars are jointly corrected (***&#8202;/&#8202;**&#8202;/&#8202;* = 1&#8202;/&#8
 </tbody>
 </table>
 
-<p class="tabnote"><em>How to read it: compare any cell across the p&#8202;=&#8202;15 and p&#8202;=&#8202;60 columns. Coefficients shrink
-up to tenfold and the pattern of stars scrambles &mdash; ten cells are starred in at least one run,
-and only two keep their stars in both. Nothing about the market changed between these columns;
+<p class="tabnote"><em>How to read it: a comparison of any cell across the p&#8202;=&#8202;15 and p&#8202;=&#8202;60 columns shows the
+coefficients shrinking up to tenfold and the pattern of stars scrambling &mdash; ten cells are
+starred in at least one run, and only two keep their stars in both. Nothing about the market changed between these columns;
 only a model setting did. This is the rolling window&rsquo;s echo being absorbed differently at
 different lag depths &mdash; the smoking gun for the weakness described in Section&nbsp;4, item&nbsp;4.</em></p>
 
@@ -546,27 +545,27 @@ point estimates. Every result quoted in this report carries the corrected infere
 <h2>7.&emsp;What the paper should now say &mdash; recommendations</h2>
 
 <ol>
-<li><strong>Recast the headline</strong>: &ldquo;futures leadership is a stress phenomenon.&rdquo; Near parity on
-average; a 12&ndash;20-point futures takeover in the volatile regime (chance probability ~5%);
-largest at the discontinuities (jump share 0.56; co-jump lead 4.6:1).</li>
-<li><strong>Keep Table&nbsp;5</strong> on the corrected independence benchmark (dependence rising monotonically
-with stress); <strong>replace Table&nbsp;7&rsquo;s</strong> cross-frequency comparison with per-frequency ratios,
-and let the action-time row say what it now says: at the order-by-order scale,
-coordination is at chance.</li>
-<li><strong>Quote leadership shares at 10&#8202;ms</strong> (where they are measurements, not assumptions), with
-1&#8202;s as the robustness column.</li>
-<li><strong>Lead the mechanism section with the pooled 10&#8202;ms error-correction test</strong> (<var>t</var>&nbsp;=&nbsp;5.2 and
-11.7; three-minute stressed half-lives) and the cross-impact asymmetry; drop the
-day-by-day liquidity-bucket splits.</li>
-<li><strong>Adopt the honest inference everywhere</strong>: day-clustering, few-cluster bootstrap,
-permutation tests as the headline evidence at 24 days, joint corrections on
-multi-cell tables; report the Rigobon precondition failure and the ordering bracket
-instead of het-ID estimates.</li>
-<li><strong>Add the innovation-level tandem correlation</strong> (0.74 calm &rarr; 0.83 volatile) as the direct
-measurement of the title phenomenon.</li>
-<li><strong>Rebuild Table&nbsp;9 window-free</strong> (RealBar headline, DCC corroboration), signs and
-significance only, lag setting fixed in advance; move the rolling-window-vs-HY contrast
-to the appendix as the measurement-artifact demonstration.</li>
+<li><strong>The headline should be recast</strong> as &ldquo;futures leadership is a stress phenomenon&rdquo;: near
+parity on average; a 12&ndash;20-point futures takeover in the volatile regime (chance
+probability ~5%); largest at the discontinuities (jump share 0.56; co-jump lead 4.6:1).</li>
+<li><strong>Table&nbsp;5 should be kept</strong> on the corrected independence benchmark (dependence rising
+monotonically with stress); <strong>Table&nbsp;7&rsquo;s cross-frequency comparison should be replaced</strong>
+with per-frequency ratios, with the action-time row saying what it now says: at the
+order-by-order scale, coordination is at chance.</li>
+<li><strong>Leadership shares should be quoted at 10&#8202;ms</strong> (where they are measurements, not
+assumptions), with 1&#8202;s as the robustness column.</li>
+<li><strong>The mechanism section should lead with the pooled 10&#8202;ms error-correction test</strong>
+(<var>t</var>&nbsp;=&nbsp;5.2 and 11.7; three-minute stressed half-lives) and the cross-impact asymmetry,
+with the day-by-day liquidity-bucket splits dropped.</li>
+<li><strong>The honest inference should be adopted everywhere</strong>: day-clustering, few-cluster
+bootstrap, permutation tests as the headline evidence at 24 days, joint corrections on
+multi-cell tables &mdash; with the Rigobon precondition failure and the ordering bracket
+reported instead of het-ID estimates.</li>
+<li><strong>The innovation-level tandem correlation</strong> (0.74 calm &rarr; 0.83 volatile) <strong>should be
+added</strong> as the direct measurement of the title phenomenon.</li>
+<li><strong>Table&nbsp;9 should be rebuilt window-free</strong> (RealBar headline, DCC corroboration), signs
+and significance only, lag setting fixed in advance &mdash; with the rolling-window-vs-HY
+contrast moved to the appendix as the measurement-artifact demonstration.</li>
 </ol>
 
 <h2>8.&emsp;Caveats and open items</h2>
@@ -575,14 +574,15 @@ to the appendix as the measurement-artifact demonstration.</li>
 <li><strong>Futures contract rolls.</strong> On three sessions the calendar rule for choosing the futures
 contract month is debatable: 2020-03-18 and 2024-12-18 land mid-roll (the chosen contract
 carries 69.5% and 64.2% of volume), and on 2025-06-13 the rule picked the minority contract
-(13.3% of volume). We must either re-extract that day pinned to the majority contract and
-say so, or keep the rule and report the share &mdash; it cannot pass silently.</li>
+(13.3% of volume). That day must either be re-extracted pinned to the majority contract
+(and reported as such), or the rule kept and the volume share reported &mdash; it cannot pass
+silently.</li>
 <li><strong>2020-03-16</strong> had short-selling restricted all session; every pooled result is reported
 with and without it.</li>
 <li><strong>Quote staleness at 10&#8202;ms.</strong> At that speed most snapshots show no price change (80% for
 SPY, 89% for ES); all fine-grid second-moment estimates use noise-robust methods, and
 correlation at the fine grid is always computed on bars, never tick by tick.</li>
-<li><strong>One open validation item.</strong> Our independent replay of the ES message feed disagrees with
+<li><strong>One open validation item.</strong> An independent replay of the ES message feed disagrees with
 the vendor&rsquo;s order ladder on one day (2024-12-18); until that is diagnosed, the ladder
 validation exhibit stays out of the draft.</li>
 </ul>
@@ -629,8 +629,8 @@ sampling interval; computing results under both orderings gives an honest bracke
 <p class="def"><strong>Day-clustering / wild-cluster bootstrap / Webb weights.</strong> Ways of computing error bars
 that treat each <em>day</em> (not each second) as one independent observation, built to work with
 as few as 4&ndash;24 clusters.</p>
-<p class="def"><strong>Permutation test.</strong> Shuffle the group labels (volatile/calm) across days thousands of
-times; the p-value is the fraction of shuffles that beat the real gap.</p>
+<p class="def"><strong>Permutation test.</strong> The group labels (volatile/calm) are shuffled across days
+thousands of times; the p-value is the fraction of shuffles that beat the real gap.</p>
 <p class="def"><strong>Romano&ndash;Wolf correction.</strong> Adjusts significance stars when a table has many cells, so a
 few stars can&rsquo;t appear by luck alone.</p>
 <p class="def"><strong>Action time.</strong> Bars that advance one order arrival at a time instead of by the clock.</p>
