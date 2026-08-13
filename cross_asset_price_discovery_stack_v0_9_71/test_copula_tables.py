@@ -36,11 +36,13 @@ NY = "America/New_York"
 
 def check_density_normalization():
     import copula_garch as cg
+    # np.trapezoid arrived in numpy 2.0 (np.trapz removed there); support both
+    trapz = getattr(np, "trapezoid", None) or np.trapz
     g = np.linspace(0.001, 0.999, 400)
     U, V = np.meshgrid(g, g)
     ok = True
     for name, fn, par in (("joe", cg._joe_logpdf, 2.0), ("frank", cg._frank_logpdf, 5.0)):
-        I = float(np.trapezoid(np.trapezoid(np.exp(fn(U, V, par)), g, axis=1), g))
+        I = float(trapz(trapz(np.exp(fn(U, V, par)), g, axis=1), g))
         print(f"  {name} density integral {I:.4f}")
         ok &= abs(I - 1.0) < 0.02
     return ok

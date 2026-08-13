@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.71 -- hotfix: numpy<2 portability of the copula gate
+
+The first v0.9.70 run on the production cluster failed STAGE 1: test_copula_tables
+check (1) called np.trapezoid, which exists only on numpy >= 2.0 (where np.trapz was
+removed). The cluster env pins numpy 1.26; every SUBSTANTIVE check passed there --
+reproduced exactly in a local numpy 1.26.4 venv (only check 1 failed, AttributeError).
+The check now resolves getattr(np, "trapezoid", None) or np.trapz -- the same portable
+pattern liquidity_curve_metrics has carried since the numpy 2.x migration. Gate verified
+green under numpy 1.26.4 AND 2.4.6. No estimator code changed.
+
 ## v0.9.70 -- copula tail dependence wired into the replication (STAGE 5c)
 
 `copula_garch.py` existed but was ORPHANED -- no driver stage, no table, no gate. It now
