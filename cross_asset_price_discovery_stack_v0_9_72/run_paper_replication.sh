@@ -38,12 +38,22 @@
 #   5. The SVAR lag length was a stated compromise, not a choice: footnote 17
 #      records AIC pointing at 60 lags and 6 being used because the full model
 #      would not run there. That makes p a researcher degree of freedom, so
-#      STAGE 4c picks it by criterion (--n-lags bic, the default) ONCE on the
-#      pooled SVAR frame, prints the whole AIC/BIC/HQ table, and reuses that one
-#      number everywhere downstream -- so the p in the table note is the p that
-#      was fitted. BIC rather than AIC: AIC is not consistent for lag order and
-#      on ~23k-bar intraday samples runs away (the paper's own 60); the log(T)
-#      penalty is what keeps it finite. Pass --n-lags 6 to reproduce the paper.
+#      STAGE 4c picks it by criterion (--n-lags bic, the default) ONCE and
+#      reuses that one number everywhere downstream -- so the p in the table
+#      note is the p that was fitted. Since v0.9.72 the criterion is scored on
+#      the window-free RealBar BAR frame: the rolling (Pearson) frame's dCorr
+#      differences a corr_window-bar box, which plants an MA spike at exactly
+#      lag W, so a criterion scored there tracks the window -- or climbs to its
+#      own search bound walking toward it (footnote 17's "AIC points at 60" is
+#      that artifact, and so was this script's own p*=pmax with BIC still
+#      falling). The rolling-frame selection is still printed as a diagnostic;
+#      it decides nothing. STAGE 4c also prints how robust the choice is
+#      (AIC/BIC/HQ agreement, the flatness set, the per-day modal vote), and
+#      T9_LAG_BAND=lo:hi makes STAGE 5 refit the whole table across a band of
+#      orders and score each cell's sign/star stability. BIC rather than AIC:
+#      AIC is not consistent for lag order and on ~23k-bar intraday samples
+#      runs away (the paper's own 60); the log(T) penalty is what keeps it
+#      finite. Pass --n-lags 6 to reproduce the paper.
 #
 #   6. Extraction is the longest and least reliable stage (hours of vendor I/O),
 #      and it used to be all-or-nothing in both directions: one un-retried
@@ -84,6 +94,10 @@
 #   FINE_N_BOOT=199           bootstrap draws for the FINE-grid Table 9 (1s keeps N_BOOT)
 #   FINE_T9_DCC=1             re-enable the DCC column at the fine grid (hours/session; see STAGE 5)
 #   FLOW_MS_BOOT=99           bootstrap LR draws per day for the STAGE 5b flow-regime test
+#   T9_LAG_BAND=lo:hi         STAGE 5 (1s): also refit Table 9 at EVERY lag order in the band and
+#                             write per-cell sign/star stability (table9_lag_band_*.csv). Off by
+#                             default -- it multiplies the estimation cost by the band width.
+#   T9_BAND_BOOT=199          bootstrap draws per band depth (0 = signs only)
 #   MST_LAKEQUERY_BACKOFF=5   seconds before the first retry (doubles each attempt)
 # ==============================================================================
 set -euo pipefail
@@ -385,6 +399,7 @@ if have_stage 1; then
            test_golden_numbers.py \
            test_flow_correlation.py \
            test_copula_tables.py \
+           test_lag_robustness.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -847,11 +862,20 @@ fi
 #
 # The paper's p=6 is a stated compromise (footnote 17: AIC suggested 60, 6 was
 # used because the full model would not run there), which makes it a researcher
-# degree of freedom. Pick it by criterion on the SAME pooled frame Eq. (5) is
-# fitted on, print the whole IC table so the choice is inspectable, and reuse
-# that ONE integer in every downstream stage -- so the p reported in a table
-# note is provably the p that was fitted, and Pearson/HY differ only in the
-# estimator rather than also in the model.
+# degree of freedom. Pick it by criterion, print the whole IC table so the
+# choice is inspectable, and reuse that ONE integer in every downstream stage
+# -- so the p reported in a table note is provably the p that was fitted, and
+# Pearson/HY differ only in the estimator rather than also in the model.
+#
+# v0.9.72: the criterion is scored on the window-free RealBar BAR frame, not
+# the rolling Pearson frame. d(rolling correlation) carries an MA spike at
+# exactly lag corr_window, so a criterion scored on the Pearson frame tracks
+# the window -- or, when pmax < corr_window, climbs to its own search bound
+# walking toward it (every real run of this script hit that: p*=pmax, BIC
+# still falling). RealBar's non-overlapping bars share no data, so its argmin
+# can be dynamics. The rolling-frame selection is still computed and logged as
+# the footnote-17 diagnostic; it decides nothing. Robustness of the choice
+# (criterion agreement, flatness set, per-day modal vote) is logged beside it.
 # ══════════════════════════════════════════════════════════════════════════════
 if have_stage 4 || have_stage 5 || have_stage 6; then
   case "$N_LAGS" in
@@ -872,23 +896,61 @@ for f in sorted(glob.glob(path)):
     with open(f, "rb") as fh:
         raw.extend(pickle.load(fh))
 sess = [r if len(r) == 3 else (r[0], "benchmark", r[1]) for r in raw]
+# v0.9.72: score the criterion on the window-free RealBar bar frame. The rolling frame's
+# selected order tracks corr_window (or the search bound below it) by construction; it is
+# computed below only as the footnote-17 diagnostic. Fall back to rolling ONLY if no session
+# yields enough bars for the bar frame -- and say so.
 p, tab = cs.select_svar_lag(sess, spec="informational", corr_window=win,
-                            criterion=crit, pmax=pmax)
+                            criterion=crit, pmax=pmax, corr_method="bar")
+frame = "bar"
+if p is None:
+    p, tab = cs.select_svar_lag(sess, spec="informational", corr_window=win,
+                                criterion=crit, pmax=pmax)
+    frame = "rolling"
 if p is None:
     sys.exit(1)
-sys.stderr.write(tab[["aic", "bic", "hqic"]].round(3).to_string() + "\n")
-# Is the selected lag an answer or an artifact of how dCorr is built? See lag_diagnosis:
-# d(W-bar rolling correlation) carries an MA term at exactly lag W, and the criterion finds it.
-d = cs.lag_diagnosis(p, corr_window=win, pmax=pmax, corr_method="rolling")
-sys.stderr.write("LAG DIAGNOSIS: " + d["text"] + "\n")
-print("%d %d %d" % (int(p), int(d["window_artifact"]), int(d["at_boundary"])))
+sys.stderr.write("IC table (%s frame):\n%s\n"
+                 % (frame, tab[["aic", "bic", "hqic"]].round(3).to_string()))
+# How much does the argmin mean? Criterion agreement, flatness, per-day vote.
+try:
+    rob = cs.lag_robustness(sess, pmax=pmax, criterion=crit, spec="informational",
+                            corr_method=frame, corr_window=win)
+    if rob["p"] is not None:
+        sys.stderr.write("robustness: picks=%s agree=%s  flat set (%.1f IC units): %s  "
+                         "per-day modal p=%s (share %s)\n"
+                         % (rob["picks"], rob["agree"], rob["flat_tol"], rob["flat_set"],
+                            rob["modal"], rob["modal_share"]))
+except Exception as e:
+    sys.stderr.write("robustness diagnostics unavailable: %s\n" % e)
+# Is the selected lag an answer or an artifact of how dCorr is built? On the bar frame only
+# the boundary check applies (there is no window to equal); on rolling both do.
+d = cs.lag_diagnosis(p, pmax=pmax, corr_method=frame,
+                     corr_window=(win if frame == "rolling" else None))
+sys.stderr.write("LAG DIAGNOSIS (%s frame): %s\n" % (frame, d["text"]))
+if frame == "bar":
+    pr, _t = cs.select_svar_lag(sess, spec="informational", corr_window=win,
+                                criterion=crit, pmax=pmax, corr_method="rolling")
+    if pr is not None:
+        dr = cs.lag_diagnosis(pr, corr_window=win, pmax=pmax, corr_method="rolling")
+        sys.stderr.write("footnote-17 diagnostic (NOT used): rolling-frame %s selects p*=%d. %s\n"
+                         % (crit.upper(), int(pr), dr["text"]))
+print("%d %d %d %s" % (int(p), int(d["window_artifact"]), int(d["at_boundary"]), frame))
 EOF
 )"
-        LAG_ART=""; LAG_EDGE=""
+        LAG_ART=""; LAG_EDGE=""; LAG_FRAME=""
         if [ -n "$N_LAGS_INT" ]; then
           set -- $N_LAGS_INT
-          N_LAGS_INT="$1"; LAG_ART="${2:-0}"; LAG_EDGE="${3:-0}"
-          info "selected p=${N_LAGS_INT} by ${N_LAGS^^} over p<=${PMAX} (IC table in the log)"
+          N_LAGS_INT="$1"; LAG_ART="${2:-0}"; LAG_EDGE="${3:-0}"; LAG_FRAME="${4:-rolling}"
+          if [ "$LAG_FRAME" = "bar" ]; then
+            info "selected p=${N_LAGS_INT} by ${N_LAGS^^} over p<=${PMAX} on the RealBar bar frame"
+            info "(window-free -- nothing for the criterion to chase; IC table, robustness"
+            info "diagnostics, and the rolling-frame footnote-17 comparison are in the log)"
+          else
+            info "selected p=${N_LAGS_INT} by ${N_LAGS^^} over p<=${PMAX} (IC table in the log)"
+            info "WARNING: selection FELL BACK to the window-bearing rolling frame (no session"
+            info "yielded enough ${N_LAGS^^}-scoreable bars for the RealBar frame) -- expect the"
+            info "window-tracking cautions below to fire; the number is suspect by construction."
+          fi
           if [ "$N_LAGS_INT" = "0" ]; then
             info "NOTE: p=0 means the criterion found no dynamics. A VAR(0) has no impulse response,"
             info "so p=1 is used downstream and the response is impact-only. On a wide"
@@ -911,9 +973,15 @@ EOF
           fi
           if [ "$LAG_EDGE" = "1" ] || { [ "$N_LAGS_INT" -ge "$PMAX" ] 2>/dev/null; }; then
             info "WARNING: p == pmax, so the criterion is still improving at the edge of the search."
-            info "That is a BOUND, not an optimum. Note that with --corr-window ${CORR_WINDOW} the"
-            info "induced spike sits at lag ${CORR_WINDOW}, so raising --pmax walks TOWARD the window"
-            info "rather than converging -- change the dependent variable, not the search."
+            if [ "$LAG_FRAME" = "bar" ]; then
+              info "That is a BOUND, not an optimum. On the bar frame there is NO window spike to"
+              info "chase, so unlike the rolling frame a larger --pmax CAN converge here -- re-run"
+              info "with a larger --pmax before quoting the order."
+            else
+              info "That is a BOUND, not an optimum. Note that with --corr-window ${CORR_WINDOW} the"
+              info "induced spike sits at lag ${CORR_WINDOW}, so raising --pmax walks TOWARD the window"
+              info "rather than converging -- change the dependent variable, not the search."
+            fi
           fi
         else
           info "selection failed (too few usable rows?); downstream stages fall back to their defaults"
@@ -936,6 +1004,12 @@ if have_stage 5; then
   # corr-window MA artifact, and DCC is the lag-robust column the 4c caution points at.
   T9ARGS="--spec informational --n-lags ${N_LAGS} --pmax ${PMAX} --n-boot ${N_BOOT} --out-dir ${OUT}"
   [ -n "$NJ" ] && T9ARGS="$T9ARGS --n-jobs $NJ"
+  # T9_LAG_BAND=lo:hi refits the whole 1s table at every order in the band and writes per-cell
+  # sign/star stability (table9_lag_band_*.csv) -- the check that a cell is a finding at every
+  # defensible depth, not only at the selected one. 1s only: the band multiplies estimation cost
+  # by its width, and the fine grid already runs on a reduced budget.
+  T9_BAND_ARGS=""
+  [ -n "${T9_LAG_BAND:-}" ] && T9_BAND_ARGS="--lag-band ${T9_LAG_BAND} --band-boot ${T9_BAND_BOOT:-199}"
   if [ "$SOURCE" = "demo" ]; then
     # shellcheck disable=SC2086
     run_show $PY run_table9_both_ways.py --source demo --corr-window "$CORR_WINDOW" $T9ARGS \
@@ -944,7 +1018,7 @@ if have_stage 5; then
     # 1-second: the paper's headline window (100 bars = 100 seconds)
     # shellcheck disable=SC2086
     run_show $PY run_table9_both_ways.py --source load --pickle "$FRAMES" \
-        --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS \
+        --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $T9ARGS $T9_BAND_ARGS \
       || info "STAGE 5 (1s Table 9) FAILED -- see $LOG; continuing"
     # 10-millisecond: the paper uses a 1-second window there, i.e. 100 bars again.
     # STAGE 2b resolves FINE_FRAMES when the fine grid ran; the old name-substitution stays as the

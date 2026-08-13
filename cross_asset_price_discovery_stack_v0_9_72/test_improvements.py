@@ -7,7 +7,10 @@
       exactly sum(n_d * resp_d)/sum(n_d) recomputed from its own per_day table
   (3) table_rigobon adds the over-identification row with >=3 exogenous labels and omits
       it with 2
-  (4) the Table 9 CLI prints the RealBar own-lag MA(1) diagnostic when a criterion is used
+  (4) the Table 9 CLI resolves a criterion on the window-free RealBar bar frame and
+      prints the rolling-frame selection as the footnote-17 diagnostic (v0.9.72; this
+      replaced the old RealBar own-lag MA(1) gap print -- the common order now IS the
+      bar frame's own choice, so there is no gap left to report)
   (5) _gram_solve under Jacobi equilibration recovers lstsq-accuracy coefficients on a
       design with 1e6-spread column scales (where raw normal equations lose digits)
   (6) rank_sample: planted extreme-range days rank on top; pairing obeys the
@@ -109,9 +112,14 @@ def check_realbar_lag_diagnostic():
                 "--n-lags", "bic", "--pmax", "6", "--bar-seconds", "30",
                 "--no-dcc", "--no-mean-group"],
                capture_output=True, text=True, timeout=540, cwd=HERE)
-    ok = r.returncode == 0 and "RealBar diagnostic" in r.stdout and "gap" in r.stdout
-    print("(4) Table 9 CLI prints the RealBar own-lag MA(1) diagnostic under a criterion "
-          "(rc=%d) : %s" % (r.returncode, ok))
+    # v0.9.72: the criterion is RESOLVED on the bar frame (the old gap print reported how the
+    # bar frame disagreed with a rolling-frame choice; now the bar frame IS the choice), and
+    # the rolling frame is demoted to the printed footnote-17 comparison.
+    ok = (r.returncode == 0
+          and "RealBar bar frame" in r.stdout
+          and "footnote-17 diagnostic (NOT used)" in r.stdout)
+    print("(4) Table 9 CLI resolves the criterion on the bar frame and demotes the rolling "
+          "frame to the footnote-17 diagnostic (rc=%d) : %s" % (r.returncode, ok))
     return ok
 
 

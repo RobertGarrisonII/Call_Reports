@@ -238,11 +238,18 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
         # panel/bar_seconds forwarded (v0.9.64): the criterion must score the design that is
         # actually fitted -- selecting under stacked seam-crossing lags and then estimating
         # under within-day FE lags answers a different question at a different order.
+        # v0.9.72: scored on the window-free RealBar bar frame whenever that column is on --
+        # the rolling frame's selected order tracks corr_window (or the search bound), so a
+        # common order chosen there was inherited from the estimator artifact, not the data.
+        _sel_method = "bar" if with_bar else "rolling"
         p_sel = csv.select_svar_lag(sessions, spec=spec, corr_window=corr_window,
                                     extra_fn=extra_fn, criterion=criterion, pmax=pmax,
-                                    bar_seconds=bar_seconds, panel=panel)[0]
+                                    bar_seconds=bar_seconds, panel=panel,
+                                    corr_method=_sel_method)[0]
         if p_sel is not None:
-            lag_note = f" Lag order p={int(p_sel)} chosen by {str(criterion).upper()} over p<={pmax} on the pooled SVAR frame."
+            _frame_note = ("the window-free RealBar bar frame" if _sel_method == "bar"
+                           else "the pooled (window-bearing) Pearson SVAR frame")
+            lag_note = f" Lag order p={int(p_sel)} chosen by {str(criterion).upper()} over p<={pmax} on {_frame_note}."
             # A criterion CAN return 0 -- it does so on a wide rolling window, where the induced
             # spike no longer covers the cost of the lags before it. A VAR(0) has no dynamics and
             # no impulse response to compute, and the IRF code raises on the empty coefficient
@@ -260,8 +267,10 @@ def table_correlation_irf_both_ways(sessions, spec="informational", ident="chole
             # carries an MA term at exactly lag W; on data with a CONSTANT correlation the criterion
             # returns p*=W every time (test_svar_lag_artifact.py). A table whose lag equals its own
             # window is reporting its estimator, and this says so in the caption rather than in a log
-            # nobody keeps.
-            _d = csv.lag_diagnosis(p_sel, corr_window=corr_window, pmax=pmax, corr_method="rolling")
+            # nobody keeps. On the bar frame there is no window to track, so only the boundary
+            # check applies there (corr_window=None disables the window-equality test).
+            _d = csv.lag_diagnosis(p_sel, pmax=pmax, corr_method=_sel_method,
+                                   corr_window=(corr_window if _sel_method == "rolling" else None))
             if not _d["ok"]:
                 lag_note += " CAUTION: " + _d["text"]
     kw = dict(spec=spec, n_lags=n_lags, horizon=horizon, ident=ident, cumulative=cumulative,

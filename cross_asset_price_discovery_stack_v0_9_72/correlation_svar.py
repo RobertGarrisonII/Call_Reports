@@ -38,6 +38,8 @@ spread, it makes the (weighted) spread the conditioning state S in the informati
 curve IS(S) via ecm_sde -- the state-dependent price-discovery object this stack is built
 around. Pure numpy/pandas (+ optional dcc_garch).
 """
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -828,6 +830,40 @@ def lag_diagnosis(p, corr_window, pmax, corr_method="rolling", tol=1) -> dict:
     return rep
 
 
+def _svar_design_list(data, spec="informational", n_levels=10, target_qty=None,
+                      corr_method="rolling", corr_window=100, wspread_kind="cost_to_fill",
+                      extra_fn=None, bar_seconds=60, pmax=12):
+    """(dates, Xs, X_pooled) for lag scoring: one built SVAR design per session with more
+    rows than pmax+5, plus the vstacked pool. Exactly-constant columns are dropped by the
+    POOLED std so every session is scored on the same regressor set. One degenerate
+    regressor (a spread that never moves on a quiet session, a microprice deviation that
+    is identically zero on a symmetric book) makes the VAR design singular, every
+    candidate's log-determinant non-finite, and the whole IC table NaN -- at which point
+    pds.select_lag_var falls back to p=1 and returns it as though it were a selection.
+    Removing the constant column keeps the criterion computable on the columns that carry
+    information; it does not change the fitted model, only the scoring."""
+    if isinstance(data, pd.DataFrame):
+        items = [("frame", data)]
+    else:
+        items = [(item[0], item[-1]) for item in data]
+    dates, Xs = [], []
+    for date, df in items:
+        X, _nm, _ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
+                                       corr_window, wspread_kind, extra_fn=extra_fn,
+                                       bar_seconds=bar_seconds)
+        if len(X) > pmax + 5:
+            dates.append(date)
+            Xs.append(X)
+    if not Xs:
+        return [], [], np.empty((0, 0))
+    X = np.vstack(Xs)
+    keep = X.std(axis=0) > EPS
+    if keep.any() and not keep.all():
+        X = X[:, keep]
+        Xs = [x[:, keep] for x in Xs]
+    return dates, Xs, X
+
+
 def select_svar_lag(data, spec="informational", n_levels=10, target_qty=None,
                     corr_method="rolling", corr_window=100, wspread_kind="cost_to_fill",
                     extra_fn=None, criterion="bic", pmax=12, bar_seconds=60, panel="fe"):
@@ -849,30 +885,12 @@ def select_svar_lag(data, spec="informational", n_levels=10, target_qty=None,
     ~23k-bar intraday samples, it chases the enormous effective sample into lag lengths that make
     the SVAR unusable (the paper's own 60). BIC's log(T) penalty is what keeps the choice finite
     and is the standard choice for this kind of high-frequency VAR."""
-    if isinstance(data, pd.DataFrame):
-        frames = [data]
-    else:
-        frames = [item[-1] for item in data]
-    Xs = []
-    for df in frames:
-        X, _nm, _ci = build_svar_frame(df, spec, n_levels, target_qty, corr_method,
-                                       corr_window, wspread_kind, extra_fn=extra_fn,
-                                       bar_seconds=bar_seconds)
-        if len(X) > pmax + 5:
-            Xs.append(X)
+    _dates, Xs, X = _svar_design_list(data, spec=spec, n_levels=n_levels, target_qty=target_qty,
+                                      corr_method=corr_method, corr_window=corr_window,
+                                      wspread_kind=wspread_kind, extra_fn=extra_fn,
+                                      bar_seconds=bar_seconds, pmax=pmax)
     if not Xs:
         return None, pd.DataFrame()
-    X = np.vstack(Xs)
-    # Drop exactly-constant columns before scoring. One degenerate regressor (a spread that never
-    # moves on a quiet session, a microprice deviation that is identically zero on a symmetric
-    # book) makes the VAR design singular, every candidate's log-determinant non-finite, and the
-    # whole IC table NaN -- at which point pds.select_lag_var falls back to p=1 and returns it as
-    # though it were a selection. Removing the constant column keeps the criterion computable on
-    # the columns that carry information; it does not change the fitted model, only the scoring.
-    keep = X.std(axis=0) > EPS
-    if keep.any() and not keep.all():
-        X = X[:, keep]
-        Xs = [x[:, keep] for x in Xs]
     # panel="fe" (default): candidates scored with lags built WITHIN-day and day FE -- the
     # stacked scoring let every candidate's lag windows cross the overnight seams and pooled
     # days around one intercept. panel="stack" reproduces the pre-v0.9.63 behaviour.
@@ -898,6 +916,152 @@ def resolve_n_lags(data, n_lags, pmax=12, **kw):
         p, tab = select_svar_lag(data, criterion=crit, pmax=pmax, **kw)
         return (int(p) if p is not None else None), crit, tab
     return int(n_lags), None, pd.DataFrame()
+
+
+# ── lag robustness: is the selected order a finding or a lucky argmin? ────────
+_CRIT_COL = {"aic": "aic", "hq": "hqic", "hqic": "hqic", "bic": "bic"}
+
+
+def lag_robustness(data, pmax=12, criterion="bic", flat_tol=2.0, spec="informational",
+                   n_levels=10, target_qty=None, corr_method="bar", corr_window=100,
+                   wspread_kind="cost_to_fill", extra_fn=None, bar_seconds=60, panel="fe"):
+    """How much does the selected lag order actually mean? Three diagnostics on ONE frame.
+
+    A single argmin over an IC column is presented as though it were a property of the data,
+    but three distinct failure modes leave the same clean-looking integer: the criteria can
+    DISAGREE (BIC's log(T) penalty against AIC's fixed 2 -- when they split, the choice of
+    criterion is doing the choosing); the criterion can be FLAT (several orders within a
+    couple of IC units of the minimum -- the argmin is then sampling noise among ties, and
+    any member of the flat set is as defensible); and the pooled argmin can be carried by a
+    minority of sessions (per-day selection scattered, the pooled pick matching few days).
+    This computes all three so the driver can print them next to the number it uses:
+
+      * ``picks``/``agree``  -- argmin per criterion (AIC/BIC/HQ) and whether they coincide.
+      * ``flat_set``         -- every p whose TOTAL criterion value sits within ``flat_tol``
+                                of the minimum (the classic "within 2 IC units" band; the
+                                stored table is per-observation-normalized, so the gap is
+                                rescaled by the common sample size before comparing).
+      * ``per_day``/``modal``-- the criterion re-run on each session alone, the modal choice,
+                                and the share of days voting for it. Pooled == modal is the
+                                comfortable case; pooled != modal means the pooled sample
+                                size, not any typical day, decided.
+
+    The frame defaults to ``corr_method='bar'`` deliberately: on the window-free RealBar
+    frame a selected order can be dynamics, while on a rolling frame it tracks the window
+    (``lag_diagnosis``), where no amount of robustness reporting rehabilitates it.
+
+    -> dict(p, criterion, frame, ic, n_common, picks, agree, flat_set, flat_tol,
+            per_day, modal, modal_share)"""
+    key = _CRIT_COL.get(str(criterion).lower(), "bic")
+    dates, Xs, X = _svar_design_list(data, spec=spec, n_levels=n_levels, target_qty=target_qty,
+                                     corr_method=corr_method, corr_window=corr_window,
+                                     wspread_kind=wspread_kind, extra_fn=extra_fn,
+                                     bar_seconds=bar_seconds, pmax=pmax)
+    out = {"p": None, "criterion": key, "frame": str(corr_method), "ic": pd.DataFrame(),
+           "n_common": 0, "picks": {}, "agree": False, "flat_set": [],
+           "flat_tol": float(flat_tol), "per_day": {}, "modal": None, "modal_share": None}
+    if not Xs:
+        return out
+    panel_mode = len(Xs) > 1 and panel != "stack"
+    if panel_mode:
+        p_sel, tab = select_lag_var_panel(Xs, pmax=pmax, criterion=key)
+        n_common = int(sum(max(0, len(x) - pmax) for x in Xs))
+    else:
+        p_sel, tab = pds.select_lag_var(X, pmax=pmax, criterion=key)
+        n_common = int(max(0, len(X) - pmax))
+    col = tab[key] if key in tab else pd.Series(dtype=float)
+    if not col.notna().any():
+        return out                                   # nothing scored: no argmin to interrogate
+    out["p"] = int(p_sel) if p_sel is not None else None
+    out["ic"] = tab
+    out["n_common"] = n_common
+    picks = {}
+    for c in ("aic", "bic", "hqic"):
+        cc = tab[c]
+        picks[c] = int(cc.idxmin()) if cc.notna().any() else None
+    out["picks"] = picks
+    out["agree"] = (None not in picks.values()) and len(set(picks.values())) == 1
+    cmin = float(col.min())
+    out["flat_set"] = [int(p) for p, v in col.items()
+                       if np.isfinite(v) and n_common * (v - cmin) <= float(flat_tol)]
+    per_day = {}
+    for d, x in zip(dates, Xs):
+        if panel_mode:
+            pd_star, dtab = select_lag_var_panel([x], pmax=pmax, criterion=key)
+        else:
+            pd_star, dtab = pds.select_lag_var(x, pmax=pmax, criterion=key)
+        if pd_star is not None and key in dtab and dtab[key].notna().any():
+            per_day[str(d)] = int(pd_star)
+    out["per_day"] = per_day
+    if per_day:
+        votes = pd.Series(list(per_day.values()))
+        out["modal"] = int(votes.mode().iloc[0])
+        out["modal_share"] = float((votes == out["modal"]).mean())
+    return out
+
+
+_CELL_NUM = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)(\*{0,3})")
+
+
+def parse_table_cell(s):
+    """Formatted table cell -> (value, n_stars).  '-0.123*** (0.045)' -> (-0.123, 3);
+    '0.5' -> (0.5, 0);  '--', '', or anything non-numeric -> (nan, 0). The inverse of
+    ``_fmt_cell`` for exactly the fields the band-stability sweep needs."""
+    m = _CELL_NUM.match(str(s))
+    if not m:
+        return float("nan"), 0
+    return float(m.group(1)), len(m.group(2))
+
+
+def band_stability(tables, star_frac=0.9):
+    """Per-cell verdict across a band of lag orders: is a Table 9 cell a finding at every
+    defensible depth, or only at the depth that was picked?
+
+    ``tables`` maps lag order p -> the FORMATTED Table 9 frame fitted at that p (the
+    ``.df`` of table_correlation_irf_both_ways; MultiIndex (estimator, regime) columns or
+    plain columns both work). A cell is **band-stable** iff over the whole band it is
+    (a) estimable at every depth, (b) one nonzero sign at every depth, and (c) its
+    10%-significance verdict (starred vs unstarred) is the modal one at >= ``star_frac``
+    of depths. Sign flips and stars that appear only at cherry-picked depths both fail --
+    which is the point: a cell that is band-stable cannot be an artifact of the lag choice,
+    because there was no lag choice left to make.
+
+    -> DataFrame[estimator, regime, shock, n_depths, n_finite, sign, sign_consistent,
+                 starred_share, star_agreement, modal_starred, band_stable,
+                 est_min, est_med, est_max]"""
+    ps = sorted(tables)
+    cells = {}
+    for p in ps:
+        df = tables[p]
+        if df is None or getattr(df, "empty", True):
+            continue
+        for col in df.columns:
+            est, reg = (str(col[0]), str(col[1])) if isinstance(col, tuple) else ("", str(col))
+            for shock in df.index:
+                cells.setdefault((est, reg, str(shock)), {})[p] = parse_table_cell(df.loc[shock, col])
+    recs = []
+    for (est, reg, shock), by_p in sorted(cells.items()):
+        vals = np.array([by_p.get(p, (np.nan, 0))[0] for p in ps], float)
+        stars = np.array([by_p.get(p, (np.nan, 0))[1] for p in ps], float)
+        fin = np.isfinite(vals)
+        n_fin = int(fin.sum())
+        if n_fin == 0:
+            continue
+        sgn = np.sign(vals[fin])
+        sign_consistent = bool(n_fin == len(ps) and ((sgn > 0).all() or (sgn < 0).all()))
+        starred = stars[fin] > 0
+        starred_share = float(starred.mean())
+        star_agreement = float(max(starred_share, 1.0 - starred_share))
+        stable = bool(sign_consistent and star_agreement >= float(star_frac))
+        recs.append({"estimator": est, "regime": reg, "shock": shock,
+                     "n_depths": len(ps), "n_finite": n_fin,
+                     "sign": "+" if float(np.nanmedian(vals)) >= 0 else "-",
+                     "sign_consistent": sign_consistent,
+                     "starred_share": starred_share, "star_agreement": star_agreement,
+                     "modal_starred": bool(starred_share >= 0.5), "band_stable": stable,
+                     "est_min": float(np.nanmin(vals)), "est_med": float(np.nanmedian(vals)),
+                     "est_max": float(np.nanmax(vals))})
+    return pd.DataFrame(recs)
 
 
 def correlation_irf(data, spec="informational", n_lags=6, horizon=10, ident="cholesky",

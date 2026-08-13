@@ -131,12 +131,32 @@ def build_parser():
                     help="append the mean-group (per-day) estimate with cross-day dispersion "
                          "(DEFAULT) -- the slope-heterogeneity check on the pooled column")
     ap.add_argument("--no-mean-group", dest="mean_group", action="store_false")
+    # v0.9.72: a criterion is resolved on the RealBar BAR frame (window-free) whenever the
+    # RealBar column is on. Resolving it on the Pearson frame scored the one design whose
+    # selected order provably tracks the corr_window box rather than the data (footnote 17's
+    # "AIC points at 60", the 2026-08-04 run's BIC still falling at pmax): the selection kept
+    # landing on the SEARCH BOUND because the frame it scored carries an MA spike the search
+    # can never reach. The bar frame has no window to chase, so its argmin can be dynamics.
+    # The Pearson-frame path is still computed and PRINTED as the footnote-17 diagnostic.
     ap.add_argument("--n-lags", default="6",
                     help="fixed integer, or an information criterion: bic | aic | hq. "
-                         "A criterion is resolved ONCE on the pooled SVAR frame and the chosen "
-                         "order is printed and used for BOTH estimator blocks")
+                         "A criterion is resolved ONCE -- on the window-free RealBar bar frame "
+                         "when --with-bar (the default), else on the pooled Pearson frame with a "
+                         "loud caution -- and the chosen order is used for ALL estimator blocks")
     ap.add_argument("--pmax", type=int, default=12,
                     help="largest lag considered when --n-lags is a criterion")
+    ap.add_argument("--flat-tol", type=float, default=2.0,
+                    help="IC-unit half-width of the reported flatness set (candidate orders "
+                         "whose total criterion sits within this of the minimum)")
+    ap.add_argument("--lag-band", default="",
+                    help="lo:hi -- refit the WHOLE table at every lag order in the band and "
+                         "report per-cell sign/star stability (band-stable = one sign at every "
+                         "depth and the same 10%%-significance verdict at >=90%% of depths). "
+                         "Writes table9_lag_band_*.csv next to the main table.")
+    ap.add_argument("--band-boot", type=int, default=199,
+                    help="bootstrap draws per depth inside --lag-band (smaller than --n-boot "
+                         "because the sweep multiplies cost by the band width; 0 = points only, "
+                         "which reduces the verdict to sign stability)")
     ap.add_argument("--horizon", type=int, default=10)
     ap.add_argument("--ident", default="cholesky", choices=["cholesky", "identity"])
     ap.add_argument("--cumulative", action="store_true")
@@ -161,6 +181,18 @@ def build_parser():
     return ap
 
 
+def parse_lag_band(s):
+    """'lo:hi' -> (lo, hi) with 1 <= lo <= hi. Raises ValueError on anything else, so a typo
+    fails before the expensive sweep rather than after it."""
+    lo, sep, hi = str(s).partition(":")
+    if not sep:
+        raise ValueError(f"--lag-band expects lo:hi, got {s!r}")
+    lo, hi = int(lo), int(hi)
+    if lo < 1 or hi < lo:
+        raise ValueError(f"--lag-band needs 1 <= lo <= hi, got {s!r}")
+    return lo, hi
+
+
 def main(argv=None):
     a = build_parser().parse_args(argv)
     warnings.simplefilter("ignore")
@@ -177,46 +209,106 @@ def main(argv=None):
     # Resolve the lag before anything else so it can be REPORTED, not just used. The paper's
     # footnote 17 records AIC pointing at 60 lags and 6 being used because the full model would
     # not run there -- exactly the kind of choice that should be visible in the output.
+    #
+    # v0.9.72: the criterion is scored on the RealBar BAR frame when the RealBar column is on.
+    # The Pearson frame's dCorr differences a corr_window-bar rolling box, which plants an MA
+    # spike at exactly lag W: a criterion scored there tracks the window (or climbs to pmax when
+    # the search cannot reach W) no matter what the data do -- selecting the common order on that
+    # frame meant every column inherited a lag chosen by the estimator artifact. The bar frame's
+    # non-overlapping bars share no data, so its argmin can be dynamics. The Pearson path is
+    # still computed and printed below as the footnote-17 diagnostic; it decides nothing.
     import correlation_svar as cs
+    sel_method = "bar" if a.with_bar else "rolling"
     n_lags, crit, ic = cs.resolve_n_lags(sessions, a.n_lags, pmax=a.pmax,
                                          spec=a.spec, corr_window=a.corr_window,
-                                         bar_seconds=a.bar_seconds, panel=a.panel)
+                                         bar_seconds=a.bar_seconds, panel=a.panel,
+                                         corr_method=sel_method)
     if crit is not None:
         if n_lags is None:
-            print("could not select a lag (no session had > pmax+5 usable rows); "
-                  "pass --n-lags <int>", file=sys.stderr)
+            print("could not select a lag (no session had > pmax+5 usable rows on the %s frame); "
+                  "pass --n-lags <int>" % sel_method, file=sys.stderr)
             return 1
-        print("lag order: p=%d chosen by %s over p<=%d (pooled SVAR frame)" % (n_lags, crit.upper(), a.pmax))
+        frame_name = ("RealBar bar frame, window-free" if sel_method == "bar"
+                      else "pooled Pearson SVAR frame")
+        print("lag order: p=%d chosen by %s over p<=%d (%s)" % (n_lags, crit.upper(), a.pmax, frame_name))
         show = ic[["aic", "bic", "hqic"]].round(3)
         print(show.to_string())
-        if n_lags >= a.pmax:
+        if n_lags == 0:
+            # A criterion CAN return 0 -- the data carry no VAR dynamics at this bar size. A
+            # VAR(0) has no impulse response to compute, so floor at 1 and say so: p*=0 is
+            # information (the criterion found nothing), not a value to fit.
+            print("  NOTE: the criterion selected p=0 -- no dynamics at all. A VAR(0) has no "
+                  "impulse response, so p=1 is fitted and the responses should be read as "
+                  "impact-only.")
+            n_lags = 1
+        if sel_method == "rolling":
+            print("  WARNING: --no-bar left the criterion nothing but the WINDOW-BEARING Pearson "
+                  "frame to score. d(rolling correlation) carries an MA spike at exactly lag "
+                  "corr_window=%d, so this selection tracks the window (or its own search bound), "
+                  "not the data -- the paper's footnote-17 failure. Restore --with-bar for a "
+                  "window-free selection." % a.corr_window)
+            diag = cs.lag_diagnosis(n_lags, corr_window=a.corr_window, pmax=a.pmax,
+                                    corr_method="rolling")
+            if not diag["ok"]:
+                print("  " + diag["text"])
+        elif n_lags >= a.pmax:
             print("  WARNING: the criterion selected p = pmax = %d, i.e. it is still improving at the"
                   " edge of the search. The chosen order is a BOUND, not an optimum -- re-run with a"
-                  " larger --pmax before reporting it." % a.pmax)
+                  " larger --pmax before reporting it. (On the bar frame there is no window spike to"
+                  " chase, so unlike the Pearson frame a larger --pmax CAN converge here.)" % a.pmax)
         n_nan = int(ic[["aic", "bic", "hqic"]].isna().all(axis=1).sum())
         if n_nan:
             print("  NOTE: %d of %d candidate orders could not be scored (singular design at that p);"
                   " the selection is the minimum over the ones that could." % (n_nan, len(ic)))
+        # Selection-robustness block: agreement across criteria, flatness of the criterion,
+        # and the per-day vote -- the three ways one clean-looking argmin can be hollow.
+        try:
+            rob = cs.lag_robustness(sessions, pmax=a.pmax, criterion=crit, flat_tol=a.flat_tol,
+                                    spec=a.spec, corr_method=sel_method, corr_window=a.corr_window,
+                                    bar_seconds=a.bar_seconds, panel=a.panel)
+        except Exception as e:
+            rob = None
+            print("  (robustness diagnostics unavailable: %s)" % e)
+        if rob is not None and rob["p"] is not None:
+            pk = rob["picks"]
+            print("  criterion agreement: AIC->%s  BIC->%s  HQ->%s  (%s)"
+                  % (pk.get("aic"), pk.get("bic"), pk.get("hqic"),
+                     "all agree" if rob["agree"] else "DISAGREE -- the choice of criterion is "
+                     "doing part of the choosing; BIC is the consistent one for lag order"))
+            fs = rob["flat_set"]
+            if len(fs) > 1:
+                print("  flatness: %d orders within %.1f IC units of the minimum: %s -- the argmin "
+                      "is one member of a near-tie, so any finding must survive the whole set "
+                      "(--lag-band %d:%d checks exactly that)"
+                      % (len(fs), rob["flat_tol"], fs, min(fs), max(fs)))
+            else:
+                print("  flatness: the minimum is isolated (no other order within %.1f IC units)"
+                      % rob["flat_tol"])
+            if rob["modal"] is not None and len(rob["per_day"]) > 1:
+                votes = pd.Series(list(rob["per_day"].values())).value_counts().sort_index()
+                print("  per-day selection: %s  -> modal p=%d (%d%% of days)%s"
+                      % (", ".join("p=%d x%d" % (p_, c_) for p_, c_ in votes.items()),
+                         rob["modal"], round(100 * rob["modal_share"]),
+                         "" if rob["modal"] == rob["p"] else
+                         " -- NOTE the pooled choice differs from the typical day's: the pooled "
+                         "sample size, not any one session's dynamics, is deciding"))
         print("  (AIC is not consistent for lag order and on ~23k-bar samples runs away -- the "
               "paper's own footnote 17 reports it choosing 60; BIC's log(T) penalty is what keeps "
               "this finite.)")
-        # RealBar's own preferred lag as an MA(1) diagnostic. The table is fitted at ONE common
-        # order by design (a column difference must not be a lag difference), but differencing
-        # per-bar realized-correlation ESTIMATES leaves an MA(1) from estimation noise, and the
-        # visible signature is RealBar's own criterion wanting exactly one more lag than the
-        # common order. A gap of +1 is that noise term; a larger gap is data, not noise.
-        if a.with_bar:
+        # The footnote-17 diagnostic: what the same criterion says on the window-bearing Pearson
+        # frame. Printed for comparison with the paper -- it decides nothing above.
+        if sel_method == "bar":
             try:
-                p_bar, _tab = cs.select_svar_lag(sessions, spec=a.spec, corr_method="bar",
-                                                 bar_seconds=a.bar_seconds, criterion=crit,
-                                                 pmax=a.pmax, panel=a.panel)
-                if p_bar is not None:
-                    gap = int(p_bar) - int(n_lags)
-                    tag = ("the expected MA(1) noise term" if gap == 1 else
-                           "no extra lag wanted -- the noise term is negligible here" if gap <= 0
-                           else "MORE than the MA(1) can explain -- treat as dynamics, not noise")
-                    print("  RealBar diagnostic: its own %s-preferred lag is p*=%d vs the common "
-                          "p=%d (gap %+d: %s)." % (crit.upper(), int(p_bar), int(n_lags), gap, tag))
+                p_roll, _tab = cs.select_svar_lag(sessions, spec=a.spec, corr_method="rolling",
+                                                  corr_window=a.corr_window, criterion=crit,
+                                                  pmax=a.pmax, panel=a.panel)
+                if p_roll is not None:
+                    d_roll = cs.lag_diagnosis(p_roll, corr_window=a.corr_window, pmax=a.pmax,
+                                              corr_method="rolling")
+                    print("  footnote-17 diagnostic (NOT used): on the window-bearing Pearson frame "
+                          "the same %s selects p*=%d%s" % (crit.upper(), int(p_roll),
+                          " -- " + d_roll["text"] if not d_roll["ok"] else
+                          "; not at the bound and not the window here"))
             except Exception:
                 pass
         print()
@@ -281,6 +373,61 @@ def main(argv=None):
         with open(stem + ".tex", "w") as fh:
             fh.write(tbl.to_latex(label=f"tab:table9_both_ways_w{a.corr_window}") + "\n")
         print(f"\nwrote {stem}.csv / .md / .tex")
+        if crit is not None and not ic.empty:
+            ic.assign(frame=sel_method).to_csv(
+                os.path.join(a.out_dir, f"table9_lag_ic_{a.spec}_w{a.corr_window}.csv"))
+
+    # ── lag-band sweep: the finding must not depend on the lag choice at all ──────────────
+    # The table above is fitted at ONE order. The selection block reports how defensible that
+    # order is; this sweep removes the question entirely by refitting the whole table at every
+    # order in the band and keeping, per cell, only what survives all of them. A cell that is
+    # band-stable cannot be an artifact of the lag choice, because no lag choice remains.
+    if a.lag_band:
+        lo, hi = parse_lag_band(a.lag_band)
+        print("\n[lag-band] refitting the table at every p in %d..%d (n_boot=%d per depth) ..."
+              % (lo, hi, int(a.band_boot or 0)), flush=True)
+        tabs = {}
+        for p in range(lo, hi + 1):
+            print("[lag-band] p=%d" % p, flush=True)
+            t = pt.table_correlation_irf_both_ways(
+                sessions, spec=a.spec, ident=a.ident, cumulative=a.cumulative,
+                n_boot=a.band_boot, n_lags=p, horizon=a.horizon, corr_window=a.corr_window,
+                min_obs=a.min_obs, seed=a.seed, n_jobs=a.n_jobs, with_dcc=a.with_dcc,
+                with_bar=a.with_bar, bar_seconds=a.bar_seconds, panel=a.panel,
+                mean_group=False)
+            if not t.df.empty:
+                tabs[p] = t.df
+        if not tabs:
+            print("[lag-band] no depth produced a table; nothing to report")
+        else:
+            stab = cs.band_stability(tabs)
+            n_stable = int(stab["band_stable"].sum())
+            print("\nLAG-BAND VERDICT over p=%d..%d: %d of %d cells band-stable "
+                  "(one sign at every depth, same 10%%-significance verdict at >=90%% of depths)."
+                  % (lo, hi, n_stable, len(stab)))
+            if a.band_boot == 0:
+                print("  (n_boot=0 in the sweep: no stars were computed, so the verdict reduces "
+                      "to sign stability alone)")
+            unstable = stab[~stab["band_stable"]]
+            if not unstable.empty:
+                print("  NOT band-stable (read these cells as lag-dependent, whatever the main "
+                      "table says):")
+                for _i, r in unstable.iterrows():
+                    why = []
+                    if not r["sign_consistent"]:
+                        why.append("zero at table precision" if r["est_min"] == 0 == r["est_max"]
+                                   else "sign flips" if r["n_finite"] == r["n_depths"]
+                                   else "not estimable at every depth")
+                    if r["star_agreement"] < 0.9:
+                        why.append("stars at only %d%% of depths" % round(100 * r["starred_share"]))
+                    print("    %-14s %-12s %-16s [%+.3f, %+.3f]  (%s)"
+                          % (r["estimator"], r["regime"], r["shock"],
+                             r["est_min"], r["est_max"], "; ".join(why) or "borderline"))
+            if a.out_dir:
+                bstem = os.path.join(a.out_dir,
+                                     f"table9_lag_band_{a.spec}_w{a.corr_window}_p{lo}-{hi}")
+                stab.to_csv(bstem + ".csv", index=False)
+                print("wrote %s.csv" % bstem)
     return 0
 
 

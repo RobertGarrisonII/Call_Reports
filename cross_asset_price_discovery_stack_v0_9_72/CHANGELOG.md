@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.9.72 -- lag-robustness harness: selection off the window-bearing frame, plus the band verdict
+
+Every criterion-driven run kept selecting the SEARCH BOUND (p*=pmax with BIC still
+falling) because the criterion was scored on the pooled PEARSON frame: d(rolling
+correlation) plants an MA spike at exactly lag corr_window, so the selection tracks the
+window -- or climbs toward it until the search runs out (footnote 17's "AIC points at
+60" is the same artifact). No larger pmax converges, because the target the criterion is
+walking toward is the estimator, not the data. Three-part fix:
+
+* **Selection moves to the window-free RealBar bar frame** whenever the RealBar column
+  is on (`run_table9_both_ways --n-lags bic`, the STAGE 4c resolver, and
+  `table_correlation_irf_both_ways(criterion=...)` all follow the same policy).
+  Non-overlapping bars share no data, so the argmin can be dynamics. The rolling-frame
+  selection is still computed and printed as the footnote-17 diagnostic -- it decides
+  nothing. `--no-bar` falls back to the rolling frame with a loud caution, as does
+  STAGE 4c when no session yields enough bars. Gate: on constant-correlation
+  no-dynamics data the rolling frame selects p* == W exactly while the bar frame
+  selects a small interior order. (The old "RealBar's own preferred lag" MA(1) gap
+  print is superseded: the common order now IS the bar frame's choice.) A p*=0
+  selection (no dynamics) is floored at 1 in the driver and announced as impact-only.
+* **`correlation_svar.lag_robustness`**: how much does the argmin mean? AIC/BIC/HQ
+  argmins and whether they agree; the flatness set (every order within `--flat-tol`,
+  default 2.0, TOTAL IC units of the minimum -- the table is per-observation
+  normalized, so the gap is rescaled by the common sample size); and the per-day vote
+  (criterion re-run per session, modal choice, share). The driver and STAGE 4c print
+  all three next to the number they use; the IC curve lands in table9_lag_ic_*.csv.
+* **`--lag-band lo:hi`** (STAGE 5: `T9_LAG_BAND`, with `T9_BAND_BOOT` draws per depth,
+  default 199): refit the WHOLE table at every order in the band and keep, per cell,
+  only what survives all of them. A cell is band-stable iff it is estimable at every
+  depth, keeps one nonzero sign at every depth, and its 10%-significance verdict is the
+  modal one at >=90% of depths -- a band-stable cell cannot be an artifact of the lag
+  choice, because no lag choice remains. Verdict printed and written to
+  table9_lag_band_*.csv (`band_stability` + `parse_table_cell`, the exact inverse of
+  `_fmt_cell`).
+
+`select_svar_lag`'s design assembly is factored into `_svar_design_list` (shared with
+`lag_robustness`; same constant-column policy, now with session dates carried for the
+per-day vote). New gate `test_lag_robustness.py` (6 checks) registered in STAGE 1.
+
 ## v0.9.71 -- hotfix: numpy<2 portability of the copula gate
 
 The first v0.9.70 run on the production cluster failed STAGE 1: test_copula_tables
