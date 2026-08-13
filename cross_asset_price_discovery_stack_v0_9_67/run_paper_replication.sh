@@ -83,6 +83,7 @@
 #   MST_LAKEQUERY_RETRIES=3   vendor-query attempts before a fetch is believed to have failed
 #   FINE_N_BOOT=199           bootstrap draws for the FINE-grid Table 9 (1s keeps N_BOOT)
 #   FINE_T9_DCC=1             re-enable the DCC column at the fine grid (hours/session; see STAGE 5)
+#   FLOW_MS_BOOT=99           bootstrap LR draws per day for the STAGE 5b flow-regime test
 #   MST_LAKEQUERY_BACKOFF=5   seconds before the first retry (doubles each attempt)
 # ==============================================================================
 set -euo pipefail
@@ -382,6 +383,7 @@ if have_stage 1; then
            test_audit_fixes.py \
            test_improvements.py \
            test_golden_numbers.py \
+           test_flow_correlation.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -970,6 +972,42 @@ if have_stage 5; then
     else
       info "no ${FINE_INTERVAL} frames found — re-run --source extract (STAGE 2b extracts them) for"
       info "the fine-grid pair, which is where the Epps gap should be largest"
+    fi
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 5b — tandem order flow as a time series (v0.9.68)
+#
+# The title phenomenon on a bar clock: per-bar correlation of the two legs'
+# AR-prefiltered OFI innovations (Fisher-z, non-overlapping bars -- no rolling
+# window, so nothing for a lag criterion to chase). Three tables per grid:
+#   flow_corr_tier1_*        regime means, day-clustered SEs, permutation p
+#   flow_corr_mediation_*    does tandem flow mediate RV -> return correlation?
+#   flow_corr_ms_regimes_*   DATA-DRIVEN regimes: per-day 2-state Markov switching
+#                            with a parametric-bootstrap LR vs the 1-state AR(1)
+#                            null (no arbitrary ranges)
+# Budgets: FLOW_MS_BOOT (LR draws/day, default 99); the mediation bootstrap
+# reuses N_BOOT at 1s and FINE_N_BOOT at the fine grid.
+# ══════════════════════════════════════════════════════════════════════════════
+if have_stage 5; then
+  say "STAGE 5b Tandem flow: Tier 1 regimes, Tier 2 mediation, data-driven MS regimes"
+  FLOWARGS="--n-boot ${N_BOOT} --ms-boot ${FLOW_MS_BOOT:-99} --out-dir ${OUT}"
+  if [ "$SOURCE" = "demo" ]; then
+    # shellcheck disable=SC2086
+    run_show $PY run_flow_correlation.py --source demo --tag demo $FLOWARGS \
+      || info "STAGE 5b (demo flow corr) FAILED -- see $LOG; continuing"
+  else
+    # shellcheck disable=SC2086
+    run_show $PY run_flow_correlation.py --source load --pickle "$FRAMES" \
+        --volatile "$VOLATILE" --mwcb "$MWCB" --tag "$INTERVAL" $FLOWARGS \
+      || info "STAGE 5b (${INTERVAL} flow corr) FAILED -- see $LOG; continuing"
+    if [ -n "${FINE_T9:-}" ] && [ "$FINE_T9" != "$FRAMES" ] && { [ "$DRY" -eq 1 ] || [ -f "$FINE_T9" ]; }; then
+      # shellcheck disable=SC2086
+      run_show $PY run_flow_correlation.py --source load --pickle "$FINE_T9" \
+          --volatile "$VOLATILE" --mwcb "$MWCB" --tag "$FINE_INTERVAL" $FLOWARGS \
+          --n-boot "${FINE_N_BOOT:-199}" \
+        || info "STAGE 5b (${FINE_INTERVAL} flow corr) FAILED -- see $LOG; continuing"
     fi
   fi
 fi

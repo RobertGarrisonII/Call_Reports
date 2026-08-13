@@ -743,6 +743,20 @@ def table_treatment_control_design(vol):
 # ══════════════════════════════════════════════════════════════════════════════
 #  Orchestration
 # ══════════════════════════════════════════════════════════════════════════════
+def _flow_table(fn_name, title, sessions, **kw):
+    """Wrap a flow_correlation (DataFrame, notes) builder into a Table. Late import: the
+    flow module returns plain frames precisely so paper_tables can own the Table type
+    without an import cycle."""
+    import flow_correlation as fc
+    df, notes = getattr(fc, fn_name)(sessions, **kw)
+    if hasattr(df, "round"):
+        try:
+            df = df.round(4)
+        except (TypeError, ValueError):
+            pass
+    return Table(title, df, notes)
+
+
 def build_all_tables(sessions, counts_fn, vol, mwcb_treated, mwcb_control, release_by_date,
                      calm_session, stress_session, n_boot=40, verbose=True, n_jobs=None):
     """Build every table on the provided synthetic/real inputs. Each builder is isolated so
@@ -773,6 +787,19 @@ def build_all_tables(sessions, counts_fn, vol, mwcb_treated, mwcb_control, relea
         ("pricing_error_revamp", lambda: table_pricing_error(calm_session, stress_session)),
         ("tick_revamp", lambda: table_tick_correction(sessions)),
         ("stress_selection_revamp", lambda: table_stress_selection(vol)),
+        # v0.9.68: tandem order flow as a time series -- the title phenomenon on a bar
+        # clock. Tier 1 describes it by the a-priori day labels; Tier 2 tests whether it
+        # MEDIATES the RV -> return-correlation link; the MS table lets the data pick its
+        # own regimes (bootstrap-LR-calibrated) instead of any constructed range.
+        ("flow_tier1", lambda: _flow_table("table_flow_corr_regimes",
+                                           "Tandem flow by a-priori regime (Tier 1)",
+                                           sessions, n_perm=2000)),
+        ("flow_mediation", lambda: _flow_table("table_flow_corr_mediation",
+                                               "Tandem-flow mediation of RV -> return corr (Tier 2)",
+                                               sessions, n_boot=49)),
+        ("flow_ms_regimes", lambda: _flow_table("table_flow_corr_ms_regimes",
+                                                "Data-driven tandem-flow regimes (MS, bootstrap LR)",
+                                                sessions, B=19, min_bars=30)),
     ]
     out = OrderedDict()
     for name, fn in jobs:

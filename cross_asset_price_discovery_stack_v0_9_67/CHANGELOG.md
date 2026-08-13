@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.9.68 -- tandem order flow as a time series (Tier 1 / Tier 2 / MS regimes)
+
+The title phenomenon on a bar clock. New module `flow_correlation.py` + driver
+`run_flow_correlation.py` (STAGE 5b, both grids), three tables per grid:
+
+* **Tier 1** (`flow_corr_tier1_*`): per-bar correlation of the two legs' OFI INNOVATIONS
+  (AR(5)-prefiltered per leg per day -- raw flow correlation partly measures common
+  persistence) on non-overlapping 60s bars, Fisher-z. Regime means with day-clustered SEs,
+  the volatile-vs-benchmark day-permutation p, and the mean within-day correlation with
+  the relative-depth book state. OFI is NaN'd wherever the leg's own mid is non-finite
+  before prefiltering: `order_flow_imbalance` zero-fills masked rows, so halt bars would
+  otherwise pass the coverage floor as fake zeros.
+* **Tier 2** (`flow_corr_mediation_*`): does tandem flow MEDIATE the RV -> return-
+  correlation link? Bar-level FE panel (within-day demeaning, day-clustered SEs):
+  Eq A d z_flow on own lags + lagged {RV, book state, d WtdSpread}; Eq B d z_ret with and
+  without the contemporaneous d z_flow mediator; total-vs-direct RV_ES effect, indirect
+  share with a day-level cluster-bootstrap 95% CI. Signed OFI is EXCLUDED by construction
+  (the DV is built from the flows) and all treatments enter at lag 1 (same-bar RV shares
+  sub-returns with the same-bar correlation estimate).
+* **Data-driven regimes** (`flow_corr_ms_regimes_*`): per-day 2-state Markov-switching
+  regression on the z_flow level series (switching intercept and variance, common AR(1);
+  Hamilton filter / Kim smoother reused from markov_switching_vecm) against the 1-state
+  AR(1) null, calibrated by PARAMETRIC BOOTSTRAP LR -- the mixing weight is unidentified
+  under H0 (Davies), so chi-square critical values are invalid. Reports the data's own
+  low/high tandem regimes, persistence, per-day significance counts, and how high-regime
+  occupancy aligns with the a-priori day labels. No constructed ranges anywhere.
+* Wiring: STAGE 5b runs the 1s pass always and the fine-grid pass when fine frames exist
+  (`--tag` keeps the stems apart); budgets FLOW_MS_BOOT (default 99 LR draws/day), N_BOOT /
+  FINE_N_BOOT for the mediation bootstrap. `build_all_tables` gains flow_tier1 /
+  flow_mediation / flow_ms_regimes (via `_flow_table`; the flow module returns plain
+  frames so paper_tables owns the Table type without an import cycle).
+* Gate: `test_flow_correlation.py` (7 checks) -- innovation-corr recovery under unequal AR
+  persistence, per-bar corr + coverage floor, EXACT OFI injection via designed quantity
+  paths + halt-NaN propagation, bar-level recovery of a planted correlation, mediation
+  finds a planted indirect channel and stays clean under the null, MS detects a planted
+  2-state series and does not reject a 1-state one, and end-to-end table/driver/runner
+  wiring. Added to the STAGE 1 list.
+* Tier 1's contrast row generalizes to any two-label day split (volatile-benchmark when
+  present, else the two labels found -- the synthetic self-test uses calm/stress).
+* Known, pre-existing: `paper_tables` SELF-TEST's t9_both_ways job can fail with a
+  non-PD covariance on its synthetic fixture (present in v0.9.67 unchanged); the dedicated
+  t9 gates and real-data runs are unaffected.
+
 ## v0.9.67 -- hotfix: BLAS-portable gate tolerances
 
 The first v0.9.66 run on a foreign machine failed its own STAGE 1 gate: `test_improvements`
