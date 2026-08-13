@@ -799,7 +799,14 @@ def build_all_tables(sessions, counts_fn, vol, mwcb_treated, mwcb_control, relea
                                                sessions, n_boot=49)),
         ("flow_ms_regimes", lambda: _flow_table("table_flow_corr_ms_regimes",
                                                 "Data-driven tandem-flow regimes (MS, bootstrap LR)",
-                                                sessions, B=19, min_bars=30)),
+                                                sessions, B=39, min_bars=30, k_max=2)),
+        ("flow_pd_link", lambda: _flow_table("table_flow_pd_link",
+                                             "Tandem flow and price discovery (window panel)",
+                                             sessions, window_minutes=10, B=39, k_max=2,
+                                             min_bars=25)),
+        ("flow_asymmetry", lambda: _flow_table("table_flow_corr_asymmetry",
+                                               "Tandem-flow asymmetry: joint selling vs joint buying",
+                                               sessions, n_flip=2000)),
     ]
     out = OrderedDict()
     for name, fn in jobs:

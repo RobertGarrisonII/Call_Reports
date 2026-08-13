@@ -110,7 +110,14 @@ def build_parser():
     ap.add_argument("--n-boot", type=int, default=499,
                     help="day-level cluster-bootstrap draws for the mediation CI")
     ap.add_argument("--ms-boot", type=int, default=99,
-                    help="parametric-bootstrap LR draws per day for the MS regime test")
+                    help="parametric-bootstrap LR draws per day PER STAGE for the "
+                         "sequential MS regime-count test")
+    ap.add_argument("--k-max", type=int, default=4,
+                    help="largest regime count the sequential LR may select per day")
+    ap.add_argument("--window-minutes", type=int, default=30,
+                    help="within-day window length for the price-discovery link panel")
+    ap.add_argument("--pd-lags", type=int, default=5,
+                    help="VECM lag order for the per-window CS/IS estimates")
     ap.add_argument("--n-perm", type=int, default=20000,
                     help="day-level permutation draws for the Tier 1 contrast")
     ap.add_argument("--seed", type=int, default=0)
@@ -162,6 +169,12 @@ def main(argv=None):
     _emit(pt.Table("Tandem flow by a-priori regime (Tier 1)", df1.round(4), n1),
           f"flow_corr_tier1_{tag}b{a.bar_seconds}s", a.out_dir)
 
+    print("[flow] downside/upside semicorrelation asymmetry ...", flush=True)
+    dfa, na = fc.table_flow_corr_asymmetry(sessions, a.n_levels, a.min_rest_steps,
+                                           a.ar_order, n_flip=a.n_perm, seed=a.seed)
+    _emit(pt.Table("Tandem-flow asymmetry: joint selling vs joint buying", dfa.round(4), na),
+          f"flow_corr_asymmetry_{tag}", a.out_dir)
+
     print("[flow] mediation panel ...", flush=True)
     try:
         df2, n2 = fc.table_flow_corr_mediation(sessions, a.bar_seconds, a.n_levels,
@@ -174,13 +187,31 @@ def main(argv=None):
     except Exception as e:
         print(f"[flow] mediation FAILED: {type(e).__name__}: {e}")
 
-    print(f"[flow] Markov-switching regimes ({a.ms_boot} LR draws/day) ...", flush=True)
+    print(f"[flow] Markov-switching regimes (sequential K, {a.ms_boot} LR draws/stage, "
+          f"k_max={a.k_max}) ...", flush=True)
+    recs, smap = fc.ms_flow_regimes(sessions, a.bar_seconds, a.n_levels, a.min_rest_steps,
+                                    a.ar_order, B=a.ms_boot, seed=a.seed, k_max=a.k_max,
+                                    bars=bars, verbose=True, return_series=True)
     df3, n3 = fc.table_flow_corr_ms_regimes(sessions, a.bar_seconds, a.n_levels,
                                             a.min_rest_steps, a.ar_order,
-                                            B=a.ms_boot, seed=a.seed, bars=bars)
+                                            B=a.ms_boot, seed=a.seed, k_max=a.k_max,
+                                            bars=bars, recs=recs)
     _emit(pt.Table("Data-driven tandem-flow regimes (Markov switching, bootstrap LR)",
                    df3, n3),
           f"flow_corr_ms_regimes_{tag}b{a.bar_seconds}s", a.out_dir)
+
+    print(f"[flow] price-discovery link ({a.window_minutes}m windows) ...", flush=True)
+    try:
+        df4, n4 = fc.table_flow_pd_link(sessions, a.bar_seconds, a.n_levels,
+                                        a.min_rest_steps, a.ar_order,
+                                        window_minutes=a.window_minutes, n_lags=a.pd_lags,
+                                        B=a.ms_boot, seed=a.seed, k_max=a.k_max,
+                                        bars=bars, recs=recs, series_map=smap)
+        _emit(pt.Table("Tandem flow and price discovery (within-day window panel)",
+                       df4, n4),
+              f"flow_corr_pd_link_{tag}b{a.bar_seconds}s_w{a.window_minutes}m", a.out_dir)
+    except Exception as e:
+        print(f"[flow] pd link FAILED: {type(e).__name__}: {e}")
     return 0
 
 

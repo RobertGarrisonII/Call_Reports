@@ -11,7 +11,16 @@
       excludes 0) and does NOT invent one under the no-mediation null (CI covers 0)
   (6) fit_ms_ar1 / ms_lr_test: a planted 2-state series is detected (bootstrap p <= 0.05,
       regime means recovered in order); a 1-state AR(1) series is NOT rejected
-  (7) the three table builders run end-to-end on synthetic sessions, the Tier 1 regime
+  (7) semicorrelation asymmetry: symmetric innovations give a ~zero down-up gap and a
+      large sign-flip p; a planted sign-dependent common factor is detected
+  (8) regime-dynamics asymmetry: planted sticky-high-regime + entered-on-selling days
+      yield small sign-flip p for both the duration ratio and the entry direction
+  (9) select_k_ms lets the data pick the regime COUNT: an AR(1) series selects K=1, a
+      planted 3-state series selects K=3 with its means recovered (levels are free to be
+      zero or negative -- nothing presupposes polarity)
+ (10) the price-discovery link recovers planted window-panel slopes (z_flow and top-regime
+      occupancy) with day-clustered inference, and builds end-to-end on synthetic sessions
+ (11) the table builders run end-to-end on synthetic sessions, the Tier 1 regime
       contrast has the planted sign with a small permutation p, and the driver wires
       run_flow_correlation.py into STAGE 5b
 
@@ -205,6 +214,128 @@ def check_ms_regimes():
     return ok1 and ok2
 
 
+def check_semicorr_asymmetry():
+    import flow_correlation as fc
+    rng = np.random.default_rng(31)
+    T = 60000
+    # symmetric null: bivariate normal, rho = 0.5 -> gap ~ 0
+    L = np.linalg.cholesky([[1.0, 0.5], [0.5, 1.0]])
+    U = rng.standard_normal((T, 2)) @ L.T
+    d_dn, d_up, *_ = fc.semicorrelations(U[:, 0], U[:, 1])
+    ok1 = abs(d_dn - d_up) < 0.04
+    # planted asymmetry: a common factor whose loading DOUBLES when it is negative --
+    # joint-selling co-movement tighter than joint-buying by construction
+    f = rng.standard_normal(T)
+    lam = np.where(f < 0, 1.6, 0.6)
+    x = lam * f + rng.standard_normal(T)
+    y = lam * f + rng.standard_normal(T)
+    a_dn, a_up, *_ = fc.semicorrelations(x, y)
+    ok2 = (a_dn - a_up) > 0.10
+    # day-level sign-flip: symmetric day gaps -> p large; shifted -> p small
+    sym = rng.standard_normal(24) * 0.05
+    shifted = sym + 0.12
+    p_sym = fc.sign_flip_p(sym, n_flip=5000, seed=1)
+    p_shift = fc.sign_flip_p(shifted, n_flip=5000, seed=1)
+    ok3 = p_sym > 0.05 and p_shift < 0.01
+    print(f"  null gap {d_dn - d_up:+.3f}; planted gap {a_dn - a_up:+.3f}; "
+          f"sign-flip p sym {p_sym:.3f} / shifted {p_shift:.4f}")
+    return ok1 and ok2 and ok3
+
+
+def check_regime_dynamics_asymmetry():
+    import flow_correlation as fc
+    rng = np.random.default_rng(41)
+    # planted: high-tandem regime is stickier (dur 33 vs 10 bars) and entered on selling
+    days = []
+    for d in range(6):
+        T = 300
+        states = np.zeros(T, dtype=int)
+        ret = np.zeros(T)
+        s = 0
+        for t in range(1, T):
+            p_stay = 0.97 if s == 1 else 0.90
+            if rng.random() > p_stay:
+                s = 1 - s
+            states[t] = s
+            # selling precedes entries: a negative return shock the bar BEFORE a switch up
+            ret[t] = rng.standard_normal()
+            if s == 1 and states[t - 1] == 0:
+                ret[t - 1] -= 3.0
+        z = np.where(states == 1, 1.1, 0.3) + 0.15 * rng.standard_normal(T)
+        idx = pd.date_range("2024-02-0%d 09:30" % (d % 7 + 1), periods=T, freq="60s", tz=NY)
+        b = pd.DataFrame({"z_flow": z, "z_ret": z, "ret_spy": ret,
+                          "ret_es": ret, "rv_es": np.ones(T), "rv_spy": np.ones(T),
+                          "state": rng.standard_normal(T),
+                          "d_wspr_es": np.zeros(T), "d_wspr_spy": np.zeros(T),
+                          "n_pairs": np.full(T, 60)}, index=idx)
+        days.append((f"2024-02-{d + 1:02d}", "volatile" if d % 2 else "benchmark", b))
+    df, notes = fc.table_flow_corr_ms_regimes([], B=39, k_max=2, bars=days)
+    row = df.loc["all days"]
+    ok = (float(row["duration asymmetry p"]) < 0.05
+          and float(row["entry ret (bps, demeaned)"]) < 0
+          and float(row["entry-direction p"]) < 0.05)
+    print(f"  duration asym p {row['duration asymmetry p']:.4f}; entry ret "
+          f"{row['entry ret (bps, demeaned)']:.2f} (p {row['entry-direction p']:.4f})")
+    return ok
+
+
+def check_select_k():
+    import flow_correlation as fc
+    rng = np.random.default_rng(41)
+    T, phi = 300, 0.4
+    y1 = np.zeros(T)
+    for t in range(1, T):
+        y1[t] = 0.5 * (1 - phi) + phi * y1[t - 1] + 0.2 * rng.standard_normal()
+    s1 = fc.select_k_ms(y1, k_max=3, B=39, seed=7)
+    ok1 = s1["k"] == 1
+    means3 = np.array([-0.20, 0.40, 1.10])
+    sds = np.array([0.10, 0.12, 0.15])
+    P = np.full((3, 3), 0.03)
+    np.fill_diagonal(P, 0.94)
+    s = 0
+    y3 = np.zeros(400)
+    y3[0] = means3[0]
+    cum = np.cumsum(P, axis=1)
+    for t in range(1, 400):
+        s = min(int(np.searchsorted(cum[s], rng.random())), 2)
+        y3[t] = means3[s] * (1 - phi) + phi * y3[t - 1] + sds[s] * rng.standard_normal()
+    s3 = fc.select_k_ms(y3, k_max=4, B=39, seed=8)
+    m = np.sort(np.asarray(s3["fit"]["means"], float))
+    ok2 = s3["k"] == 3 and np.all(np.abs(m - means3) < 0.25)
+    print(f"  AR(1) -> K={s1['k']} (p_path {s1['p_path']}); planted 3-state -> K={s3['k']}, "
+          f"means {np.round(m, 2).tolist()} (true {means3.tolist()})")
+    return ok1 and ok2
+
+
+def check_pd_link():
+    import flow_correlation as fc
+    import paper_tables as pt
+    rng = np.random.default_rng(55)
+    rows = []
+    for d in range(12):
+        off = 0.05 * rng.standard_normal()
+        for w in range(12):
+            z = rng.standard_normal()
+            occ = rng.random()
+            rows.append({"date": f"d{d}", "regime": "benchmark", "window": str(w),
+                         "CS_ES": 0.4 + off + 0.08 * z + 0.02 * rng.standard_normal(),
+                         "IS_mid_ES": 0.5 + off + 0.10 * occ + 0.02 * rng.standard_normal(),
+                         "ec_valid": True, "z_flow": z, "occ_top": occ})
+    panel = pd.DataFrame(rows)
+    bz, sz, pz, _n, _G = fc._fe_reg_windows(panel, "CS_ES", "z_flow", standardize=True)
+    bo, so, po, _n2, _G2 = fc._fe_reg_windows(panel, "IS_mid_ES", "occ_top", standardize=False)
+    ok1 = abs(bz - 0.08) < 0.02 and pz < 0.01 and abs(bo - 0.10) < 0.03 and po < 0.01
+    sessions = [(f"2024-08-{i + 1:02d}", "calm" if i < 4 else "stress",
+                 pt._synth_session(f"2024-08-{i + 1:02d}",
+                                   "calm" if i < 4 else "stress", T=2500, seed=40 + i))
+                for i in range(8)]
+    t4, n4 = fc.table_flow_pd_link(sessions, window_minutes=10, B=9, k_max=2, min_bars=25)
+    ok2 = (not t4.empty) and "windows / days" in t4.index
+    print(f"  planted slopes: z {bz:.3f} (true 0.08, p {pz:.4f}), occ {bo:.3f} "
+          f"(true 0.10, p {po:.4f}); end-to-end table ok: {ok2}")
+    return ok1 and ok2
+
+
 def check_tables_end_to_end():
     import flow_correlation as fc
     import test_hy_correlation as th
@@ -223,7 +354,9 @@ def check_tables_end_to_end():
     t2, n2 = fc.table_flow_corr_mediation(sessions, n_lags=2, n_boot=49, bars=bars)
     ok2 = not t2.empty and "indirect share of RV_ES effect" in t2.index
     t3, n3 = fc.table_flow_corr_ms_regimes(sessions, B=19, bars=bars)
-    ok3 = not t3.empty and "all days" in t3.index
+    ok3 = not t3.empty and "all days" in t3.index and "duration asymmetry p" in t3.columns
+    ta, na = fc.table_flow_corr_asymmetry(sessions, n_flip=2000)
+    ok3 = ok3 and not ta.empty and "sign-flip p" in ta.columns
     drv = open(os.path.join(HERE, "run_paper_replication.sh")).read()
     ok4 = "run_flow_correlation.py" in drv
     import run_flow_correlation as rfc
@@ -242,6 +375,10 @@ def main():
               ("flow_corr_bars recovers injected corr", check_flow_corr_bars),
               ("mediation: planted channel found, null clean", check_mediation),
               ("MS regimes: planted detected, null not rejected", check_ms_regimes),
+              ("semicorrelation asymmetry: null clean, planted found", check_semicorr_asymmetry),
+              ("regime-dynamics asymmetry: duration + entry direction", check_regime_dynamics_asymmetry),
+              ("select_k: AR(1) -> 1 regime, planted 3-state -> 3", check_select_k),
+              ("pd link: planted slopes recovered + end-to-end table", check_pd_link),
               ("tables end-to-end + driver/runner wiring", check_tables_end_to_end)]
     rc = 0
     for i, (name, fn) in enumerate(checks, 1):

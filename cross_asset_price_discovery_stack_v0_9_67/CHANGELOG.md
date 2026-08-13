@@ -19,24 +19,57 @@ The title phenomenon on a bar clock. New module `flow_correlation.py` + driver
   share with a day-level cluster-bootstrap 95% CI. Signed OFI is EXCLUDED by construction
   (the DV is built from the flows) and all treatments enter at lag 1 (same-bar RV shares
   sub-returns with the same-bar correlation estimate).
-* **Data-driven regimes** (`flow_corr_ms_regimes_*`): per-day 2-state Markov-switching
-  regression on the z_flow level series (switching intercept and variance, common AR(1);
-  Hamilton filter / Kim smoother reused from markov_switching_vecm) against the 1-state
-  AR(1) null, calibrated by PARAMETRIC BOOTSTRAP LR -- the mixing weight is unidentified
-  under H0 (Davies), so chi-square critical values are invalid. Reports the data's own
-  low/high tandem regimes, persistence, per-day significance counts, and how high-regime
-  occupancy aligns with the a-priori day labels. No constructed ranges anywhere.
+* **Data-driven regimes** (`flow_corr_ms_regimes_*`): per-day Markov-switching regression
+  on the z_flow level series (switching intercept and variance, common AR(1); Hamilton
+  filter / Kim smoother reused from markov_switching_vecm) with the NUMBER of regimes
+  chosen per day by SEQUENTIAL parametric-bootstrap LR (select_k_ms: K vs K+1 from K=1,
+  strict rejection, capped at --k-max, default 4) -- the mixing weight is unidentified
+  under H0 (Davies), so chi-square critical values are invalid and the null LR is
+  simulated (simulate_ms). Nothing presupposes the levels either: fitted regime means
+  land wherever the data puts them (zero, weakly negative, strongly positive). The EM
+  runs from the deterministic quantile init plus seeded perturbed restarts and keeps the
+  best likelihood -- a lucky optimum on the data against unlucky ones on the simulated
+  nulls would otherwise read as evidence for extra regimes. Reports the per-group chosen-K
+  distribution, regime levels at the modal K, top-regime occupancy by day label,
+  persistence, and REGIME-DYNAMICS ASYMMETRY: the per-day log duration ratio (top vs
+  bottom persistence, sign-flip p) and the mean signed SPY bar return in the bar BEFORE
+  each entry into the top regime (demeaned by the day's own mean; negative = the
+  high-tandem regime is entered on selling). No constructed ranges anywhere.
+* **Tandem-flow asymmetry** (`flow_corr_asymmetry_*`): quadrant SEMICORRELATIONS of the
+  grid-level OFI innovations -- down-down vs up-up co-movement. Quadrant truncation
+  biases the levels identically under any point-symmetric distribution, so the per-day
+  Fisher-z gap has a zero null; day-level sign-flip inference. The innovation-level
+  analogue of Table 5's corner asymmetry.
+* **Price-discovery link** (`flow_corr_pd_link_*`): does tandem flow move PRICE
+  DISCOVERY? Within-day windows (default 30 min): CS_ES / IS_mid_ES from the
+  fixed-(1,-1) VECM on each window's mids, regressed on the window's mean z_flow and on
+  the window's smoothed top-regime occupancy (chosen-K fit), plus a top-regime-majority
+  contrast -- day FE, day-clustered SEs, CS rows on ec_valid windows only.
+* **Asymmetry** (`flow_corr_asymmetry_*` + new MS-table columns): (i) downside/upside
+  QUADRANT SEMICORRELATIONS of the grid-level OFI innovations -- joint-selling vs
+  joint-buying co-movement; quadrant truncation biases the levels identically under any
+  point-symmetric distribution, so the per-day Fisher-z gap has a zero null, tested by a
+  day-level SIGN-FLIP test (the innovation-level analogue of Table 5's corner asymmetry);
+  (ii) regime-dynamics asymmetry inside the MS fit: the per-day log duration ratio
+  (is the high-tandem regime stickier?) and the entry-direction statistic (mean signed
+  SPY bar return in the bar before each high-regime entry, demeaned by the day's own
+  mean), both with day-level sign-flip p.
 * Wiring: STAGE 5b runs the 1s pass always and the fine-grid pass when fine frames exist
   (`--tag` keeps the stems apart); budgets FLOW_MS_BOOT (default 99 LR draws/day), N_BOOT /
   FINE_N_BOOT for the mediation bootstrap. `build_all_tables` gains flow_tier1 /
   flow_mediation / flow_ms_regimes (via `_flow_table`; the flow module returns plain
   frames so paper_tables owns the Table type without an import cycle).
-* Gate: `test_flow_correlation.py` (7 checks) -- innovation-corr recovery under unequal AR
-  persistence, per-bar corr + coverage floor, EXACT OFI injection via designed quantity
+* Gate: `test_flow_correlation.py` (11 checks) -- innovation-corr recovery under unequal
+  AR persistence, per-bar corr + coverage floor, EXACT OFI injection via designed quantity
   paths + halt-NaN propagation, bar-level recovery of a planted correlation, mediation
   finds a planted indirect channel and stays clean under the null, MS detects a planted
-  2-state series and does not reject a 1-state one, and end-to-end table/driver/runner
-  wiring. Added to the STAGE 1 list.
+  2-state series and does not reject a 1-state one, semicorrelation asymmetry (null
+  clean, planted sign-dependent factor found), regime-dynamics asymmetry (planted sticky
+  high regime + entered-on-selling detected), select_k (AR(1) -> K=1; planted 3-state ->
+  K=3 with means recovered), pd-link planted-slope recovery under day-clustered
+  inference, and end-to-end table/driver/runner wiring. Added to the STAGE 1 list.
+  NOTE: the sequential LR needs B >= 1/alpha draws to reject at all (min p = 1/(B+1));
+  the runner default is 99 per stage.
 * Tier 1's contrast row generalizes to any two-label day split (volatile-benchmark when
   present, else the two labels found -- the synthetic self-test uses calm/stress).
 * Known, pre-existing: `paper_tables` SELF-TEST's t9_both_ways job can fail with a
