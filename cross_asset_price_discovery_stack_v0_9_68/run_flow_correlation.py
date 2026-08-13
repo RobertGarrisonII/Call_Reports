@@ -116,8 +116,12 @@ def build_parser():
                     help="largest regime count the sequential LR may select per day")
     ap.add_argument("--window-minutes", type=int, default=30,
                     help="within-day window length for the price-discovery link panel")
-    ap.add_argument("--pd-lags", type=int, default=5,
-                    help="VECM lag order for the per-window CS/IS estimates")
+    ap.add_argument("--pd-lags", type=int, default=-1,
+                    help="VECM lag order for the per-window CS/IS estimates; -1 (default) "
+                         "resolves from the grid via frequency_defaults so the model keeps "
+                         "~5s of wall-clock memory at any interval (5 lags at 1s, 60 at "
+                         "10ms) -- a fixed lag COUNT means a different memory span on "
+                         "every grid")
     ap.add_argument("--n-perm", type=int, default=20000,
                     help="day-level permutation draws for the Tier 1 contrast")
     ap.add_argument("--seed", type=int, default=0)
@@ -152,10 +156,16 @@ def main(argv=None):
     a = build_parser().parse_args(argv)
     sessions = _load(a)
     print(f"{len(sessions)} sessions; bar={a.bar_seconds}s, ar_order={a.ar_order}")
-    if a.min_rest_steps < 0:
+    if a.min_rest_steps < 0 or a.pd_lags < 0:
         import cross_asset_pd_liquidity as ca
-        a.min_rest_steps = ca.frequency_defaults(sessions[0][2])["min_rest_steps"]
-        print(f"min_rest_steps resolved from grid: {a.min_rest_steps}")
+        fd = ca.frequency_defaults(sessions[0][2])
+        if a.min_rest_steps < 0:
+            a.min_rest_steps = fd["min_rest_steps"]
+            print(f"min_rest_steps resolved from grid: {a.min_rest_steps}")
+        if a.pd_lags < 0:
+            a.pd_lags = fd["n_lags"]
+            print(f"pd-lags resolved from grid: {a.pd_lags} "
+                  f"(~{fd['n_lags'] * fd['dt']:.1f}s of memory)")
 
     tag = (a.tag + "_") if a.tag else ""
     print("[flow] building per-day bars ...", flush=True)

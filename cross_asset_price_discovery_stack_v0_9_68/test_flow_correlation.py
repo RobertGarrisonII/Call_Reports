@@ -362,6 +362,12 @@ def check_tables_end_to_end():
     import run_flow_correlation as rfc
     hp = rfc.build_parser().format_help()
     ok5 = all(f in hp for f in ("--bar-seconds", "--ms-boot", "--n-perm", "--out-dir"))
+    # lag length must be denominated in WALL CLOCK, not lag count: the pd-link default
+    # resolves from the grid (5 lags at 1s, capped 60 at 10ms), like run_analysis
+    import cross_asset_pd_liquidity as ca
+    ok5 = (ok5 and rfc.build_parser().parse_args([]).pd_lags == -1
+           and ca.frequency_defaults(dt=1.0)["n_lags"] == 5
+           and ca.frequency_defaults(dt=0.01)["n_lags"] == 60)
     print(f"  tier1 z: ben {zb:.3f} < vol {zv:.3f}, perm p {p:.4f}; mediation rows ok: {ok2}; "
           f"ms table ok: {ok3}; driver wired: {ok4}; runner flags ok: {ok5}")
     return ok1 and ok2 and ok3 and ok4 and ok5

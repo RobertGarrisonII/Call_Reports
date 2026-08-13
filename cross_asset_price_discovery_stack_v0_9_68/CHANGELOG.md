@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.9.69 -- hotfix: frequency-scaled lags for the pd-link window VECM
+
+Lag length is only meaningful in WALL CLOCK: 5 lags at 1s is five seconds of memory, 5
+lags at 10ms is fifty milliseconds. The v0.9.68 pd-link table passed a fixed --pd-lags 5
+to the per-window VECM on BOTH grids -- right at 1s, effectively memoryless at 10ms.
+
+* `run_flow_correlation.py --pd-lags` now defaults to -1 = resolve from the grid via
+  `frequency_defaults` (~5s of memory: 5 lags at 1s, capped 60 at 10ms), exactly like
+  run_analysis. An explicit integer still overrides.
+* Gate: the end-to-end check pins the -1 default and the 1s/10ms resolution values.
+* For reference, the other layers were already denominated correctly: raw-grid models
+  scale by frequency_defaults; bar-clock models (RealBar, flow correlation, mediation)
+  are grid-invariant because the bar is fixed wall-clock; Table 9's rolling-window
+  columns are bar-denominated on purpose (the MA artifact lives at the window length in
+  bars), which is one more reason their magnitudes are not comparable across grids.
+
 ## v0.9.68 -- tandem order flow as a time series (Tier 1 / Tier 2 / MS regimes)
 
 The title phenomenon on a bar clock. New module `flow_correlation.py` + driver

@@ -858,14 +858,21 @@ def table_flow_corr_ms_regimes(sessions, bar_seconds=60, n_levels=10, min_rest_s
 # ══════════════════════════════════════════════════════════════════════════════
 #  Flow-correlation regimes -> price discovery (the payoff link)
 # ══════════════════════════════════════════════════════════════════════════════
-def window_pd_panel(sessions, bars_map, series_map=None, window_minutes=30, n_lags=5):
+def window_pd_panel(sessions, bars_map, series_map=None, window_minutes=30, n_lags=None):
     """Within-day windows: price-discovery shares next to the tandem-flow state.
 
     For each ``window_minutes`` block of each session: CS_ES and IS_mid_ES from the
     fixed-(1,-1) VECM on the window's mids (price_discovery_shares.estimate_day, with its
     ec_valid flag), the window mean z_flow, and the window mean smoothed top-regime
-    probability (when the day's chosen K >= 2). Returns a DataFrame, one row per window."""
+    probability (when the day's chosen K >= 2). Returns a DataFrame, one row per window.
+
+    ``n_lags=None`` resolves from the grid (frequency_defaults, ~5s of wall-clock memory:
+    5 lags at 1s, capped 60 at 10ms) -- a fixed lag COUNT would mean a different memory
+    span on every grid."""
     import price_discovery_shares as pds
+    if n_lags is None and sessions:
+        n_lags = ca.frequency_defaults(sessions[0][2])["n_lags"]
+    n_lags = 5 if n_lags is None else int(n_lags)
     rows = []
     for date, regime, df in sessions:
         b = bars_map.get(str(date))
@@ -961,12 +968,16 @@ def _pd_link_table(panel):
 
 
 def table_flow_pd_link(sessions, bar_seconds=60, n_levels=10, min_rest_steps=0,
-                       ar_order=5, window_minutes=30, n_lags=5, B=99, seed=0,
+                       ar_order=5, window_minutes=30, n_lags=None, B=99, seed=0,
                        min_bars=60, k_max=4, bars=None, recs=None, series_map=None):
     """Does tandem flow move PRICE DISCOVERY? -> (DataFrame, notes). Window-level FE
     panel: within-day windows' CS/IS regressed on the window's mean z_flow and on the
     window's smoothed top-regime occupancy (from the chosen-K Markov fit), plus a
-    top-regime-majority contrast. Day FE + day-clustered SEs throughout."""
+    top-regime-majority contrast. Day FE + day-clustered SEs throughout. ``n_lags=None``
+    resolves from the grid (see window_pd_panel)."""
+    if n_lags is None and sessions:
+        n_lags = ca.frequency_defaults(sessions[0][2])["n_lags"]
+    n_lags = 5 if n_lags is None else int(n_lags)
     bars = per_day_bars(sessions, bar_seconds, n_levels, min_rest_steps, ar_order) \
         if bars is None else bars
     if series_map is None:
