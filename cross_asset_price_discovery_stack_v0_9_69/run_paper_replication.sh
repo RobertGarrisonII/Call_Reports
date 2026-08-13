@@ -384,6 +384,7 @@ if have_stage 1; then
            test_improvements.py \
            test_golden_numbers.py \
            test_flow_correlation.py \
+           test_copula_tables.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -1009,6 +1010,32 @@ if have_stage 5; then
           --n-boot "${FINE_N_BOOT:-199}" \
         || info "STAGE 5b (${FINE_INTERVAL} flow corr) FAILED -- see $LOG; continuing"
     fi
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 5c — copula tail dependence (v0.9.70)
+#
+# A Gaussian DCC has lambda = 0 at any rho < 1 -- zero joint-tail dependence by
+# assumption, backwards for a crash paper. STAGE 5c fits the copula menu on
+# GARCH-margin pseudo-observations: return tails by regime, the thin-vs-deep
+# book split (liquidity contagion), and the OFI-innovation copula (tandem-
+# selling tail dependence, the parametric twin of the semicorrelation table).
+# 1s ONLY: at 10ms the 80-89% stale-repeat rate turns the rank PIT into ties
+# and the copula measures staleness, not dependence.
+# ══════════════════════════════════════════════════════════════════════════════
+if have_stage 5; then
+  say "STAGE 5c Copula tail dependence: regimes, book-depth split, flow innovations"
+  COPARGS="--out-dir ${OUT}"
+  if [ "$SOURCE" = "demo" ]; then
+    # shellcheck disable=SC2086
+    run_show $PY run_copula.py --source demo --tag demo $COPARGS \
+      || info "STAGE 5c (demo copula) FAILED -- see $LOG; continuing"
+  else
+    # shellcheck disable=SC2086
+    run_show $PY run_copula.py --source load --pickle "$FRAMES" \
+        --volatile "$VOLATILE" --mwcb "$MWCB" --tag "$INTERVAL" $COPARGS \
+      || info "STAGE 5c (${INTERVAL} copula) FAILED -- see $LOG; continuing"
   fi
 fi
 

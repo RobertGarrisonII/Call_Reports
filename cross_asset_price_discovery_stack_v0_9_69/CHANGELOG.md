@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.9.70 -- copula tail dependence wired into the replication (STAGE 5c)
+
+`copula_garch.py` existed but was ORPHANED -- no driver stage, no table, no gate. It now
+ships as three exhibits, because a Gaussian DCC asserts lambda = 0 at any rho < 1 (zero
+joint-tail dependence by assumption -- backwards for a crash paper):
+
+* **Family menu completed**: Joe (upper tail, heavier than Gumbel; also the J in the
+  existing SJC), Frank (dependence-without-tails null), and the 180-degree survival
+  rotations clayton180/gumbel180 (tails swap; density at (u,v) = base at (1-u,1-v)) join
+  {gaussian, t, clayton, gumbel, bb1, sjc}. New simulators: Gumbel via the
+  Chambers-Mallows-Stuck positive-stable frailty, Joe via conditional-inverse
+  (Rosenblatt), Frank via its closed-form conditional inverse (a first-cut inversion had
+  the denominator algebra wrong -- theta_hat pinned at the boundary; fixed and pinned by
+  gate), rotations by reflection.
+* **`run_copula.py` + STAGE 5c** (1s ONLY: at 10ms the 80-89% stale-repeat rate turns the
+  rank PIT into ties and the copula measures staleness, not dependence):
+  - `copula_regimes_*`: per-day BIC winner over the menu on GARCH(1,1)-X-margin
+    pseudo-observations of the two legs' returns; lambda_L / lambda_U; the BB1
+    lower-minus-upper contrast (joint crashes vs joint rallies) with day-level sign-flip
+    p; the boundary-corrected BB1-vs-Clayton nested LR for upper-tail dependence.
+  - `copula_liquidity_*`: crash-tail lambda_L in thin- vs deep-book rows WITHIN each day
+    (thin = total resting depth below the day median), day-level sign-flip inference --
+    the liquidity-contagion direction stated at the tail.
+  - `copula_flows_*`: the copula on the OFI INNOVATIONS -- tandem-SELLING tail
+    dependence, the parametric, likelihood-based twin of the semicorrelation exhibit.
+  Open/close trimmed (default 15 min); halt rows dropped by the finite-row mask; all
+  cross-day inference at the day level.
+* `build_all_tables` gains copula_regimes / copula_flows self-test jobs (trimmed menu).
+* **Reflection-debiased tail asymmetry.** The gate's symmetric-control DGP exposed a real
+  bias: BB1's raw lambda_L - lambda_U is systematically NONZERO on tail-free symmetric
+  data (the Gumbel-type parameter absorbs Gaussian-like body dependence). The reported
+  contrast is now the half-difference of the fit and the fit on the REFLECTED
+  pseudo-observations (same allocation bias, asymmetry sign-flipped), which has an exact
+  zero-mean null under any point-symmetric copula.
+* Gate: `test_copula_tables.py` (6 checks) -- density normalization for the new families,
+  family recovery on simulated truths (Clayton / Gumbel / Joe / Frank / rotated-Clayton,
+  with the rotation ranked below the base on unrotated data), a planted sign-dependent
+  return factor found by the regime table while a symmetric DGP stays clean, the
+  liquidity split inventing NO effect under a depth-independent DGP, a planted
+  asymmetric tandem-flow DGP found by the flow table, and driver/runner wiring. Added to
+  the STAGE 1 list.
+
 ## v0.9.69 -- hotfix: frequency-scaled lags for the pd-link window VECM
 
 Lag length is only meaningful in WALL CLOCK: 5 lags at 1s is five seconds of memory, 5

@@ -757,6 +757,18 @@ def _flow_table(fn_name, title, sessions, **kw):
     return Table(title, df, notes)
 
 
+def _copula_table(fn_name, title, sessions, **kw):
+    """Same wrapper for the copula_garch (DataFrame, notes) builders."""
+    import copula_garch as cg
+    df, notes = getattr(cg, fn_name)(sessions, **kw)
+    if hasattr(df, "round"):
+        try:
+            df = df.round(4)
+        except (TypeError, ValueError):
+            pass
+    return Table(title, df, notes)
+
+
 def build_all_tables(sessions, counts_fn, vol, mwcb_treated, mwcb_control, release_by_date,
                      calm_session, stress_session, n_boot=40, verbose=True, n_jobs=None):
     """Build every table on the provided synthetic/real inputs. Each builder is isolated so
@@ -804,6 +816,18 @@ def build_all_tables(sessions, counts_fn, vol, mwcb_treated, mwcb_control, relea
                                              "Tandem flow and price discovery (window panel)",
                                              sessions, window_minutes=10, B=39, k_max=2,
                                              min_bars=25)),
+        # v0.9.70: copula tail dependence (families trimmed for self-test speed; the full
+        # menu is exercised by test_copula_tables' simulation checks)
+        ("copula_regimes", lambda: _copula_table("table_copula_regimes",
+                                                 "Return-tail dependence by regime (copula)",
+                                                 sessions, families=("gaussian", "frank",
+                                                                     "clayton", "gumbel", "joe"),
+                                                 min_obs=500, trim_min=2.0, n_flip=2000)),
+        ("copula_flows", lambda: _copula_table("table_copula_flows",
+                                               "Tandem-flow tail dependence (OFI copula)",
+                                               sessions, families=("gaussian", "frank",
+                                                                   "clayton", "gumbel", "joe"),
+                                               min_obs=500, trim_min=2.0, n_flip=2000)),
         ("flow_asymmetry", lambda: _flow_table("table_flow_corr_asymmetry",
                                                "Tandem-flow asymmetry: joint selling vs joint buying",
                                                sessions, n_flip=2000)),

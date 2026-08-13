@@ -126,6 +126,36 @@ def _gumbel_logpdf(u, v, th):
             + (1 / th - 2) * np.log(sab) + np.log(A + th - 1))
 
 
+# ---- Joe (upper tail, heavier than Gumbel, near-independent center) ----
+# C(u,v) = 1 - [ub^th + vb^th - ub^th vb^th]^(1/th), ub=1-u, th>=1.
+# lambda_U = 2 - 2^(1/th), lambda_L = 0.  Density: Joe (1997), eq. 5.4 family.
+def _joe_logpdf(u, v, th):
+    u = _clip(u); v = _clip(v); th = max(th, 1.0 + 1e-6)
+    ub = 1.0 - u; vb = 1.0 - v
+    ut = ub**th; vt = vb**th
+    A = np.maximum(ut + vt - ut * vt, 1e-300)
+    return ((1.0 / th - 2.0) * np.log(A) + (th - 1.0) * (np.log(ub) + np.log(vb))
+            + np.log(np.maximum(th - 1.0 + ut + vt - ut * vt, 1e-300)))
+
+
+def _joe_hfunc(v, u, th):
+    """C_{2|1}(v|u) = dC/du for Joe, monotone 0->1 in v (inverse-CDF sampling)."""
+    ub = 1.0 - _clip(u); vb = 1.0 - _clip(v)
+    ut = ub**th; vt = vb**th
+    A = np.maximum(ut + vt - ut * vt, 1e-300)
+    return A**(1.0 / th - 1.0) * ub**(th - 1.0) * (1.0 - vt)
+
+
+# ---- Frank (radially symmetric, NO tail dependence -- a dependence-without-tails null) ----
+def _frank_logpdf(u, v, th):
+    u = _clip(u); v = _clip(v)
+    th = np.clip(th, 1e-3, 60.0)
+    em = -np.expm1(-th)                                   # 1 - e^{-th}
+    num = np.log(th) + np.log(em) - th * (u + v)
+    den = em - np.expm1(-th * u) * np.expm1(-th * v)
+    return num - 2.0 * np.log(np.maximum(np.abs(den), 1e-300))
+
+
 # ---- BB1 (Joe two-parameter "Clayton-Gumbel"): BOTH tails, analytic density ----
 # C(u,v) = [1 + ((u^-th - 1)^d + (v^-th - 1)^d)^(1/d)]^(-1/th), th>0, d>=1.
 # Nests Clayton at d=1 (lambda_U->0) and approaches Gumbel as th->0.
@@ -210,6 +240,23 @@ def _fit_copula(name, u, v):
                                        bounds=(1.001, 30.0), method="bounded")
         th = float(res.x); ll, k, params = -res.fun, 1, {"theta": th}
         lL, lU = 0.0, 2.0 - 2.0**(1.0 / th)
+    elif name == "joe":
+        res = optimize.minimize_scalar(lambda t: -np.sum(_joe_logpdf(u, v, t)),
+                                       bounds=(1.001, 30.0), method="bounded")
+        th = float(res.x); ll, k, params = -res.fun, 1, {"theta": th}
+        lL, lU = 0.0, 2.0 - 2.0**(1.0 / th)
+    elif name == "frank":
+        res = optimize.minimize_scalar(lambda t: -np.sum(_frank_logpdf(u, v, t)),
+                                       bounds=(1e-2, 50.0), method="bounded")
+        th = float(res.x); ll, k, params = -res.fun, 1, {"theta": th}
+        lL, lU = 0.0, 0.0
+    elif name in ("clayton180", "gumbel180"):
+        # survival (180-degree) rotations: density at (u,v) = base density at (1-u,1-v);
+        # the tails swap (a rotated Clayton is UPPER-tail-only, a rotated Gumbel LOWER-only)
+        base = _fit_copula(name[:-3], 1.0 - u, 1.0 - v)
+        return {"name": name, "params": base["params"], "loglik": base["loglik"],
+                "k": base["k"], "aic": base["aic"], "bic": base["bic"],
+                "lambda_L": base["lambda_U"], "lambda_U": base["lambda_L"]}
     elif name == "bb1":
         th0 = optimize.minimize_scalar(lambda t: -np.sum(_clayton_logpdf(u, v, t)),
                                        bounds=(1e-2, 30.0), method="bounded").x
@@ -239,7 +286,8 @@ def _fit_copula(name, u, v):
             "lambda_L": float(lL), "lambda_U": float(lU)}
 
 
-_FAMILIES = ("gaussian", "t", "clayton", "gumbel", "bb1", "sjc")
+_FAMILIES = ("gaussian", "frank", "t", "clayton", "gumbel", "joe",
+             "clayton180", "gumbel180", "bb1", "sjc")
 
 
 def select_copula(U_or_Z, families=_FAMILIES, is_uniform=False) -> dict:
@@ -291,6 +339,36 @@ def simulate_copula(name, n, params, rng=None):
         g = rng.gamma(1.0 / th, 1.0, size=n)
         e = rng.exponential(1.0, size=(n, 2))
         return (1.0 + e / g[:, None])**(-1.0 / th)
+    if name == "gumbel":                                  # positive-stable frailty (CMS sampler)
+        th = max(params["theta"], 1.0 + 1e-6)
+        alpha = 1.0 / th
+        # Chambers-Mallows-Stuck for a positive alpha-stable S
+        theta_u = rng.uniform(0.0, np.pi, size=n)
+        w = rng.exponential(1.0, size=n)
+        a0 = np.sin(alpha * theta_u) / (np.sin(theta_u) ** (1.0 / alpha))
+        b0 = (np.sin((1.0 - alpha) * theta_u) / w) ** ((1.0 - alpha) / alpha)
+        S = np.maximum(a0 * b0, 1e-300)
+        e = rng.exponential(1.0, size=(n, 2))
+        return np.exp(-(e / S[:, None]) ** (1.0 / th))
+    if name == "joe":                                     # inverse conditional CDF (Rosenblatt)
+        th = max(params["theta"], 1.0 + 1e-6)
+        u = rng.uniform(size=n); t = rng.uniform(size=n); v = np.empty(n)
+        for i in range(n):
+            f = lambda vv: _joe_hfunc(vv, u[i], th) - t[i]
+            try:
+                v[i] = optimize.brentq(f, 1e-9, 1 - 1e-9, maxiter=100, xtol=1e-10)
+            except Exception:
+                v[i] = t[i]
+        return np.column_stack([u, v])
+    if name == "frank":                                   # closed-form conditional inverse
+        # C_{2|1}(v|u)=t with A=e^{-th u}, D=e^{-th}-1  =>  e^{-th v} = 1 + tD/(A(1-t)+t)
+        th = float(np.clip(params["theta"], 1e-3, 60.0))
+        u = rng.uniform(size=n); t = rng.uniform(size=n)
+        A = np.exp(-th * u)
+        v = -np.log1p(t * np.expm1(-th) / (A * (1.0 - t) + t)) / th
+        return np.column_stack([u, np.clip(v, 1e-12, 1 - 1e-12)])
+    if name in ("clayton180", "gumbel180"):               # survival rotation = reflection
+        return 1.0 - simulate_copula(name[:-3], n, params, rng)
     if name == "bb1":                                     # inverse conditional CDF (Rosenblatt)
         th, d = params["theta"], params["delta"]
         u = rng.uniform(size=n); t = rng.uniform(size=n); v = np.empty(n)
@@ -674,6 +752,250 @@ def _selftest() -> bool:
     ok = all([clayton_ok, sel_ok, sjc_ok, bb1_ok, lr_ok, dcc_ok, liq_ok, e2e_ok])
     print("\nchecks:", ok)
     return ok
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Paper exhibits (v0.9.70): day-level copula records with day-clustered inference.
+# These return (DataFrame, notes) -- paper_tables owns the Table type (no cycle).
+# ════════════════════════════════════════════════════════════════════════════
+def _regime_order_cg(labels):
+    pref = ["benchmark", "volatile", "mwcb"]
+    seen = list(dict.fromkeys(labels))
+    return [r for r in pref if r in seen] + sorted(r for r in seen if r not in pref)
+
+
+def _day_R(df, names=("SPY", "ES")):
+    """Log-mid returns (T-1 x 2) for one session frame; finite rows are the caller's
+    problem (garch_margins drops them). Mids from *_mid columns when present, else from
+    the level-1 book."""
+    import cross_asset_pd_liquidity as ca
+    cols = []
+    for a in names:
+        if f"{a}_mid" in df.columns:
+            m = df[f"{a}_mid"].to_numpy(float)
+        else:
+            m = np.asarray(ca._mid(df, a), float)
+        cols.append(m)
+    P = np.column_stack(cols)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.diff(np.log(np.where(P > 0, P, np.nan)), axis=0)
+
+
+def _trim_open_close(df, trim_min=15.0):
+    """Boolean row mask dropping the first/last trim_min minutes of the session (cash-open
+    auction and close desync)."""
+    t0, t1 = df.index[0], df.index[-1]
+    lo = t0 + pd.Timedelta(minutes=trim_min)
+    hi = t1 - pd.Timedelta(minutes=trim_min)
+    return (df.index >= lo) & (df.index <= hi)
+
+
+def _bb1_asym(u, v):
+    """Reflection-debiased BB1 lower-minus-upper tail contrast. BB1 allocates tail mass
+    asymmetrically even on tail-free SYMMETRIC data (its Gumbel-type parameter absorbs
+    Gaussian-like body dependence), so the raw lambda_L - lambda_U has a nonzero null.
+    The reflected fit (1-u, 1-v) carries the same allocation bias with the true asymmetry
+    sign-flipped; the half-difference therefore has an EXACT zero-mean null under any
+    point-symmetric copula. Returns (asym, fit, fit_reflected)."""
+    f = _fit_copula("bb1", u, v)
+    fr = _fit_copula("bb1", 1.0 - u, 1.0 - v)
+    d = (f["lambda_L"] - f["lambda_U"]) - (fr["lambda_L"] - fr["lambda_U"])
+    return 0.5 * d, f, fr
+
+
+def day_copula_records(sessions, families=_FAMILIES, min_obs=1000, trim_min=15.0,
+                       verbose=False):
+    """Per-day copula fits on GARCH-margin pseudo-observations of the two legs' returns.
+    Every record carries the BIC-selected family's tails AND the reflection-debiased BB1
+    lower-minus-upper contrast (comparable across days regardless of which family wins,
+    with an exact symmetric null -- see _bb1_asym)."""
+    fams = tuple(families) if "bb1" in families else tuple(families) + ("bb1",)
+    recs = []
+    for date, regime, df in sessions:
+        try:
+            keep = _trim_open_close(df, trim_min)
+            R = _day_R(df.loc[keep])
+            R = R[np.isfinite(R).all(axis=1)]
+            if len(R) < min_obs:
+                if verbose:
+                    print(f"  [copula] {date}: {len(R)} finite returns < {min_obs} -- skipped")
+                continue
+            U, _Z, _m = garch_margins(R)
+            sel = select_copula(U, families=fams, is_uniform=True)
+            best = sel["fits"][sel["best"]]
+            asym, bb1, _bb1r = _bb1_asym(U[:, 0], U[:, 1])
+            nl = sel.get("nested_lr", {})
+            recs.append({"date": str(date), "regime": str(regime), "best": best["name"],
+                         "lambda_L": best["lambda_L"], "lambda_U": best["lambda_U"],
+                         "bb1_lL": bb1["lambda_L"], "bb1_lU": bb1["lambda_U"],
+                         "dlam_bb1": float(asym),
+                         "p_upper_lr": nl.get("p_boundary", np.nan), "n": int(len(R))})
+            if verbose:
+                print(f"  [copula] {date}: best={best['name']} lL={best['lambda_L']:.3f} "
+                      f"lU={best['lambda_U']:.3f} asym={asym:+.3f} (n={len(R)})", flush=True)
+        except Exception as e:                             # pragma: no cover - defensive
+            if verbose:
+                print(f"  [copula] {date}: SKIPPED ({type(e).__name__}: {e})")
+    return recs
+
+
+def _group_copula_rows(recs, n_flip=20000):
+    from flow_correlation import sign_flip_p
+    per = pd.DataFrame(recs)
+    out = {}
+    for gname in _regime_order_cg(per.regime) + ["all days"]:
+        g = per if gname == "all days" else per[per.regime == gname]
+        if g.empty:
+            continue
+        counts = g.best.value_counts()
+        d = g.dlam_bb1.to_numpy(float)
+        d = d[np.isfinite(d)]
+        out[gname] = {
+            "best family (days)": " ".join(f"{k}:{v}" for k, v in counts.items()),
+            "median lambda_L": float(g.lambda_L.median()),
+            "median lambda_U": float(g.lambda_U.median()),
+            "mean tail asym (L-U)": float(d.mean()) if len(d) else np.nan,
+            "se(asym)": float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1 else np.nan,
+            "sign-flip p": sign_flip_p(d, n_flip=n_flip, seed=3) if len(d) else np.nan,
+            "median p(upper tail LR)": float(g.p_upper_lr.median()),
+            "days": int(len(g))}
+    df = pd.DataFrame(out).T
+    df.index.name = "day group"
+    return df
+
+
+def table_copula_regimes(sessions, families=_FAMILIES, min_obs=1000, trim_min=15.0,
+                         n_flip=20000, verbose=False, recs=None):
+    """Return-copula tail dependence by a-priori regime -> (DataFrame, notes)."""
+    recs = day_copula_records(sessions, families, min_obs, trim_min, verbose) \
+        if recs is None else recs
+    if not recs:
+        return pd.DataFrame(), "no usable sessions"
+    df = _group_copula_rows(recs, n_flip=n_flip)
+    notes = ("Per-day copula on GARCH(1,1)-X-margin pseudo-observations of the two legs' "
+             "log-mid returns (rank PIT; first/last %.0f min trimmed; halt rows dropped by "
+             "the finite-row mask). 'best' is the BIC winner over {%s}. Tail-dependence "
+             "columns are the winner's; the L-minus-U contrast uses BB1 on every day "
+             "(both tails estimated regardless of winner) with a day-level sign-flip p. "
+             "'p(upper tail LR)' is the boundary-corrected BB1-vs-Clayton nested LR: small "
+             "= upper-tail dependence beyond the crash tail. A Gaussian DCC asserts "
+             "lambda = 0 at any rho < 1; a positive dlam says joint crashes are tighter "
+             "than joint rallies." % (trim_min, ", ".join(families)))
+    return df, notes
+
+
+def table_copula_liquidity(sessions, min_obs=1000, trim_min=15.0, n_levels=10,
+                           n_flip=20000, verbose=False):
+    """Within-day thin-vs-deep book split of the crash-tail dependence -> (DataFrame,
+    notes). Thinness = TOTAL resting depth (both legs, all levels) below the day median;
+    BB1 fit per half on the full-day pseudo-observations."""
+    from flow_correlation import sign_flip_p
+    import cross_asset_pd_liquidity as ca
+    recs = []
+    for date, regime, df in sessions:
+        try:
+            keep = _trim_open_close(df, trim_min)
+            dfk = df.loc[keep]
+            R = _day_R(dfk)
+            fin = np.isfinite(R).all(axis=1)
+            if int(fin.sum()) < min_obs:
+                continue
+            depth = np.zeros(len(dfk))
+            for a in ("SPY", "ES"):
+                for side in ("bid", "ask"):
+                    for i in range(1, n_levels + 1):
+                        depth += np.nan_to_num(dfk[f"{a}_{side}quantity_{i}"].to_numpy(float))
+            depth = depth[1:][fin]                         # align to returns
+            U, _Z, _m = garch_margins(R)                   # garch_margins re-masks; recompute mask
+            # garch_margins dropped non-finite rows internally in the same order
+            thin = depth < np.median(depth)
+            if min(int(thin.sum()), int((~thin).sum())) < max(200, min_obs // 10):
+                continue
+            f_thin = _fit_copula("bb1", U[thin, 0], U[thin, 1])
+            f_deep = _fit_copula("bb1", U[~thin, 0], U[~thin, 1])
+            recs.append({"date": str(date), "regime": str(regime),
+                         "lL_thin": f_thin["lambda_L"], "lL_deep": f_deep["lambda_L"],
+                         "d_lL": f_thin["lambda_L"] - f_deep["lambda_L"],
+                         "n_thin": int(thin.sum()), "n_deep": int((~thin).sum())})
+            if verbose:
+                print(f"  [copula-liq] {date}: lL thin {f_thin['lambda_L']:.3f} vs deep "
+                      f"{f_deep['lambda_L']:.3f}", flush=True)
+        except Exception as e:                             # pragma: no cover - defensive
+            if verbose:
+                print(f"  [copula-liq] {date}: SKIPPED ({type(e).__name__}: {e})")
+    if not recs:
+        return pd.DataFrame(), "no usable sessions"
+    per = pd.DataFrame(recs)
+    out = {}
+    for gname in _regime_order_cg(per.regime) + ["all days"]:
+        g = per if gname == "all days" else per[per.regime == gname]
+        if g.empty:
+            continue
+        d = g.d_lL.to_numpy(float)
+        d = d[np.isfinite(d)]
+        out[gname] = {"median lambda_L thin": float(g.lL_thin.median()),
+                      "median lambda_L deep": float(g.lL_deep.median()),
+                      "mean delta (thin-deep)": float(d.mean()) if len(d) else np.nan,
+                      "se(delta)": float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1 else np.nan,
+                      "sign-flip p": sign_flip_p(d, n_flip=n_flip, seed=4) if len(d) else np.nan,
+                      "days": int(len(g))}
+    dfo = pd.DataFrame(out).T
+    dfo.index.name = "day group"
+    notes = ("Crash-tail (lambda_L, BB1) dependence of the two legs' returns in thin- vs "
+             "deep-book rows WITHIN each day: thin = total resting depth (both legs, %d "
+             "levels, both sides) below the day median; pseudo-observations from full-day "
+             "GARCH margins; first/last %.0f min trimmed. A positive delta = joint-crash "
+             "dependence rises as the books empty -- the liquidity-contagion direction. "
+             "Day-level sign-flip p." % (n_levels, trim_min))
+    return dfo, notes
+
+
+def table_copula_flows(sessions, families=_FAMILIES, min_obs=1000, trim_min=15.0,
+                       n_levels=10, min_rest_steps=0, ar_order=5, n_flip=20000,
+                       verbose=False):
+    """Copula on the two legs' OFI INNOVATIONS -> (DataFrame, notes): the parametric twin
+    of the semicorrelation exhibit, with likelihood-based tail asymmetry."""
+    import flow_correlation as fcm
+    recs = []
+    for date, regime, df in sessions:
+        try:
+            keep = _trim_open_close(df, trim_min)
+            dfk = df.loc[keep]
+            u1 = fcm.ofi_innovations(dfk, "SPY", n_levels, min_rest_steps, ar_order)
+            u2 = fcm.ofi_innovations(dfk, "ES", n_levels, min_rest_steps, ar_order)
+            m = np.isfinite(u1) & np.isfinite(u2)
+            if int(m.sum()) < min_obs:
+                if verbose:
+                    print(f"  [copula-flow] {date}: {int(m.sum())} pairs < {min_obs} -- skipped")
+                continue
+            U = pseudo_obs(np.column_stack([u1[m], u2[m]]))
+            fams = tuple(families) if "bb1" in families else tuple(families) + ("bb1",)
+            sel = select_copula(U, families=fams, is_uniform=True)
+            best = sel["fits"][sel["best"]]
+            asym, bb1, _bb1r = _bb1_asym(U[:, 0], U[:, 1])
+            nl = sel.get("nested_lr", {})
+            recs.append({"date": str(date), "regime": str(regime), "best": best["name"],
+                         "lambda_L": best["lambda_L"], "lambda_U": best["lambda_U"],
+                         "bb1_lL": bb1["lambda_L"], "bb1_lU": bb1["lambda_U"],
+                         "dlam_bb1": float(asym),
+                         "p_upper_lr": nl.get("p_boundary", np.nan), "n": int(m.sum())})
+            if verbose:
+                print(f"  [copula-flow] {date}: best={best['name']} "
+                      f"lL={best['lambda_L']:.3f} lU={best['lambda_U']:.3f}", flush=True)
+        except Exception as e:                             # pragma: no cover - defensive
+            if verbose:
+                print(f"  [copula-flow] {date}: SKIPPED ({type(e).__name__}: {e})")
+    if not recs:
+        return pd.DataFrame(), "no usable sessions"
+    df = _group_copula_rows(recs, n_flip=n_flip)
+    notes = ("Copula on the rank-PIT pseudo-observations of the two legs' OFI INNOVATIONS "
+             "(AR(%d)-prefiltered per leg; fleeting-quote filter %d steps; first/last "
+             "%.0f min trimmed). lambda_L here is TANDEM-SELLING tail dependence: the "
+             "probability one leg's flow surprise is extremely negative given the other's "
+             "is. The parametric, likelihood-based twin of the semicorrelation exhibit -- "
+             "a positive BB1 L-minus-U contrast (day-level sign-flip p) says tandem "
+             "selling is tighter than tandem buying." % (ar_order, min_rest_steps, trim_min))
+    return df, notes
 
 
 if __name__ == "__main__":
