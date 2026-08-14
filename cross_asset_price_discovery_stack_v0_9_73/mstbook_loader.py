@@ -154,7 +154,7 @@ def adjacent_contracts(symbol: str, as_of_date: date, rollover_days: int = 8) ->
 
 
 def measure_roll_at_extraction(label, symbol: str = "ES", rollover_days: int = 8,
-                               window: tuple = (-3, 7), _measure=None):
+                               window: tuple = (-3, 7), _measure=None, extracted=None):
     """Self-verifying contract pick: measure the roll split AT EXTRACTION for in-window sessions.
 
     The calendar rule (`get_front_month_contract`) stays the pick -- switching contracts on a
@@ -218,7 +218,13 @@ def measure_roll_at_extraction(label, symbol: str = "ES", rollover_days: int = 8
                 rival, _fmt(o.get(rival, np.nan)),
                 100 * (1 - oi_s) if np.isfinite(oi_s) else float("nan"),
                 front, tr.get(front, float("nan")), rival, tr.get(rival, float("nan"))))
-    if not rep.get("rule_agrees", True):
+    if not rep.get("rule_agrees", True) and extracted is not None and extracted != front:
+        # v0.9.73 activity rule: the EXTRACTED contract is the measured leader, so the calendar
+        # rule's minority pick was corrected upstream -- confirmation, not an emergency.
+        log.info("%s: calendar front %s is the minority contract (%.1f%%) but the activity rule "
+                 "already extracted the leader %s -- the measured split (%s) is recorded for the "
+                 "sample appendix.", label, front, 100 * fs, extracted, split)
+    elif not rep.get("rule_agrees", True):
         log.error("%s: THE CALENDAR RULE PICKED THE MINORITY CONTRACT: %s carries %.1f%% of the "
                   "two-contract volume at %+d day(s) from the boundary (%s). The extracted ES leg "
                   "is the QUIETER book. This is a sample-definition decision, not an auto-switch: "
@@ -242,6 +248,68 @@ def measure_roll_at_extraction(label, symbol: str = "ES", rollover_days: int = 8
                  "disagreement is recorded rather than assumed away.", label,
                  100 * fs, 100 * oi_s, front)
     return off, rep
+
+
+def select_contract(symbol: str, as_of_date, rollover_days: int = 8, rule: str = "calendar",
+                    label=None, activity_window: int = 14, _measure=None):
+    """The contract the ES leg extracts: calendar rule, or the ACTIVITY rule (v0.9.73).
+
+    rule='calendar'  the fixed rule: `get_front_month_contract` (roll `rollover_days` before
+                     the third Friday). Deterministic, but on roll-window sessions it can pin
+                     the sample to the QUIETER book -- the March-2020 measurements put the
+                     calendar pick as low as 60.4% of two-contract volume, and a minority pick
+                     means the extracted leg misses the majority of futures price discovery.
+    rule='activity'  measure first, then choose: within ``activity_window`` signed days of the
+                     roll boundary, head-read `mt_product_statistics` (check_roll.measure --
+                     the PRIOR session's closing volume/OI totals off the pre-open rows, so the
+                     choice is a deterministic function of the date, not of same-day flow) and
+                     extract whichever contract carries the volume (open interest breaks a
+                     volume tie). Outside the window the neighbours carry ~0%, so the calendar
+                     pick stands without a lake read. Measurement failure falls back to the
+                     calendar pick with a warning -- extraction never dies over this.
+
+    -> (contract, report_or_None). report is check_roll.measure's dict augmented with
+    {'rule', 'calendar_pick', 'activity_pick', 'overrode'} when a measurement ran."""
+    d = as_of_date if hasattr(as_of_date, "year") else _parse_yyyymmdd(str(as_of_date).replace("-", ""))
+    front = get_front_month_contract(symbol, as_of_date=d, rollover_days=rollover_days)
+    if str(rule) != "activity":
+        return front, None
+    off = roll_window_days(d, rollover_days)
+    tag = label if label is not None else d.strftime("%Y-%m-%d")
+    if not (-int(activity_window) <= off <= int(activity_window)):
+        return front, None                    # neighbours are dead this far from the boundary
+    try:
+        if _measure is None:
+            import check_roll as _cr                      # lazy: check_roll imports this module
+            _measure = _cr.measure
+        rep = dict(_measure(d.strftime("%Y-%m-%d"), symbol, rollover_days))
+    except Exception as exc:
+        log.warning("%s: activity rule could not measure the contract split at %+d day(s) from "
+                    "the boundary (%s) -- FALLING BACK to the calendar pick %s.",
+                    tag, off, str(exc).splitlines()[0][:120], front)
+        return front, None
+    vols = {k: v for k, v in (rep.get("volume") or {}).items() if np.isfinite(v)}
+    if not rep.get("measured") or not vols:
+        log.warning("%s: activity rule measured nothing usable (%s) -- FALLING BACK to the "
+                    "calendar pick %s.", tag, rep.get("note", "no finite volume"), front)
+        return front, rep
+    ois = rep.get("open_interest") or {}
+    pick = max(vols, key=lambda c: (vols[c], ois.get(c, float("-inf"))))
+    rep.update({"rule": "activity", "calendar_pick": front, "activity_pick": pick,
+                "overrode": pick != front})
+    if pick != front:
+        log.warning("%s: ACTIVITY RULE OVERRODE THE CALENDAR PICK at %+d day(s) from the "
+                    "boundary: extracting %s (%s of two-contract volume) instead of the calendar "
+                    "front %s. The extracted leg follows the market's actual activity; the "
+                    "calendar pick would have carried the minority book.",
+                    tag, off, pick,
+                    "%.1f%%" % (100 * (1 - rep["front_share"])) if np.isfinite(rep.get("front_share", float("nan"))) else "?",
+                    front)
+    else:
+        log.info("%s: activity rule confirms the calendar pick %s at %+d day(s) from the "
+                 "boundary (%.1f%% of two-contract volume).", tag, front, off,
+                 100 * rep.get("front_share", float("nan")))
+    return pick, rep
 
 
 def get_contract_expiry(contract_code: str, ref_year: Optional[int] = None) -> date:
@@ -1317,21 +1385,37 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
                                 "(the two carry identical columns, so nothing downstream would "
                                 "notice)", label, _cp, _got_src, _want_src)
                     continue
+            # v0.9.73: under the activity rule a cached frame extracted under the CALENDAR pick
+            # must not silently satisfy the run on a roll-window day -- the whole point of the
+            # rule is that those days can differ. Re-resolve the pick (head-read; falls back to
+            # calendar when the lake is unreachable, in which case the cached frame stands) and
+            # re-extract on mismatch. Outside the activity window select_contract answers from
+            # the calendar without any lake read, so far-from-roll cache hits stay free.
+            if cfg.get("contract_rule", "calendar") == "activity":
+                _cached_con = df.attrs.get("es_contract")
+                _act_con, _ = select_contract(cfg["es_symbol"], _parse_yyyymmdd(ymd),
+                                              rollover_days=cfg["rollover_days"],
+                                              rule="activity", label=label)
+                if _cached_con is not None and _act_con != _cached_con:
+                    log.warning("%s: cached frame carries %s but the activity rule selects %s -- "
+                                "re-extracting rather than reusing the quieter contract's book",
+                                label, _cached_con, _act_con)
+                    continue
             qc = session_qc(df)
             progress_cb("DONE (cache hit)")
             return (label, regime, df, "reused cached %s: %d rows (%s)" % (label, len(df), _cp), None, qc)
         except Exception as exc:                           # a corrupt/partial cache must never win
             log.warning("%s: cache read failed (%s); re-extracting", label, exc)
-    contract = get_front_month_contract(cfg["es_symbol"], as_of_date=_parse_yyyymmdd(ymd),
-                                        rollover_days=cfg["rollover_days"])
-    # Self-verifying pick: a session near the roll boundary MEASURES the volume/OI split between
-    # the calendar pick and its rival at extraction time (cheap head-read of mt_product_statistics)
-    # instead of quoting the one roll ever measured. The pick itself stays the calendar rule --
-    # switching on a same-day volume read would make the series definition data-dependent -- but a
-    # minority pick is now a loud log.error at extraction, not a post-hoc discovery. The full
-    # report lands in df.attrs["roll_measurement"] and the QC table.
+    # v0.9.73: the contract the leg extracts follows cfg["contract_rule"]. 'calendar' is the
+    # fixed front-month rule; 'activity' measures the volume/OI split first (the PRIOR session's
+    # closing totals -- deterministic per date, not same-day flow) and extracts the leader, so a
+    # roll-window session no longer pins the sample to the quieter book. The measured report
+    # still lands in df.attrs and the QC table either way.
+    contract, _sel_rep = select_contract(cfg["es_symbol"], _parse_yyyymmdd(ymd),
+                                         rollover_days=cfg["rollover_days"],
+                                         rule=cfg.get("contract_rule", "calendar"), label=label)
     _roll_d, _roll_rep = measure_roll_at_extraction(label, cfg["es_symbol"],
-                                                    cfg["rollover_days"])
+                                                    cfg["rollover_days"], extracted=contract)
     # SPY: consolidated multi-venue hybrid MBO+MBP. ES: single-venue CME order-by-order (MBO) — the
     # mt_price_level_* types are empty for futures; integer-hundredths -> index points via price_scale.
     spy = lob.reconstruct_session(ymd, "SPY", "direct", levels=cfg["levels"], interval=cfg["interval"],
@@ -1468,7 +1552,10 @@ def _extract_one_session(spec, cfg: dict, progress_cb=None):
         df.attrs["halt_reasons"] = sorted(set(df.attrs.get("halt_reasons_SPY", []))
                                           | set(df.attrs.get("halt_reasons_ES", [])))
     df.attrs["es_contract"] = contract
+    df.attrs["contract_rule"] = str(cfg.get("contract_rule", "calendar"))
     df.attrs["roll_offset_days"] = int(_roll_d)
+    if _sel_rep is not None:                       # activity rule ran a measurement
+        df.attrs["contract_selection"] = _sel_rep
     if _roll_rep is not None:                      # in a roll window and the measurement ran
         df.attrs["roll_measurement"] = _roll_rep
     # Tag with the source that ACTUALLY built the ES leg. v0.9.46-65 gated this on
@@ -1598,6 +1685,7 @@ def extract_sessions(date_specs: Sequence, es_symbol: str = "ES", levels: int = 
                      data_source: str = "apu", tz: str = "America/New_York", with_flow: bool = True,
                      classify: str = "aggressor", side_buy_label: str = "Bid",
                      futures_scale: float = 0.01, rollover_days: int = 8,
+                     contract_rule: str = "calendar",
                      book_source: str = "reconstruct", es_book_source: str = "aggregated",
                      round_lot: int = 100,
                      odd_lot_inclusive: bool = True, clock: str = "receipt",
@@ -1662,7 +1750,7 @@ def extract_sessions(date_specs: Sequence, es_symbol: str = "ES", levels: int = 
            "classify": classify, "side_buy_label": side_buy_label, "futures_scale": futures_scale,
            "rollover_days": rollover_days, "round_lot": round_lot, "odd_lot_inclusive": odd_lot_inclusive,
            "clock": clock, "cache_dir": cache_dir, "resume": bool(resume), "crossed_tol": crossed_tol,
-           "es_book_source": es_book_source}
+           "es_book_source": es_book_source, "contract_rule": str(contract_rule)}
 
     def _emit(msg):                                         # per-session summary line
         _tqdm.write(msg) if bar is not None else log.info("%s", msg)

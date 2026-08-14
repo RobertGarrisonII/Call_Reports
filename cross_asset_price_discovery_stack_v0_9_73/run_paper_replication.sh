@@ -130,6 +130,7 @@ FINE_STAGES="information_shares,ecm_sde,liquidity_conditional,cross_impact,jumps
 N_BOOT=499
 CORR_WINDOW=100
 N_LAGS="bic"          # integer, or an information criterion: bic | aic | hq
+CONTRACT_RULE="activity"  # activity (DEFAULT: volume/OI leader near the roll) | calendar
 PMAX=12
 N_LAGS_INT=""        # resolved integer, filled in by STAGE 4c
 # (the old T9_DCC escape hatch is gone: run_table9_both_ways includes the DCC column BY DEFAULT
@@ -142,7 +143,9 @@ QUICK=0
 NJ="${N_JOBS:-}"
 # Cache extracted sessions OUTSIDE the per-run output folder: the point is that a re-run (new
 # RUN_ID) reuses days a previous run already paid for. One day is 10-25 minutes of vendor I/O.
-CACHE_DIR="${EXTRACT_CACHE:-${OUT_ROOT}/extract_cache}"
+# (v0.9.73: CACHE_DIR is resolved AFTER argument parsing -- it used to capture OUT_ROOT before
+# --out-dir was read, so a custom root left the cache stranded under ./output.)
+CACHE_DIR=""
 RESUME=1
 QC_ACTION="warn"      # warn | drop | raise -- what to do with a session whose book crosses
 
@@ -197,6 +200,7 @@ while [ "$#" -gt 0 ]; do
     --n-boot)        N_BOOT="$2"; shift 2 ;;
     --corr-window)   CORR_WINDOW="$2"; shift 2 ;;
     --n-lags)        N_LAGS="$2"; shift 2 ;;
+    --contract-rule) CONTRACT_RULE="$2"; shift 2 ;;
     --pmax)          PMAX="$2"; shift 2 ;;
     --volatile)      VOLATILE="$2"; shift 2 ;;
     --baseline)      BASELINE="$2"; shift 2 ;;
@@ -218,7 +222,26 @@ done
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 OUT="${OUT_ROOT}/replication_${RUN_ID}"
 LOG="${OUT}/replication.log"
-mkdir -p "$OUT"
+CACHE_DIR="${EXTRACT_CACHE:-${OUT_ROOT}/extract_cache}"
+# ── ONE structured tree per run (v0.9.73) ────────────────────────────────────
+# Everything a run produces lands under ${OUT}, in a fixed layout instead of a
+# flat pile plus opaque nested run_<ts>/ dirs:
+#   frames/                    extracted/derived session pickles + extract report
+#   qc/                        sample validation, per-day QC, feed health, crossing
+#   nulls/                     STAGE 4 corrected null tables (t5/t7)
+#   <interval>/analysis/       run_analysis report.md / summary.json / tables/
+#   <interval>/table9/         STAGE 5 Table 9 both-ways (+ lag IC / lag band)
+#   <interval>/flow/           STAGE 5b flow-correlation tables
+#   <interval>/copula/         STAGE 5c copula tables (1s only)
+#   <interval>/geometry/       STAGE 5d book-geometry ||L|| check (1s only)
+#   MANIFEST.json / .md        full recursive inventory + config + stack version
+mkdir -p "$OUT/frames" "$OUT/qc" "$OUT/nulls" \
+         "$OUT/${INTERVAL}/analysis" "$OUT/${INTERVAL}/table9" "$OUT/${INTERVAL}/flow" \
+         "$OUT/${INTERVAL}/copula" "$OUT/${INTERVAL}/geometry"
+[ "$WITH_FINE" -eq 1 ] && mkdir -p "$OUT/${FINE_INTERVAL}/analysis" \
+         "$OUT/${FINE_INTERVAL}/table9" "$OUT/${FINE_INTERVAL}/flow"
+# paper_tables.py honours $OUT_DIR for its own report; keep it inside the tree.
+export OUT_DIR="${OUT}"
 
 # Size the pools from the MACHINE via autoscale, not from a default buried in a library. Leaving
 # --n-jobs unset used to fall through to inference.py's os.cpu_count(), which ignores CPU affinity
@@ -344,11 +367,11 @@ EOF
     VS_FLAGS=""; [ "$ALLOW_BAD_DATES" -eq 1 ] && VS_FLAGS="--allow-bad-dates"
     # shellcheck disable=SC2086
     if run_show $PY validate_sample.py --volatile "$VOLATILE" --baseline "$BASELINE" \
-         --mwcb "$MWCB" $VS_FLAGS --out "${OUT}/sample_validation.txt"; then
+         --mwcb "$MWCB" $VS_FLAGS --out "${OUT}/qc/sample_validation.txt"; then
       :
     else
       echo "" | tee -a "$LOG"
-      echo "SAMPLE REJECTED — see ${OUT}/sample_validation.txt" | tee -a "$LOG"
+      echo "SAMPLE REJECTED — see ${OUT}/qc/sample_validation.txt" | tee -a "$LOG"
       echo "Replace the flagged date(s) with tradable sessions, or pass --allow-bad-dates" | tee -a "$LOG"
       echo "if you intend to extract them anyway. Whichever date replaces one must keep the" | tee -a "$LOG"
       echo "matching rule: same weekday, roughly one year prior to its volatile partner." | tee -a "$LOG"
@@ -400,6 +423,10 @@ if have_stage 1; then
            test_flow_correlation.py \
            test_copula_tables.py \
            test_lag_robustness.py \
+           test_book_geometry.py \
+           test_memo_items.py \
+           test_output_layout.py \
+           test_contract_rule.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -470,7 +497,7 @@ if have_stage 2; then
             --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
             --interval "$FINE_INTERVAL" --n-levels 10 --max-workers "$AS_FINE" \
             --qc-action "$QC_ACTION" $CACHE_FLAGS \
-            --output-dir "$OUT" --no-dataset --only extract; then
+            --output-dir "$OUT/frames" --flat-output --contract-rule "$CONTRACT_RULE" --no-dataset --only extract; then
           FINE_FRAMES="$(find "${OUT}" -name "frames_${FINE_INTERVAL}.pkl" 2>/dev/null \
                          | xargs -r ls -1t 2>/dev/null | head -1 || true)"
         fi
@@ -506,13 +533,13 @@ if have_stage 2; then
           --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
           --interval "$INTERVAL" --n-levels 10 --max-workers "$AS_EXTRACT" \
           --qc-action "$QC_ACTION" $CACHE_FLAGS \
-          --output-dir "$OUT" --save-dataset --save-objects --only extract
+          --output-dir "$OUT/frames" --flat-output --contract-rule "$CONTRACT_RULE" --save-dataset --save-objects --only extract
       # A session that failed or that violates the book invariant is named here, not only in the
       # scrollback of a multi-hour log -- the SAMPLE is a result, and a universe that quietly
       # shrank from 24 days to 22 produces tables indistinguishable from a clean run's.
-      if [ -s "${OUT}/extract_report.txt" ]; then
-        info "EXTRACTION WAS NOT CLEAN -- ${OUT}/extract_report.txt:"
-        sed 's/^/     /' "${OUT}/extract_report.txt" | tee -a "$LOG"
+      if [ -s "${OUT}/frames/extract_report.txt" ]; then
+        info "EXTRACTION WAS NOT CLEAN -- ${OUT}/frames/extract_report.txt:"
+        sed 's/^/     /' "${OUT}/frames/extract_report.txt" | tee -a "$LOG"
       fi
       # run_analysis writes the frames into a TIMESTAMPED SUBDIRECTORY of --output-dir, so a
       # flat glob on ${OUT} finds nothing. That is not hypothetical: an 85-minute extraction
@@ -596,7 +623,7 @@ if [ "$WITH_FINE" -eq 1 ] && { have_stage 2 || [ "$SOURCE" = "load" ]; }; then
           --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
           --interval "$FINE_INTERVAL" --n-levels 10 --max-workers "$AS_FINE" \
           --qc-action "$QC_ACTION" $FINE_CACHE_FLAGS \
-          --output-dir "$OUT" --no-dataset --only extract; then
+          --output-dir "$OUT/frames" --flat-output --contract-rule "$CONTRACT_RULE" --no-dataset --only extract; then
         FINE_FRAMES="$(find "${OUT}" -name "frames_${FINE_INTERVAL}.pkl" 2>/dev/null \
                        | xargs -r ls -1t 2>/dev/null | head -1 || true)"
       fi
@@ -639,7 +666,7 @@ if have_stage 3 && [ "$SOURCE" != "demo" ]; then
     info "(dry-run) would then run debug_crossing.py on any flagged session"
   else
     if run_show $PY qc_frames.py --pickle "$FRAMES" --crossed-tol 0.005 \
-         --out "${OUT}/qc_frames.txt"; then
+         --out "${OUT}/qc/qc_frames.txt"; then
       info "every session satisfies the invariant"
       # The invariant says the book is SELF-consistent. It does not say the book is RIGHT.
       #
@@ -653,13 +680,13 @@ if have_stage 3 && [ "$SOURCE" != "demo" ]; then
       # re-runs it on another day.
       if [ "$SOURCE" = "extract" ]; then
         VDATE="$(echo "$VOLATILE" | cut -d, -f1 | tr -d -)"
-        VCON="$($PY -c "import mstbook_loader as ml,datetime;print(ml.get_front_month_contract('ES', as_of_date=ml._parse_yyyymmdd('$VDATE')))" 2>/dev/null || true)"
+        VCON="$($PY -c "import mstbook_loader as ml;print(ml.select_contract('ES', ml._parse_yyyymmdd('$VDATE'), rule='$CONTRACT_RULE')[0])" 2>/dev/null || true)"
         if [ -n "$VCON" ]; then
           info "cross-checking an independent message replay against the venue ladder the ES leg"
           info "  is built from, on ${VDATE} (${VCON}) -- evidence the ladder is a faithful book"
           run_rc $PY validate_aggregated.py --date "$VDATE" --product "$VCON" \
                  --product-type futures --price-scale 0.01 --interval "$INTERVAL" \
-                 --out "${OUT}/validate_${VCON}_${VDATE}.txt" \
+                 --out "${OUT}/qc/validate_${VCON}_${VDATE}.txt" \
             && info "  the independent replay reproduces the ladder (${OUT}/validate_${VCON}_${VDATE}.txt)" \
             || info "  DISAGREEMENT replay vs ladder -- see ${OUT}/validate_${VCON}_${VDATE}.txt"
         fi
@@ -668,7 +695,7 @@ if have_stage 3 && [ "$SOURCE" != "demo" ]; then
       # 2>/dev/null + || true: when qc_frames CRASHES (as opposed to failing the gate) the out
       # file may not exist; under set -e a bare sed then killed the script HERE, before any of
       # the guidance below printed -- the one moment the operator needs it most.
-      BAD="$(sed -n 's/^BAD \([0-9-]*\).*/\1/p' "${OUT}/qc_frames.txt" 2>/dev/null | tr '\n' ' ' || true)"
+      BAD="$(sed -n 's/^BAD \([0-9-]*\).*/\1/p' "${OUT}/qc/qc_frames.txt" 2>/dev/null | tr '\n' ' ' || true)"
       if [ -n "$BAD" ] && [ "$SOURCE" = "extract" ]; then
         info "root-causing the flagged session(s) -- both tools re-fetch that day's raw messages"
         for d in $BAD; do
@@ -677,21 +704,21 @@ if have_stage 3 && [ "$SOURCE" != "demo" ]; then
           # adds never arrived, so the removals referencing them are orphans and the book crosses
           # through no fault of the replay. No amount of reconstruction work fixes a lost packet.
           run_rc $PY feed_health.py --date "$ymd" --product SPY \
-                 --out "${OUT}/feed_health_${ymd}.txt" || true
+                 --out "${OUT}/qc/feed_health_${ymd}.txt" || true
           # THEN the replay-side root cause. --clock must MATCH the extraction (receipt): diagnosing
           # a book built on the other clock answers a question about a book you did not save, and
           # some feeds stamp a whole burst with one exchange timestamp, which makes that ordering
           # degenerate for them.
           run_rc $PY debug_crossing.py --date "$ymd" --product SPY \
-                 --clock receipt --ab-ordering --out "${OUT}/crossing_${ymd}.txt" || true
+                 --clock receipt --ab-ordering --out "${OUT}/qc/crossing_${ymd}.txt" || true
           info "  reports: ${OUT}/feed_health_${ymd}.txt, ${OUT}/crossing_${ymd}.txt"
           # The gate fails on EITHER leg, so diagnosing only SPY can answer the wrong question.
           # The futures leg has its own capture, its own resets and its own halts -- CME Velocity
           # Logic pauses ES for 5-10 s on exactly these days.
-          ECON="$($PY -c "import mstbook_loader as ml;print(ml.get_front_month_contract('ES', as_of_date=ml._parse_yyyymmdd('$ymd')))" 2>/dev/null || true)"
+          ECON="$($PY -c "import mstbook_loader as ml;print(ml.select_contract('ES', ml._parse_yyyymmdd('$ymd'), rule='$CONTRACT_RULE')[0])" 2>/dev/null || true)"
           if [ -n "$ECON" ]; then
             run_rc $PY feed_health.py --date "$ymd" --product "$ECON" --product-type futures \
-                   --out "${OUT}/feed_health_${ymd}_${ECON}.txt" || true
+                   --out "${OUT}/qc/feed_health_${ymd}_${ECON}.txt" || true
             info "  ES leg: ${OUT}/feed_health_${ymd}_${ECON}.txt"
           fi
         done
@@ -710,7 +737,7 @@ if have_stage 3 && [ "$SOURCE" != "demo" ]; then
   # estimates on it, instead of surfacing as an inexplicable fine-grid number.
   if [ -n "${FINE_FRAMES:-}" ] && { [ "$DRY" -eq 1 ] || [ -f "$FINE_FRAMES" ]; }; then
     run_rc $PY qc_frames.py --pickle "$FINE_FRAMES" --crossed-tol 0.005 \
-           --out "${OUT}/qc_frames_${FINE_INTERVAL}.txt" \
+           --out "${OUT}/qc/qc_frames_${FINE_INTERVAL}.txt" \
       && info "fine (${FINE_INTERVAL}) frames satisfy the invariant" \
       || info "fine (${FINE_INTERVAL}) frames FAIL the crossed-book check -- see ${OUT}/qc_frames_${FINE_INTERVAL}.txt; STAGE 6b still runs, read it with that in mind"
   fi
@@ -725,7 +752,7 @@ if have_stage 4; then
   say "STAGE 4  Table 5 + Table 7 with the corrected nulls"
   info "reports: raw corner shares (as published), independence GIVEN the observed"
   info "marginals, the corner log odds ratio, and the frequency-matched binomial null"
-  run_show $PY - "$OUT" "$FRAMES" "$MWCB" <<'EOF' || info "STAGE 4 FAILED -- see $LOG; continuing to STAGE 5"
+  run_show $PY - "$OUT/nulls" "$FRAMES" "$MWCB" <<'EOF' || info "STAGE 4 FAILED -- see $LOG; continuing to STAGE 5"
 import sys, glob, pickle, warnings; warnings.simplefilter("ignore")
 import numpy as np, pandas as pd, tandem_order_flow as tof
 out, frames_glob, mwcb = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -1002,7 +1029,7 @@ if have_stage 5; then
   say "STAGE 5  Table 9 three ways: Pearson, Hayashi-Yoshida, and DCC d-correlation"
   # The DCC column is run_table9_both_ways' DEFAULT (v0.9.56): the two rolling measures share the
   # corr-window MA artifact, and DCC is the lag-robust column the 4c caution points at.
-  T9ARGS="--spec informational --n-lags ${N_LAGS} --pmax ${PMAX} --n-boot ${N_BOOT} --out-dir ${OUT}"
+  T9ARGS="--spec informational --n-lags ${N_LAGS} --pmax ${PMAX} --n-boot ${N_BOOT} --out-dir ${OUT}/${INTERVAL}/table9"
   [ -n "$NJ" ] && T9ARGS="$T9ARGS --n-jobs $NJ"
   # T9_LAG_BAND=lo:hi refits the whole 1s table at every order in the band and writes per-cell
   # sign/star stability (table9_lag_band_*.csv) -- the check that a cell is a finding at every
@@ -1038,7 +1065,7 @@ if have_stage 5; then
       #   --n-boot      FINE_N_BOOT (default 199): each fine draw refits the pooled panel on
       #                 ~56M rows; 199 draws bound the fine pair to hours, not days, and the
       #                 Epps GAP -- the point of this pass -- is a point-estimate contrast.
-      FINE_T9_EXTRA="--n-boot ${FINE_N_BOOT:-199}"
+      FINE_T9_EXTRA="--n-boot ${FINE_N_BOOT:-199} --out-dir ${OUT}/${FINE_INTERVAL}/table9"
       [ "${FINE_T9_DCC:-0}" != "1" ] && FINE_T9_EXTRA="$FINE_T9_EXTRA --no-dcc"
       # shellcheck disable=SC2086
       run_show $PY run_table9_both_ways.py --source load --pickle "$FINE_T9" \
@@ -1067,7 +1094,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 if have_stage 5; then
   say "STAGE 5b Tandem flow: Tier 1 regimes, Tier 2 mediation, data-driven MS regimes"
-  FLOWARGS="--n-boot ${N_BOOT} --ms-boot ${FLOW_MS_BOOT:-99} --out-dir ${OUT}"
+  FLOWARGS="--n-boot ${N_BOOT} --ms-boot ${FLOW_MS_BOOT:-99} --out-dir ${OUT}/${INTERVAL}/flow"
   if [ "$SOURCE" = "demo" ]; then
     # shellcheck disable=SC2086
     run_show $PY run_flow_correlation.py --source demo --tag demo $FLOWARGS \
@@ -1081,7 +1108,7 @@ if have_stage 5; then
       # shellcheck disable=SC2086
       run_show $PY run_flow_correlation.py --source load --pickle "$FINE_T9" \
           --volatile "$VOLATILE" --mwcb "$MWCB" --tag "$FINE_INTERVAL" $FLOWARGS \
-          --n-boot "${FINE_N_BOOT:-199}" \
+          --n-boot "${FINE_N_BOOT:-199}" --out-dir "${OUT}/${FINE_INTERVAL}/flow" \
         || info "STAGE 5b (${FINE_INTERVAL} flow corr) FAILED -- see $LOG; continuing"
     fi
   fi
@@ -1100,7 +1127,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 if have_stage 5; then
   say "STAGE 5c Copula tail dependence: regimes, book-depth split, flow innovations"
-  COPARGS="--out-dir ${OUT}"
+  COPARGS="--out-dir ${OUT}/${INTERVAL}/copula"
   if [ "$SOURCE" = "demo" ]; then
     # shellcheck disable=SC2086
     run_show $PY run_copula.py --source demo --tag demo $COPARGS \
@@ -1110,6 +1137,40 @@ if have_stage 5; then
     run_show $PY run_copula.py --source load --pickle "$FRAMES" \
         --volatile "$VOLATILE" --mwcb "$MWCB" --tag "$INTERVAL" $COPARGS \
       || info "STAGE 5c (${INTERVAL} copula) FAILED -- see $LOG; continuing"
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 5d — book geometry: the ||L|| (arc-length) check (v0.9.73)
+#
+# tau (normalized index-square arc length of the depth profile) computed beside
+# the three statistics argued to dominate it -- total depth, the depth centroid
+# (= the exact full-sweep VWAP concession), and the Herfindahl -- plus the
+# VERDICT: Spearman(tau, HHI) and tau's incremental R^2 over the covering set.
+# The predicted outcome is "redundant"; a failing verdict on real frames is the
+# interesting result and the reason tau would be promoted to a regressor.
+# 1s by default (per-snapshot vectorized; GEOM_FINE=1 adds the fine grid).
+# ══════════════════════════════════════════════════════════════════════════════
+if have_stage 5; then
+  say "STAGE 5d Book geometry: tau / centroid / Herfindahl + redundancy verdict"
+  GEOMARGS="--out-dir ${OUT}/${INTERVAL}/geometry"
+  if [ "$SOURCE" = "demo" ]; then
+    # shellcheck disable=SC2086
+    run_show $PY run_book_geometry.py --source demo --tag demo $GEOMARGS \
+      || info "STAGE 5d (demo geometry) FAILED -- see $LOG; continuing"
+  else
+    # shellcheck disable=SC2086
+    run_show $PY run_book_geometry.py --source load --pickle "$FRAMES" \
+        --volatile "${VOLATILE},${MWCB}" --tag "$INTERVAL" $GEOMARGS \
+      || info "STAGE 5d (${INTERVAL} geometry) FAILED -- see $LOG; continuing"
+    if [ "${GEOM_FINE:-0}" = "1" ] && [ -n "${FINE_T9:-}" ] && [ -f "$FINE_T9" ]; then
+      mkdir -p "${OUT}/${FINE_INTERVAL}/geometry"
+      # shellcheck disable=SC2086
+      run_show $PY run_book_geometry.py --source load --pickle "$FINE_T9" \
+          --volatile "${VOLATILE},${MWCB}" --tag "$FINE_INTERVAL" \
+          --out-dir "${OUT}/${FINE_INTERVAL}/geometry" \
+        || info "STAGE 5d (${FINE_INTERVAL} geometry) FAILED -- see $LOG; continuing"
+    fi
   fi
 fi
 
@@ -1129,13 +1190,13 @@ if have_stage 6; then
   # The gates (STAGES 1 and 3) stay hard; the analysis stages are best-effort past them.
   case "$SOURCE" in
     demo)  # shellcheck disable=SC2086
-           run $PY run_analysis.py --source demo $QFLAG --legacy --output-dir "$OUT" \
+           run $PY run_analysis.py --source demo $QFLAG --legacy --output-dir "$OUT/${INTERVAL}/analysis" --flat-output \
              || info "STAGE 6 FAILED -- see $LOG; continuing to the manifest" ;;
     *)     # shellcheck disable=SC2086
            run $PY run_analysis.py --source load --pickle "$FRAMES" \
                --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
                --interval "$INTERVAL" --legacy \
-               --output-dir "$OUT" --save-dataset $QFLAG \
+               --output-dir "$OUT/${INTERVAL}/analysis" --flat-output --save-dataset $QFLAG \
              || info "STAGE 6 FAILED -- see $LOG; continuing to the manifest" ;;
   esac
 fi
@@ -1179,7 +1240,7 @@ if [ "$WITH_FINE" -eq 1 ] && have_stage 6 && [ "$SOURCE" != "demo" ]; then
         --volatile "${VOLATILE},${MWCB}" --benchmark "${BASELINE}" \
         --interval "$FINE_INTERVAL" \
         $ONLY_FLAG --no-dataset --no-save-frames \
-        --output-dir "$OUT" $FQ \
+        --output-dir "$OUT/${FINE_INTERVAL}/analysis" --flat-output $FQ \
       || info "STAGE 6b FAILED -- the 1s results above are unaffected; see $LOG"
   else
     info "skipped: no ${FINE_INTERVAL} frames this run (STAGE 2b did not produce any)"
@@ -1216,9 +1277,18 @@ if have_stage 7; then
     echo "- cluster SE falls back to Newey-West at G=1 instead of returning a silent NaN"
     echo
     echo "## Artifacts"
-    ls -1 "$OUT" | sed 's/^/- /'
-  } > "${OUT}/MANIFEST.md"
-  cat "${OUT}/MANIFEST.md"
+    echo "(full recursive inventory in MANIFEST.json / MANIFEST.md, written below)"
+  } > "${OUT}/RUN_NOTES.md"
+  cat "${OUT}/RUN_NOTES.md"
+  # v0.9.73: the manifest walks the WHOLE tree (the old flat `ls` could not see
+  # inside the analysis subdirs, i.e. it inventoried everything except the exhibits)
+  # and records the resolved configuration plus the stack version alongside.
+  run_show $PY manifest_output.py "$OUT" \
+      source="$SOURCE" interval="$INTERVAL" fine_interval="$FINE_INTERVAL" \
+      with_fine="$WITH_FINE" corr_window="$CORR_WINDOW" n_boot="$N_BOOT" \
+      n_lags="$N_LAGS" n_lags_resolved="${N_LAGS_INT:-per-driver}" pmax="$PMAX" \
+      contract_rule="${CONTRACT_RULE:-activity}" run_id="$RUN_ID" \
+    || info "manifest generation FAILED -- see $LOG"
 fi
 
 say "done — ${OUT}"

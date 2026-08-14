@@ -339,6 +339,7 @@ def load_sessions(args):
         _prog = {"auto": None, "on": True, "off": False}.get(getattr(args, "progress", "auto"), None)
         rep: dict = {}
         sessions = ml.extract_sessions(specs, es_symbol="ES", levels=args.n_levels,
+                                       contract_rule=getattr(args, "contract_rule", "activity"),
                                        interval=args.interval, with_flow=True,
                                        classify=getattr(args, "classify", "aggressor"),
                                        book_source=getattr(args, "book_source", "reconstruct"),
@@ -386,9 +387,25 @@ def run_information_shares(sessions, args):
            "mean_CS_ES_ec_valid": float(per_day.loc[_v, "CS_ES"].mean()) if _v.any() else float("nan"),
            "n_ec_invalid": int((~_v).sum()),
            "mean_IS_mid_ES": float(per_day.IS_mid_ES.mean())}
+    # Q2 flag (2026-08-14 findings memo): on days where the net adjustment speed kappa is a
+    # small fraction of typical, CS is a quotient of near-zero alphas -- re-estimating beta
+    # moved CS_ES by >0.30 on exactly those days while IS moved by ~0.02. The flag marks
+    # them in the exported per-day table; it excludes nothing.
+    if "kappa" in per_day.columns:
+        med = float(np.nanmedian(per_day["kappa"]))
+        per_day["low_kappa"] = per_day["kappa"] < 0.25 * med
     if len({r for _, r, _ in sessions}) >= 2:
         try: res["regime_test"] = pds.compare_regimes(per_day, metric="CS_ES")
         except Exception as e: res["regime_test_error"] = str(e)
+        # E3 (memo): the same contrast on the beta-robust share and with kappa weights --
+        # the migration toward ES must survive both for the regime finding to be quotable.
+        try: res["regime_test_IS"] = pds.compare_regimes(per_day, metric="IS_mid_ES")
+        except Exception as e: res["regime_test_IS_error"] = str(e)
+        try:
+            res["regime_test_kappa_weighted"] = pds.compare_regimes(
+                per_day, metric="CS_ES", weights="kappa")
+        except Exception as e:
+            res["regime_test_kappa_weighted_error"] = str(e)
     try: res["panel_vecm"] = pds.panel_vecm(mids, n_lags=args.n_lags)
     except Exception as e: res["panel_vecm_error"] = str(e)
     return res
@@ -568,6 +585,16 @@ def run_jumps(sessions, args):
         out["cojump_session0"] = jr.cojump_from_mids(ca._mid(df0, "SPY"), ca._mid(df0, "ES"), max_lag=2)
     except Exception as e:
         out["cojump_error"] = str(e)
+    # E2 (2026-08-14 findings memo): the lead-lag read on EVERY session, with a day-level
+    # sign-flip test on the per-day lead share -- the single-session 4.6:1 ES lead cannot be
+    # quoted as a population finding from one day. Lee-Mykland already ran per day for the
+    # split above; this reruns it inside the alignment (self-contained beats plumbing).
+    try:
+        cj = jr.cojump_by_day(mids, max_lag=2)
+        out["cojump_per_day"] = cj
+        out["cojump_lead_test"] = jr.cojump_lead_test(cj)
+    except Exception as e:
+        out["cojump_by_day_error"] = str(e)
     return out
 
 def run_ecm_sde(sessions, args):
@@ -692,6 +719,17 @@ def _scalar_summary(results):
     s["mean_ISj_ES"] = g(["jumps", "mean_ISj_ES"])
     s["mean_jump_frac_cf"] = g(["jumps", "mean_jump_frac_cf"])
     s["mean_jump_frac_cf_lm"] = g(["jumps", "mean_jump_frac_cf_lm"])
+    # memo items E2/E3: the population lead-lag verdict and the robust regime contrasts
+    lt = g(["jumps", "cojump_lead_test"])
+    if isinstance(lt, dict):
+        s["cojump_leader"] = lt.get("leader")
+        s["cojump_mean_lead_share"] = lt.get("mean_lead_share")
+        s["cojump_lead_p_flip"] = lt.get("p_flip")
+    for key, name in (("regime_test", "regime_p_CS"), ("regime_test_IS", "regime_p_IS"),
+                      ("regime_test_kappa_weighted", "regime_p_CS_kappa_w")):
+        rt = g(["information_shares", key])
+        if isinstance(rt, dict):
+            s[name] = rt.get("p_perm")
     s["ecm_sde_dAlphaSPY_dS_t"] = g(["ecm_sde", "t_a1_SPY"])
     s["ecm_sde_t_a1_SPY_microprice"] = g(["ecm_sde", "t_a1_SPY_microprice"])
     s["ecm_sde_IS_ES_mid_vs_microprice"] = (g(["ecm_sde", "IS_ES_med_mid"]), g(["ecm_sde", "IS_ES_med_microprice"]))
@@ -845,7 +883,26 @@ def parse_args(argv=None):
     p.add_argument("--quick", action="store_true", help="smaller bootstrap/horizons for a fast run")
     p.add_argument("--n-sessions", type=int, default=4, help="demo: number of sessions")
     p.add_argument("--session-len", type=int, default=6000, help="demo: rows per session")
+    # v0.9.73: the ES leg's contract follows ACTIVITY by default -- within +/-14 days of the
+    # roll boundary the extraction head-reads each candidate's prior-session volume/OI
+    # (mt_product_statistics; deterministic per date) and extracts the leader, instead of
+    # letting the calendar rule pin a roll-window session to the quieter book (March 2020
+    # measured the calendar pick as low as 60.4% of two-contract volume). --contract-rule
+    # calendar restores the fixed rule; the pick, the rule, and the measured split are stamped
+    # on every frame's attrs and the QC table either way.
+    p.add_argument("--contract-rule", choices=["activity", "calendar"], default="activity",
+                   help="how the ES contract is chosen per session: 'activity' (DEFAULT: "
+                        "prior-session volume/OI leader near the roll, calendar elsewhere) "
+                        "or 'calendar' (fixed front-month rule)")
     p.add_argument("--output-dir", default=OUTPUT_DIR)
+    # v0.9.73: the replication driver owns the directory structure (one tree per run, a
+    # subdir per grid/stage). --flat-output writes report/tables/summary DIRECTLY into
+    # --output-dir instead of nesting an opaque run_<timestamp>/ under it -- the nesting is
+    # what left a full replication with three sibling run_* dirs distinguishable only by
+    # their timestamps. Default OFF so standalone invocations keep their history.
+    p.add_argument("--flat-output", action="store_true", default=False,
+                   help="write report.md/summary.json/tables/ directly into --output-dir "
+                        "(no run_<timestamp>/ nesting; used by the replication driver)")
     p.add_argument("--dataset-format", choices=["auto", "parquet", "csv"], default="auto",
                    help="consolidated final-dataset format (auto: parquet if available, else csv.gz)")
     p.add_argument("--save-dataset", action="store_true", help="also write the dataset for --source demo")
@@ -926,7 +983,8 @@ def run_stages(sessions, args, ts=None, t0=None):
                "path": "sub-second" if fc["subsecond"] else ">=1s", "n_lags": fc["n_lags"],
                "jump_method": fc["jump_method"], "fleeting_min_rest_steps": fc["min_rest_steps"],
                **summary}
-    run_dir = os.path.join(args.output_dir, f"run_{ts}")
+    run_dir = (args.output_dir if getattr(args, "flat_output", False)
+               else os.path.join(args.output_dir, f"run_{ts}"))
     tables_dir = os.path.join(run_dir, "tables")
     os.makedirs(tables_dir, exist_ok=True)
 

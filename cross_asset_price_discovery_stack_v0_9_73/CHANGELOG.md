@@ -1,5 +1,58 @@
 # Changelog
 
+## v0.9.73 -- the ||L|| check, one structured output tree, memo items, and the activity contract rule
+
+Four tracks, all from the co-author review cycle:
+
+* **Book geometry: the arc-length measure AS A CHECK (`book_geometry.py`, STAGE 5d).**
+  In raw units the 10-level book curve's arc length is total depth to ~10 significant
+  figures (each segment is sqrt(tick^2 + q^2) ~ q at a 1e4-1e6:1 aspect ratio), so only
+  the index-square normalization survives: tau = (L - sqrt2)/(L_max(n) - sqrt2) with the
+  DISCRETE maximum L_max(10) = 1.90499 (the continuum bound 2 is not attained at finite
+  n). tau is permutation-invariant in the levels -- a symmetric Schur-convex functional
+  of the depth shares, the Herfindahl's family -- so it carries no location information
+  by construction; the location statistic is the depth CENTROID, which equals the
+  full-sweep VWAP concession exactly (gaps included; gate-pinned identity). The module
+  computes tau beside {total depth, centroid, Herfindahl} and renders the verdict it
+  exists for: Spearman(tau, HHI) and tau's incremental R^2 over the covering set.
+  `run_book_geometry.py` + STAGE 5d (1s; GEOM_FINE=1 adds the fine grid). Gate:
+  test_book_geometry.py (6 checks; endpoints, permutation invariance, sweep identity,
+  rank equivalence, hygiene, runner).
+* **One structured output tree per run.** Everything lands under
+  `replication_<RUN_ID>/{frames,qc,nulls,<grid>/{analysis,table9,flow,copula,geometry}}`
+  instead of a flat pile plus up to three opaque nested `run_<ts>/` dirs. run_analysis
+  grows `--flat-output` (driver-owned structure; default OFF for standalone use); the
+  fine grid routes to its own subtree via argparse last-wins; `manifest_output.py`
+  replaces the flat-`ls` STAGE 7 manifest with a RECURSIVE MANIFEST.json/.md carrying
+  the file inventory, resolved config, and stack version (the old manifest inventoried
+  everything except the exhibits). CACHE_DIR now resolves AFTER --out-dir is parsed.
+  Gate: test_output_layout.py.
+* **Findings-memo items E2/E3/Q2 implemented; E1/E4-E7 designed.**
+  `jump_robust.cojump_by_day` runs the co-jump alignment on EVERY session with a
+  day-level sign-flip test on the per-day lead share (the 4.6:1 ES lead was quotable
+  from one session only); `compare_regimes(weights=...)` adds the kappa-weighted
+  contrast, the information-shares stage reports regime_test_IS and
+  regime_test_kappa_weighted beside CS, and low-kappa days (< 0.25 x median) are
+  flagged in the per-day table; summary.json carries the new verdicts. Approaches for
+  the propagation-horizon profile, the half-life grid-dependence experiments, intraday
+  Rigobon windows, microprice-primary reporting, and the state-construction
+  reconciliation are recorded in APPROACHES_MEMO_ITEMS.md. Gate: test_memo_items.py.
+  (test_improvements untouched; the new keys ride the existing report machinery.)
+* **Activity-based contract selection (`select_contract`, DEFAULT on the pipeline).**
+  The calendar front-month rule pinned roll-window sessions to the quieter book (March
+  2020: the calendar pick measured as low as 60.4% of two-contract volume). Within
+  +/-14 signed days of the roll boundary the ES leg now head-reads each candidate's
+  PRIOR-session closing volume/OI (check_roll.measure's mt_product_statistics read --
+  deterministic per date, not same-day flow) and extracts the leader; outside the
+  window the calendar pick stands without a lake read. Overrides are loud; lake
+  failures fall back to the calendar pick; a cached frame extracted under the other
+  rule's pick re-extracts rather than silently reusing the quieter contract; the rule,
+  pick, and measured split are stamped on frame attrs. measure_roll_at_extraction
+  demotes its MINORITY error to a confirmation when the activity rule already
+  extracted the leader. `--contract-rule {activity,calendar}` on run_analysis
+  (default activity) and the replication driver; library default stays calendar.
+  Gate: test_contract_rule.py (7 checks); existing roll gates unchanged and green.
+
 ## v0.9.72 -- lag-robustness harness: selection off the window-bearing frame, plus the band verdict
 
 Every criterion-driven run kept selecting the SEARCH BOUND (p*=pmax with BIC still

@@ -349,18 +349,50 @@ def estimate_sample(sessions, n_lags=5, names=("SPY", "ES"), criterion=None, pma
 
 
 # ── regime inference (small-N -> permutation, not asymptotics) ────────────────
-def compare_regimes(per_day, metric="CS_ES", n_perm=20000, seed=0):
-    """Permutation test of mean(metric) across volatile vs benchmark sessions."""
-    vol = per_day.loc[per_day.regime == "volatile", metric].to_numpy()
-    ben = per_day.loc[per_day.regime == "benchmark", metric].to_numpy()
-    obs = vol.mean() - ben.mean()
-    pool = np.concatenate([vol, ben]); n_v = len(vol)
+def compare_regimes(per_day, metric="CS_ES", n_perm=20000, seed=0, weights=None):
+    """Permutation test of mean(metric) across volatile vs benchmark sessions.
+
+    weights: optional column name (e.g. 'kappa') or array of per-day weights. The weighted
+    variant exists for the CS fragility documented in the 2026-08-14 findings memo (Q2): on
+    days where the net adjustment speed kappa is ~0, CS is a quotient of near-zero alphas
+    and its per-day value is noise -- weighting the contrast by kappa downweights exactly
+    those days instead of letting them vote at full strength. Labels are permuted with
+    (value, weight) pairs kept together, so the null preserves each day's precision.
+    Unweighted path unchanged (draw-for-draw) from prior releases."""
+    if weights is None:
+        vol = per_day.loc[per_day.regime == "volatile", metric].to_numpy()
+        ben = per_day.loc[per_day.regime == "benchmark", metric].to_numpy()
+        obs = vol.mean() - ben.mean()
+        pool = np.concatenate([vol, ben]); n_v = len(vol)
+        rng = np.random.default_rng(seed); cnt = 0
+        for _ in range(n_perm):
+            rng.shuffle(pool)
+            if abs(pool[:n_v].mean() - pool[n_v:].mean()) >= abs(obs) - EPS:
+                cnt += 1
+        return {"metric": metric, "vol_mean": float(vol.mean()), "ben_mean": float(ben.mean()),
+                "diff": float(obs), "p_perm": (cnt + 1) / (n_perm + 1)}
+    w = (per_day[weights].to_numpy(float) if isinstance(weights, str)
+         else np.asarray(weights, float))
+    v = per_day[metric].to_numpy(float)
+    lab = (per_day.regime.to_numpy() == "volatile")
+    fin = np.isfinite(v) & np.isfinite(w) & (w >= 0)
+    v, w, lab = v[fin], w[fin], lab[fin]
+
+    def _wm(mask):
+        ws = w[mask].sum()
+        return float((v[mask] * w[mask]).sum() / ws) if ws > EPS else float("nan")
+
+    obs = _wm(lab) - _wm(~lab)
+    n_v = int(lab.sum())
+    idx = np.arange(len(v))
     rng = np.random.default_rng(seed); cnt = 0
     for _ in range(n_perm):
-        rng.shuffle(pool)
-        if abs(pool[:n_v].mean() - pool[n_v:].mean()) >= abs(obs) - EPS:
+        rng.shuffle(idx)
+        m = np.zeros(len(v), bool); m[idx[:n_v]] = True
+        if abs(_wm(m) - _wm(~m)) >= abs(obs) - EPS:
             cnt += 1
-    return {"metric": metric, "vol_mean": float(vol.mean()), "ben_mean": float(ben.mean()),
+    return {"metric": metric, "weights": (weights if isinstance(weights, str) else "array"),
+            "vol_mean": _wm(lab), "ben_mean": _wm(~lab),
             "diff": float(obs), "p_perm": (cnt + 1) / (n_perm + 1)}
 
 

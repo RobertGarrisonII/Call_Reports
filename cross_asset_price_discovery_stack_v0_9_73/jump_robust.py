@@ -262,6 +262,43 @@ def cojump_alignment(rx, ry, K=None, alpha=0.01, max_lag=1, names=("SPY", "ES"))
 def cojump_from_mids(mid_spy, mid_es, **kw):
     return cojump_alignment(log_returns(mid_spy), log_returns(mid_es), **kw)
 
+def cojump_by_day(mids, max_lag=2, K=None, alpha=0.01, names=("SPY", "ES")):
+    """cojump_alignment on EVERY session, not an illustrative first one. The single-session
+    read established that ES leads SPY co-jumps 4.6:1 on 2020-03-09 at 10ms -- a claim that
+    cannot be quoted from one day. `mids` is the (label, regime, mid_a, mid_b) list from
+    robustness._mid_sessions. -> DataFrame indexed by date with the alignment counts, the
+    per-day lead SHARE r = (lead_b - lead_a)/(lead_b + lead_a), and regime."""
+    rows = []
+    for label, regime, m_a, m_b in mids:
+        rep = dict(cojump_from_mids(m_a, m_b, max_lag=max_lag, K=K, alpha=alpha, names=names))
+        la, lb = rep.get(f"lead_{names[0]}", 0), rep.get(f"lead_{names[1]}", 0)
+        rep["lead_share"] = ((lb - la) / (lb + la)) if (la + lb) > 0 else float("nan")
+        rep["date"] = str(label); rep["regime"] = regime
+        rows.append(rep)
+    return pd.DataFrame(rows).set_index("date")
+
+def cojump_lead_test(per_day, names=("SPY", "ES"), n_flip=20000, seed=0):
+    """Day-level sign-flip test on the per-day lead share r = (lead_b - lead_a)/(lead_b +
+    lead_a). Under the null of no systematic leader, each day's r is symmetric about zero,
+    so flipping the sign of whole DAYS (the cluster unit -- within-day co-jumps are not
+    independent) gives the reference distribution for |mean r|. The share, not the raw
+    count difference, so a single jump-heavy session cannot carry the verdict."""
+    r = per_day["lead_share"].to_numpy(float)
+    r = r[np.isfinite(r)]
+    if len(r) == 0:
+        return {"leader": None, "mean_lead_share": float("nan"), "n_days": 0,
+                "p_flip": float("nan")}
+    obs = float(np.mean(r))
+    rng = np.random.default_rng(seed)
+    cnt = 0
+    for _ in range(n_flip):
+        if abs(float(np.mean(r * rng.choice([-1.0, 1.0], size=len(r))))) >= abs(obs) - 1e-12:
+            cnt += 1
+    lean = names[1] if obs > 0 else names[0]
+    return {"leader": lean, "mean_lead_share": obs, "n_days": int(len(r)),
+            f"n_days_leaning_{lean}": int((r > 0).sum() if obs > 0 else (r < 0).sum()),
+            "p_flip": (cnt + 1) / (n_flip + 1)}
+
 
 # ── continuous / jump information-share split (built on price_discovery_shares) ─
 def _psd(M, floor_frac=1e-10):
