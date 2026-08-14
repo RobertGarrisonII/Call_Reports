@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en-US">
+<head>
+<meta charset="utf-8">
+<title>Findings of Record — Full-Sample Two-Grid Analysis Run of August 14, 2026</title>
+<style>
+html { -webkit-print-color-adjust: exact; }
+body {
+  font-family: "XCharter", "Charter", "Liberation Serif", "Times New Roman", serif;
+  font-size: 10.5pt;
+  line-height: 1.45;
+  color: #000;
+  margin: 0;
+  text-align: justify;
+  hyphens: auto;
+  -webkit-hyphens: auto;
+}
+p { margin: 0 0 7pt 0; orphans: 2; widows: 2; }
+strong { font-weight: bold; }
+em { font-style: italic; }
+code { font-family: "DejaVu Sans Mono", "Liberation Mono", monospace; font-size: 0.84em; }
+sub, sup { font-size: 0.68em; line-height: 0; }
+var { font-style: italic; font-family: inherit; }
+.circ {
+  text-align: center; font-size: 8.6pt; letter-spacing: 0.18em;
+  text-transform: uppercase; color: #333; margin: 0 0 16pt 0;
+}
+h1 {
+  font-size: 16pt; font-weight: bold; text-align: center; line-height: 1.28;
+  margin: 0 20pt 6pt 20pt; hyphens: none;
+}
+.verline { text-align: center; font-size: 9.4pt; font-style: italic; margin: 0 0 16pt 0; }
+h2 {
+  font-size: 12pt; font-weight: bold; text-align: left; margin: 15pt 0 6pt 0;
+  break-after: avoid; page-break-after: avoid; hyphens: none;
+}
+h3 {
+  font-size: 10.8pt; font-weight: bold; text-align: left; margin: 12pt 0 5pt 0;
+  break-after: avoid; page-break-after: avoid; hyphens: none;
+}
+ol, ul { margin: 0 0 7pt 0; padding-left: 1.55em; }
+li { margin: 0 0 4.5pt 0; }
+.item { margin: 0 0 8pt 0; }
+.item .tag { font-weight: bold; }
+.src { font-size: 9.2pt; color: #333; }
+table {
+  border-collapse: collapse; margin: 11pt auto 10pt auto;
+  break-inside: avoid; page-break-inside: avoid;
+}
+caption {
+  caption-side: top; text-align: center; font-size: 9.3pt; line-height: 1.35;
+  padding: 0 6pt 5pt 6pt; hyphens: none;
+}
+.exnum { font-weight: bold; }
+th, td { font-size: 9.6pt; padding: 2.6pt 10pt; text-align: center; }
+thead th { font-weight: normal; border-top: 1.1pt solid #000; border-bottom: 0.55pt solid #000; }
+tbody tr:last-child td { border-bottom: 1.1pt solid #000; }
+.l { text-align: left; }
+.tabnote {
+  font-size: 9.3pt; line-height: 1.38; margin: -4pt auto 10pt auto;
+  max-width: 5.6in; text-align: justify;
+}
+</style>
+</head>
+<body>
+
+<div class="circ">Internal &mdash; for co-authors</div>
+<h1>Findings of Record: Full-Sample Two-Grid Analysis Run of August&nbsp;14,&nbsp;2026</h1>
+<div class="verline">Re: Garrison, Jain &amp; Paddrik, &ldquo;Cross-Asset Tandem Trading and Extraordinary Volatility&rdquo;<br>
+Interpretation of the production analysis run &mdash; 24 sessions, 1-second and 10-millisecond grids</div>
+
+<h2>1&nbsp;&nbsp;Scope of the record</h2>
+
+<p><span class="exnum">1.1.</span> This report interprets the output archive of the analysis run completed August 14, 2026 (1-second grid at 04:24; 10-millisecond grid at 05:44). The archive comprises two run reports, two machine summaries, and 52 exhibit tables (37 at 1s, 15 at 10ms).</p>
+
+<p><span class="exnum">1.2.</span> The sample is 24 trading sessions: 14 classified volatile &mdash; including the four March 2020 market-wide circuit-breaker sessions (2020-03-09, 2020-03-12, 2020-03-16, 2020-03-18) &mdash; and 10 classified benchmark. Each session carries approximately 23,400 one-second observations and 2.34 million ten-millisecond observations. Session roster at Appendix&nbsp;A.</p>
+
+<p><span class="exnum">1.3.</span> Every stage of both runs completed without error. The error-correction validity check passed on all 24 sessions at both grids (<code>n_ec_invalid&nbsp;=&nbsp;0</code>); the halt mask was in effect throughout, so LULD/MWCB windows contribute no spliced pseudo-returns.</p>
+
+<p><span class="exnum">1.4.</span> <strong>Scope limitation.</strong> This archive covers the core price-discovery stages (information shares, state-dependent ECM, cross-impact, DCC, IRF/FEVD, jumps, robustness, microstructure, legacy comparisons). It does not contain the Table&nbsp;9 both-ways output, the order-flow-correlation tables, or the copula tables; those are produced by separate stages and are addressed in separate memoranda when their outputs are in hand.</p>
+
+<h2>2&nbsp;&nbsp;Methodology in effect, with measured consequences</h2>
+
+<p>Each revision below is active in this run, and the run itself quantifies what the revision changes. The numbers are from this archive, not from simulation.</p>
+
+<div class="item"><span class="tag">M1 &mdash; Lag depth scaled to wall-clock, not step count.</span> The lag order resolved to 5 at the 1-second grid and 60 at the 10-millisecond grid, holding dynamic memory at roughly comparable wall-clock spans rather than fixing one step count across grids. <span class="src">Source: run headers, both grids.</span></div>
+
+<div class="item"><span class="tag">M2 &mdash; Day-clustered inference.</span> The same regression of SPY returns on ES order-flow imbalance carries <var>t</var>&nbsp;=&nbsp;253.25 under the legacy pooled-iid treatment and <var>t</var>&nbsp;=&nbsp;4.62 under day-clustered standard errors (wild-cluster bootstrap <var>p</var>&nbsp;=&nbsp;0.001; 557,995 observations, 24 clusters). The coefficient is unchanged; the legacy precision was overstated by a factor of roughly 55. <span class="src">Source: legacy__inference_iid_vs_clustered, 1s.</span></div>
+
+<div class="item"><span class="tag">M3 &mdash; Book-stress state versus quoted spread.</span> The book-stress state explains 31.8% of the variation in |SPY returns| against 13.8% for the quoted spread alone, with a partial R&sup2; of 17.9% for the state conditional on the spread. The depth-side information is not redundant with the touch. <span class="src">Source: legacy__liquidity_spread_vs_bookstate, 1s.</span></div>
+
+<div class="item"><span class="tag">M4 &mdash; Generalized FEVD under correlated flow shocks.</span> The measured correlation of SPY/ES OFI innovations is 0.742 on benchmark days and 0.835 on volatile days. A diagonal (orthogonalized) FEVD is not valid at that correlation; the Pesaran&ndash;Shin generalized decomposition is the quoted object, with the stated caveat that common tandem flow is partially attributed to both shocks. <span class="src">Source: irf block, 1s.</span></div>
+
+<div class="item"><span class="tag">M5 &mdash; Epps control at the coarse grid.</span> The mean SPY/ES return correlation at 1s is 0.918478 under grid Pearson and 0.918478 under Hayashi&ndash;Yoshida. At one second the two estimators coincide to six decimal places; Epps attenuation is not a factor at this grid, and 1-second findings cannot be Epps artifacts. (The 10ms comparison, where the gap is expected, is the Table&nbsp;9 deliverable.) <span class="src">Source: legacy__comovement_Pearson_vs_HY, 1s.</span></div>
+
+<div class="item"><span class="tag">M6 &mdash; Grid-appropriate jump detection and quote filtering.</span> The 1s run uses truncation; the 10ms run switches to Lee&ndash;Mykland and engages the fleeting-quote filter (minimum rest 5 steps = 50ms) on OFI inputs. The 10ms staleness report records the conditions requiring this: 79.6% (SPY) and 89.2% (ES) of 10ms returns are exact zeros. <span class="src">Source: microstructure__staleness_report, both grids.</span></div>
+
+<div class="item"><span class="tag">M7 &mdash; Identification honesty gate.</span> The Rigobon heteroskedasticity identification was estimated and <strong>refused by its own gate</strong>: the relative variance-ratio spread across regimes is 0.055 against a threshold of 0.10, and the output states &ldquo;NO &mdash; do not quote the het-ID column.&rdquo; The run reports the Cholesky ordering as the identification actually used. A method that declines to identify is recorded as such rather than quoted. <span class="src">Source: legacy__identification_Cholesky_vs_Rigobon, 1s.</span></div>
+
+<div class="item"><span class="tag">M8 &mdash; Uncertainty on the headline share.</span> The cross-sectional mean of CS<sub>ES</sub> carries a day-level bootstrap interval: 0.384, 95% CI [0.293,&nbsp;0.478], bootstrap SE 0.048. <span class="src">Source: robustness__bootstrap_CS_ES, 1s.</span></div>
+
+<h2>3&nbsp;&nbsp;Findings of fact</h2>
+
+<div class="item"><span class="tag">F1 &mdash; The average division of price discovery is near parity, and the ES share rises as the grid refines.</span> At 1 second: mean IS<sub>mid,ES</sub>&nbsp;=&nbsp;0.484, mean CS<sub>ES</sub>&nbsp;=&nbsp;0.384 [0.293,&nbsp;0.478]. At 10 milliseconds: mean IS<sub>mid,ES</sub>&nbsp;=&nbsp;0.542, mean CS<sub>ES</sub>&nbsp;=&nbsp;0.455. Both estimators move toward ES by 6&ndash;7 points when the grid moves from 1s to 10ms. The futures leg&rsquo;s informational lead is concentrated at sub-second horizons; by one second the equity leg has partially caught up. <span class="src">Source: information_shares, both grids.</span></div>
+
+<div class="item"><span class="tag">F2 &mdash; Price discovery migrates toward the futures on volatile days, at both grids, at conventional significance.</span> The day-level permutation test on CS<sub>ES</sub>: volatile mean 0.466 versus benchmark mean 0.269 at 1s (difference +0.197, <var>p</var>&nbsp;=&nbsp;0.048); volatile 0.504 versus benchmark 0.387 at 10ms (difference +0.117, <var>p</var>&nbsp;=&nbsp;0.047). Two grids constructed from different aggregations of the same tape return the same direction at the same significance. The pooled panel-VECM interaction term is <strong>not</strong> significant at either grid (1s: <var>t</var>&nbsp;=&nbsp;0.86&nbsp;/&nbsp;&minus;1.14; 10ms: <var>t</var>&nbsp;=&nbsp;&minus;1.50&nbsp;/&nbsp;&minus;1.60, day-clustered): the migration is a day-level phenomenon with substantial cross-day heterogeneity, not a uniform pooled coefficient shift (see Q1). <span class="src">Source: information_shares__regime_test, panel_vecm, both grids.</span></div>
+
+<div class="item"><span class="tag">F3 &mdash; Tandem order flow is directly measured and intensifies under stress.</span> The correlation of AR-prefiltered OFI innovations across the two legs is 0.742 on benchmark days and 0.835 on volatile days (1s). In the generalized FEVD, ES flow accounts for 47.6% (benchmark) and 51.2% (volatile) of SPY return variance; SPY flow accounts for 34.8% (benchmark) and 43.4% (volatile) of ES return variance. Under stress, each leg&rsquo;s returns are increasingly explained by the other leg&rsquo;s flow &mdash; in both directions. <span class="src">Source: irf block, 1s.</span></div>
+
+<div class="item"><span class="tag">F4 &mdash; Cross-impact is asymmetric at one second, becomes two-way under stress, and largely vanishes at ten milliseconds.</span> At 1s, mean cross-impact of ES flow on SPY returns is &lambda;&nbsp;=&nbsp;0.391 (benchmark) and 0.429 (volatile); the reverse direction, SPY flow on ES returns, is &lambda;&nbsp;=&nbsp;0.004 (benchmark) and 0.106 (volatile). On benchmark days the asymmetry is roughly 100:1 &mdash; ES flow moves SPY, SPY flow does not move ES; on volatile days the reverse channel activates by a factor of ~25. Own-impact simultaneously falls from 0.665 to 0.491 while total cross rises from 0.198 to 0.268. At 10ms all four coefficients are an order of magnitude smaller (cross means 0.017&ndash;0.080). The cross-asset propagation horizon therefore lies between 10 milliseconds and 1 second. <span class="src">Source: cross_impact__regime_summary, cross_impact__panel, both grids.</span></div>
+
+<div class="item"><span class="tag">F5 &mdash; At the fine grid, the futures lead the co-jumps; at the coarse grid the lead is invisible.</span> On 2020-03-09 at 1s: 14 co-jumps, all 14 simultaneous, sign agreement 1.00, zero leads either way. The same session at 10ms: 24,346 co-jumps, of which ES leads 7,610 and SPY leads 1,669 &mdash; a 4.6:1 ratio &mdash; with 15,067 simultaneous and sign agreement 0.948. The lead-lag structure of tandem jumps is a sub-second phenomenon that one-second sampling aggregates away. <span class="src">Source: jumps__cojump_session0, both grids.</span></div>
+
+<div class="item"><span class="tag">F6 &mdash; The state dependence of adjustment speeds is decisively established at 10ms and weak at 1s.</span> In the ECM-SDE, the sensitivity of SPY&rsquo;s error-correction coefficient to the liquidity state carries <var>t</var>&nbsp;=&nbsp;5.24 at 10ms (ES leg: <var>t</var>&nbsp;=&nbsp;&minus;9.35); at 1s the SPY-leg sensitivity is <var>t</var>&nbsp;=&nbsp;0.25 (ES: &minus;3.01). Along the fitted 10ms state curve the median IS<sub>ES</sub> is 0.669 using the mid and 0.741 using the microprice &mdash; the microprice reference shifts roughly 7 points of information share toward ES. <span class="src">Source: ecm_sde, both grids.</span></div>
+
+<div class="item"><span class="tag">F7 &mdash; Jump and continuous components split price discovery about evenly at 1s.</span> Decomposing by the truncation split at 1s: mean ISj<sub>ES</sub>&nbsp;=&nbsp;0.505 (jump component) versus ISc<sub>ES</sub>&nbsp;=&nbsp;0.480 (continuous component). Jumps account for 17.4% of common-factor variation by truncation and 5.8% by Lee&ndash;Mykland at 1s. The corresponding 10ms fractions (69.5%&nbsp;/&nbsp;58.1%) are recorded but flagged as unreliable in Q4. <span class="src">Source: jumps, both grids.</span></div>
+
+<div class="item"><span class="tag">F8 &mdash; The headline share is flat in the lag order.</span> CS<sub>ES</sub> at lag orders 3, 5, 10, 20 (1s): 0.398, 0.384, 0.390, 0.412. The regime finding does not depend on the lag choice &mdash; consistent with the position, adopted in the v0.9.72 stack revision, that findings should be demonstrated across a band of defensible lag depths rather than at a single selected one. <span class="src">Source: robustness__lag_sensitivity, 1s.</span></div>
+
+<div class="item"><span class="tag">F9 &mdash; Conditional correlation is high and near-integrated.</span> DCC(1,1) on the 24 sessions: <var>a</var>&nbsp;=&nbsp;0.0096, <var>b</var>&nbsp;=&nbsp;0.9903, persistence 0.9999 (at the estimation boundary); mean conditional correlation 0.885 against a realized correlation of 0.932. The persistence estimate is a boundary solution and the level series should be treated as near-integrated (Q3). <span class="src">Source: dcc, 1s.</span></div>
+
+<h2>4&nbsp;&nbsp;Qualifications</h2>
+
+<div class="item"><span class="tag">Q1 &mdash; The regime migration is established at the day level, not the pooled level.</span> The permutation tests (<var>p</var>&nbsp;=&nbsp;0.048, 0.047) operate on per-day shares; the pooled interaction terms do not reach significance. The correct statement for the paper is that the <em>distribution of days</em> shifts toward ES leadership under stress, with cross-day heterogeneity large relative to the mean shift &mdash; not that a pooled adjustment coefficient moves uniformly. The per-day 10ms IS<sub>mid,ES</sub> ranges from 0.328 to 0.944.</div>
+
+<div class="item"><span class="tag">Q2 &mdash; CS is fragile on slow-adjustment days; IS is not.</span> Re-estimating the cointegrating &beta; (rather than imposing (1,&nbsp;&minus;1)) moves CS<sub>ES</sub> by more than 0.30 on 6 of 24 days (mean absolute change 0.205), while IS<sub>mid,ES</sub> moves by a mean of 0.024. The unstable days are those with the smallest net adjustment speed &kappa; (2024-12-18: &kappa;&nbsp;=&nbsp;0.0003; 2024-04-04: 0.0025; 2025-10-10: 0.0040 at 1s): when both &alpha;&rsquo;s are near zero, their ratio is noise. Recommended reporting: IS (bounded, &beta;-robust) as the primary share; CS quoted with &kappa; alongside, or with low-&kappa; days flagged. <span class="src">Source: robustness__beta_fixed_vs_estimated, information_shares__per_day.</span></div>
+
+<div class="item"><span class="tag">Q3 &mdash; DCC persistence is a boundary estimate.</span> <var>a</var>&nbsp;+&nbsp;<var>b</var>&nbsp;=&nbsp;0.9999 is the optimizer&rsquo;s cap, not an interior optimum. The conditional-correlation <em>level</em> is effectively a random walk over the session and should not be quoted as a stable parameter; the realized (unconditional) correlation of 0.932 is the safer summary.</div>
+
+<div class="item"><span class="tag">Q4 &mdash; The 10ms jump fractions are not yet quotable.</span> Jump shares of 58&ndash;69% of common-factor variation at 10ms sit on top of 80&ndash;89% exact-zero returns; at that staleness, threshold-based detectors classify quote-refresh clustering as jumps. The 1s fractions (5.8&ndash;17.4%) are the defensible ones. The 10ms co-jump <em>timing</em> asymmetry (F5) is less exposed &mdash; it conditions on jumps in both legs within a window, and its 4.6:1 ratio would require a staleness mechanism that is asymmetric between legs in the observed direction &mdash; but corroboration on the remaining 23 sessions is required before it is quoted (E2).</div>
+
+<div class="item"><span class="tag">Q5 &mdash; Heteroskedasticity identification failed honestly.</span> The Rigobon variance-ratio spread across day-level regimes (0.055) is below the identification threshold (0.10). Day-level regimes do not move the relative SPY/ES variance enough; the identification needs sharper contrast (E5).</div>
+
+<div class="item"><span class="tag">Q6 &mdash; One session remains under a data-quality flag.</span> 2024-12-18 (FOMC) is simultaneously the most extreme observation at 10ms (IS<sub>mid,ES</sub>&nbsp;=&nbsp;0.944), the lowest-&kappa; day at both grids, and the session with the unresolved replay-versus-ladder discrepancy in extraction validation. No finding should lean on this day until that discrepancy is resolved; F2&rsquo;s permutation result does not depend on it (removing it lowers the volatile mean).</div>
+
+<div class="item"><span class="tag">Q7 &mdash; Two liquidity-state constructions disagree at 10ms.</span> The depth-based state and the FPCA state produce day-level <var>t</var>-statistics of opposite average sign (+1.11 versus &minus;3.97) for the ES-share response. The state definition is doing work; the disagreement is documented, not resolved (E7).</div>
+
+<h2>5&nbsp;&nbsp;Matters for further examination</h2>
+
+<div class="item"><span class="tag">E1 &mdash; The propagation horizon.</span> F4 brackets the cross-impact horizon between 10ms and 1s. A profile of cross-&lambda; against aggregation interval (10ms, 50ms, 100ms, 250ms, 1s) would locate the timescale at which futures flow is impounded into the equity price &mdash; a single exhibit, estimable from the existing frames, and arguably the sharpest characterization of &ldquo;tandem&rdquo; the data can produce.</div>
+
+<div class="item"><span class="tag">E2 &mdash; Co-jump lead-lag on all sessions.</span> F5 rests on one session in the summary output. Extending the co-jump lead/lag/simultaneous counts to all 24 sessions, with a day-level sign test on the lead ratio (and, if warranted, the Hoffmann&ndash;Rosenbaum&ndash;Yoshida lead-lag estimator as the formal version), would either establish ES jump leadership as a population finding or confine it to March 2020.</div>
+
+<div class="item"><span class="tag">E3 &mdash; &kappa;-weighted and IS-primary reporting.</span> Per Q2: recompute the regime contrast with days weighted by &kappa; (or on IS rather than CS) and confirm the migration survives. The permutation machinery already exists; this is a reporting change, not new estimation.</div>
+
+<div class="item"><span class="tag">E4 &mdash; Grid-dependence of the error-correction half-life.</span> The fitted half-life is 9&ndash;12 seconds on the 1s grid and 177&ndash;205 seconds on the 10ms grid &mdash; a twenty-fold disagreement for what is nominally the same adjustment process. Two candidate mechanisms: (i) 60 lags at 10ms spans only 0.6s of dynamics, truncating the correction; (ii) stale quotes mechanically attenuate the measured &alpha; at the fine grid &mdash; the same attenuation logic the paper applies to correlation (Epps) applied to adjustment speeds. Distinguishing these matters for any statement about <em>how fast</em> the basis closes; mechanism (ii), if confirmed, extends the paper&rsquo;s measurement-error theme to a second estimator family.</div>
+
+<div class="item"><span class="tag">E5 &mdash; Identification through sharper variance regimes.</span> Q5&rsquo;s failure used whole days as regimes. Intraday windows with genuine relative-variance contrast &mdash; MWCB reopening windows against mid-session windows, or the 2020-03-16 open &mdash; are the natural candidates for a Rigobon identification that passes its own gate.</div>
+
+<div class="item"><span class="tag">E6 &mdash; Microprice-referenced discovery at the fine grid.</span> F6&rsquo;s 7-point IS shift under the microprice reference (0.669&nbsp;&rarr;&nbsp;0.741) suggests the mid systematically lags the book&rsquo;s information at 10ms. Adopting the microprice curve as the primary 10ms exhibit (mid as robustness) is a candidate revision; it also connects to the queue-imbalance discussion in the tick-constrained-regime memorandum.</div>
+
+<div class="item"><span class="tag">E7 &mdash; Reconciling the state constructions.</span> Q7&rsquo;s sign conflict between depth-state and FPCA-state conditioning should be resolved before either is quoted as &ldquo;the&rdquo; liquidity state &mdash; most plausibly by identifying which days drive the FPCA divergence and whether its leading component loads on depth level or depth <em>shape</em>.</div>
+
+<div class="item"><span class="tag">E8 &mdash; Completion of the record.</span> The Table&nbsp;9 both-ways/RealBar output (with the v0.9.72 lag-band stability verdict), the flow-correlation tables, and the copula tail-dependence tables are produced by stages not included in this archive. The findings above &mdash; particularly F3 &mdash; are expected to be sharpened by those exhibits; interpretation of the full record is deferred until they ship.</div>
+
+<h2>Appendix A &mdash; Session roster</h2>
+
+<table>
+<thead><tr><th class="l">Class</th><th class="l">Sessions</th></tr></thead>
+<tbody>
+<tr><td class="l">Volatile, MWCB (4)</td><td class="l">2020-03-09, 2020-03-12, 2020-03-16, 2020-03-18</td></tr>
+<tr><td class="l">Volatile (10)</td><td class="l">2023-03-09, 2024-07-24, 2024-08-05, 2024-09-03, 2024-12-18, 2025-01-27, 2025-04-03, 2025-08-01, 2025-10-10, 2026-06-05</td></tr>
+<tr><td class="l">Benchmark (10)</td><td class="l">2022-03-24, 2023-07-19, 2023-08-07, 2023-09-05, 2023-12-20, 2024-01-29, 2024-04-04, 2024-08-09, 2024-10-18, 2025-06-13</td></tr>
+</tbody>
+</table>
+<p class="tabnote">Observations per session: &asymp;23,400 (1s grid); &asymp;2,340,000 (10ms grid). Halt masking active on all sessions; error-correction validity check passed 24/24 at both grids.</p>
+
+<h2>Appendix B &mdash; Key figures at a glance</h2>
+
+<table>
+<thead><tr><th class="l">Quantity</th><th>1s</th><th>10ms</th><th class="l">Source</th></tr></thead>
+<tbody>
+<tr><td class="l">Mean IS<sub>mid,ES</sub></td><td>0.484</td><td>0.542</td><td class="l">information_shares</td></tr>
+<tr><td class="l">Mean CS<sub>ES</sub></td><td>0.384 [0.293, 0.478]</td><td>0.455</td><td class="l">information_shares, bootstrap</td></tr>
+<tr><td class="l">CS<sub>ES</sub>, volatile &minus; benchmark</td><td>+0.197 (p=0.048)</td><td>+0.117 (p=0.047)</td><td class="l">regime_test</td></tr>
+<tr><td class="l">OFI innovation correlation (bench / vol)</td><td>0.742 / 0.835</td><td>&mdash;</td><td class="l">irf</td></tr>
+<tr><td class="l">Cross-&lambda; SPY&larr;ES (bench / vol)</td><td>0.391 / 0.429</td><td>0.024 / 0.080</td><td class="l">cross_impact</td></tr>
+<tr><td class="l">Cross-&lambda; ES&larr;SPY (bench / vol)</td><td>0.004 / 0.106</td><td>0.017 / 0.040</td><td class="l">cross_impact</td></tr>
+<tr><td class="l">Co-jump leads ES&nbsp;:&nbsp;SPY (2020-03-09)</td><td>0 : 0 (14 simult.)</td><td>7,610 : 1,669</td><td class="l">jumps</td></tr>
+<tr><td class="l">ECM state-dependence t (SPY / ES)</td><td>0.25 / &minus;3.01</td><td>5.24 / &minus;9.35</td><td class="l">ecm_sde</td></tr>
+<tr><td class="l">Zero-return fraction (SPY / ES)</td><td>0.066 / 0.188</td><td>0.796 / 0.892</td><td class="l">microstructure</td></tr>
+<tr><td class="l">Legacy vs clustered t (SPY ret ~ ES OFI)</td><td>253.25 &rarr; 4.62</td><td>&mdash;</td><td class="l">legacy</td></tr>
+</tbody>
+</table>
+
+</body>
+</html>
