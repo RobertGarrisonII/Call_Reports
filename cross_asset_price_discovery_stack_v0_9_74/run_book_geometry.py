@@ -114,9 +114,15 @@ def main(argv=None):
     print()
     print("VERDICT: mean Spearman(tau, HHI) = %.3f ; mean incremental R^2 of tau over"
           % verdict["mean_spearman_tau_hhi"])
-    print("         {depth, centroid, HHI} = %+.4f  (n = %d session-assets)"
+    print("         {spread, depth, centroid, HHI} = %+.4f  (n = %d session-assets)"
           % (verdict["mean_tau_increment"], verdict["n_session_assets"]))
     print("         reading: %s" % verdict["reading"])
+    q0 = verdict.get("dwc_decay_scale", {})
+    print("DWC:     fixed Q0 = %s (benchmark median inside size x5, held constant);"
+          % (", ".join("%s=%.0f" % (a, v) for a, v in q0.items() if v is not None) or "n/a"))
+    print("         mean incremental R^2 of the decay-weighted cost over the same set "
+          "(which contains both of its Q0 limits) = %+.4f" % verdict["mean_dwc_increment"])
+    print("         reading: %s" % verdict["reading_dwc"])
     if a.out_dir:
         os.makedirs(a.out_dir, exist_ok=True)
         tag = (a.tag + "_") if a.tag else ""

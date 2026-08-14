@@ -133,6 +133,40 @@ def check_hygiene():
     return bool(ok_nan and ok_torn)
 
 
+def check_dwc_limits():
+    """The Q0 dial's endpoints, verified numerically on a constructed book: tiny Q0
+    reproduces the level-1 (touch) cost, huge Q0 reproduces the size-weighted mean
+    marginal cost (the centroid in bps from the anchor). The covering set contains
+    both, which is what makes the redundancy question sharp. Also: the fixed scale
+    resolver uses benchmark sessions and falls back to the pooled sample."""
+    rng = np.random.default_rng(21)
+    q = rng.gamma(2.0, 200.0, size=(200, 10)) + 5.0
+    df = _book_frame(q)
+    import liquidity_curve_metrics as lcm
+    cost, qq, Q, _ = lcm._cost_curve(df, "SPY", "ask", 10, "wmid")
+    dwc_lo = bg.dwc_fixed(df, "SPY", 10, decay_scale=1e-6)
+    dwc_hi = bg.dwc_fixed(df, "SPY", 10, decay_scale=1e12)
+    # side='both' averages ask and bid; the constructed book is symmetric in prices
+    # but not sizes, so compute both legs' references explicitly
+    cost_b, qq_b, _, _ = lcm._cost_curve(df, "SPY", "bid", 10, "wmid")
+    touch = 0.5 * (cost[:, 0] + cost_b[:, 0])
+    swm = 0.5 * ((cost * qq).sum(axis=1) / qq.sum(axis=1)
+                 + (cost_b * qq_b).sum(axis=1) / qq_b.sum(axis=1))
+    ok_lo = np.nanmax(np.abs(dwc_lo - touch)) < 1e-6
+    ok_hi = np.nanmax(np.abs(dwc_hi - swm)) < 1e-6
+    sess = [("d0", "benchmark", df), ("d1", "volatile", df * np.nan)]
+    q0_b = bg.fixed_decay_scale(sess, "SPY")
+    med = np.median(np.concatenate([q[:, 0], q[:, 0]]))
+    ok_q0 = q0_b is not None and abs(q0_b - 5.0 * med) < 1e-9
+    q0_f = bg.fixed_decay_scale([("d0", "volatile", df)], "SPY")
+    ok_fb = q0_f is not None and abs(q0_f - 5.0 * med) < 1e-9
+    print("(6) DWC limits: Q0->0 == touch cost (%s), Q0->inf == size-weighted mean "
+          "marginal cost (%s);" % (ok_lo, ok_hi))
+    print("    fixed Q0 from benchmark sessions (%s), pooled fallback when none (%s)"
+          % (ok_q0, ok_fb))
+    return bool(ok_lo and ok_hi and ok_q0 and ok_fb)
+
+
 def check_runner():
     import run_book_geometry as rbg
     with tempfile.TemporaryDirectory() as td:
@@ -147,17 +181,22 @@ def check_runner():
         if per_day:
             t = pd.read_csv(os.path.join(td, per_day[0]))
             ok_cols = ({"tau_bid", "hhi_bid", "centroid_asym", "spearman_tau_hhi_bid",
-                        "tau_increment"} <= set(t.columns)) and len(t) > 0
+                        "tau_increment", "dwc_mean", "dwc_increment",
+                        "spearman_dwc_qspr"} <= set(t.columns)) and len(t) > 0
+            ok_dwc_finite = ok_cols and t["dwc_increment"].notna().any()
+        else:
+            ok_dwc_finite = False
         out = buf.getvalue()
-        ok_verdict = "VERDICT" in out
-    print("(6) runner: rc=%s, per-day CSV written (%s), verdict printed (%s), columns (%s)"
-          % (rc, ok_files, ok_verdict, ok_cols))
-    return rc == 0 and ok_files and ok_verdict and ok_cols
+        ok_verdict = "VERDICT" in out and "DWC:" in out and "fixed Q0" in out
+    print("(7) runner: rc=%s, per-day CSV written (%s), tau+DWC verdicts printed (%s), "
+          "columns incl. DWC (%s), DWC increment computed (%s)"
+          % (rc, ok_files, ok_verdict, ok_cols, ok_dwc_finite))
+    return rc == 0 and ok_files and ok_verdict and ok_cols and ok_dwc_finite
 
 
 def main():
     checks = [check_endpoints, check_permutation_invariance, check_sweep_identity,
-              check_rank_equivalence, check_hygiene, check_runner]
+              check_rank_equivalence, check_hygiene, check_dwc_limits, check_runner]
     res = []
     for fn in checks:
         try:

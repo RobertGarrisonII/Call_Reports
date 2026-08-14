@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.9.74 -- decay-weighted cost enters the STAGE 5d redundancy verdict (fixed Q0)
+
+The decay-weighted cost (lcm.decay_weighted_cost: expected marginal cost at an
+Exp(Q0)-distributed fill depth -- a Laplace-transform aggregation of the whole cost
+curve, no hard fill-size cutoff, never NaN on thin books) is now a CANDIDATE in the
+book-geometry redundancy check, under two disciplines:
+
+* **Fixed Q0** (`fixed_decay_scale`): one scale per asset for the whole sample --
+  5 x the pooled BENCHMARK-session median inside size, held constant everywhere.
+  The library's endogenous per-bar Q0 (5 x the same bar's inside size) re-anchors
+  the weights toward the touch exactly when books thin, conflating curve steepening
+  with window contraction; freezing Q0 on calm-period depth makes cross-regime
+  variation in the measure the cost curve's alone.
+* **The sharp covering set.** The measure's own Q0 limits are now both IN the set:
+  Q0 -> 0 is the quoted spread (added to the covering regressors as
+  `quoted_spread_bps`) and Q0 -> inf is the size-weighted mean marginal cost -- the
+  depth centroid, gate-pinned in v0.9.73. Any surviving incremental R^2 is interior
+  cost-curve curvature, the one thing the endpoints cannot span. Both limits are
+  verified NUMERICALLY in the gate (tiny/huge Q0 reproduce touch cost and
+  size-weighted mean to 1e-6).
+
+table_book_geometry / STAGE 5d now report dwc_mean, dwc_increment,
+Spearman(DWC, spread) and Spearman(DWC, centroid) per session-asset, plus a
+`reading_dwc` verdict line: increment ~0 -> keep cost-to-fill as the headline with
+DWC as the no-hard-target robustness column; a surviving increment -> curvature
+carries independent information and DWC (or a deep-to-near marginal cost ratio)
+deserves promotion. tau's covering set gains the quoted spread as well (strictly
+harder test than v0.9.73's). Gate test_book_geometry.py extended to 7 checks.
+
+
 ## v0.9.73 -- the ||L|| check, one structured output tree, memo items, and the activity contract rule
 
 Four tracks, all from the co-author review cycle:

@@ -151,6 +151,57 @@ def book_geometry_frame(df: pd.DataFrame, asset: str, n_levels: int = 10,
     return pd.DataFrame(out, index=df.index)
 
 
+# ── decay-weighted cost as a redundancy-check candidate (v0.9.74) ─────────────
+def fixed_decay_scale(sessions, asset, decay_levels=5.0):
+    """One Q0 per asset for the WHOLE sample: decay_levels x the pooled median inside
+    (level-1) size over the BENCHMARK sessions, held constant everywhere.
+
+    The library default (Q0 = 5 x the same bar's inside size) is endogenous: under
+    stress the inside shrinks, Q0 shrinks with it, the exponential weights re-anchor
+    toward the touch, and the measured 'cost' change conflates the curve steepening
+    with the measurement window contracting. Freezing Q0 on calm-period depth makes
+    the weights a fixed demand distribution, so cross-regime variation in the measure
+    is variation in the COST CURVE alone. Benchmark days define 'calm'; a sample with
+    no benchmark label falls back to the pooled median. -> float or None."""
+    def _collect(only_benchmark):
+        vals = []
+        for _d, regime, df in sessions:
+            if only_benchmark and regime != "benchmark":
+                continue
+            for side in ("bid", "ask"):
+                col = f"{asset}_{side}quantity_1"
+                if col in df.columns:
+                    vals.append(df[col].to_numpy(float))
+        return vals
+    vals = _collect(True) or _collect(False)
+    if not vals:
+        return None
+    v = np.concatenate(vals)
+    v = v[np.isfinite(v) & (v > 0)]
+    return float(decay_levels * np.median(v)) if len(v) else None
+
+
+def dwc_fixed(df, asset, n_levels=10, decay_scale=None):
+    """Decay-weighted cost (bps) at a FIXED Q0 -- lcm.decay_weighted_cost with the
+    endogenous per-bar scale replaced by `decay_scale` (see fixed_decay_scale).
+    Its two limits bracket it analytically: Q0 -> 0 gives the touch cost (the quoted
+    half-spread family) and Q0 -> inf gives the size-weighted mean marginal cost --
+    the depth centroid in bps. Whatever it adds over {quoted spread, centroid} is
+    interior-curve curvature; the redundancy check below measures exactly that."""
+    return lcm.decay_weighted_cost(df, asset, n_levels=n_levels, decay_scale=decay_scale)
+
+
+def quoted_spread_bps(df, asset):
+    """Level-1 spread in bps of mid -- the Q0 -> 0 endpoint of the decay dial, added
+    to the covering set so the check asks the sharp question (increment over BOTH
+    endpoints), not the easy one."""
+    b = df[f"{asset}_bidprice_1"].to_numpy(float)
+    a = df[f"{asset}_askprice_1"].to_numpy(float)
+    mid = (a + b) / 2.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(mid > EPS, (a - b) / mid * 1e4, np.nan)
+
+
 # ── the two checks the measure exists for ─────────────────────────────────────
 def _spearman(a: np.ndarray, b: np.ndarray) -> float:
     m = np.isfinite(a) & np.isfinite(b)
@@ -177,16 +228,24 @@ def _r2(y: np.ndarray, X: np.ndarray) -> float:
 
 
 def tau_redundancy_check(df: pd.DataFrame, asset: str, n_levels: int = 10,
-                         tick_size: float | None = None, horizon: int = 60) -> dict:
-    """The verdict tau exists to deliver, on one session frame.
+                         tick_size: float | None = None, horizon: int = 60,
+                         decay_scale: float | None = None) -> dict:
+    """The verdicts the geometry candidates exist to deliver, on one session frame.
 
     (1) rank equivalence: Spearman rho of tau vs the Herfindahl, per side. The
         Schur-convexity argument predicts rho ~ 1; a materially lower rho means
         the higher-order share moments tau weights are moving independently.
     (2) incremental R^2: |forward mid return over `horizon` steps| regressed on
-        the covering set {log total depth, centroid, HHI} (both sides), then
-        with tau_bid/tau_ask added. The prediction is an increment of ~0.
-    -> {side: spearman_tau_hhi}, r2_covering, r2_with_tau, tau_increment"""
+        the covering set {quoted spread, log total depth, centroid, HHI} (both
+        sides), then with tau_bid/tau_ask added. The prediction is ~0.
+    (3) when ``decay_scale`` is given (fixed Q0; see fixed_decay_scale): the
+        decay-weighted cost's increment over the same covering set. The set
+        contains BOTH of the measure's Q0 limits -- the quoted spread (Q0 -> 0)
+        and the centroid (Q0 -> inf) -- so any surviving increment is interior
+        cost-curve curvature, the one thing the endpoints cannot span.
+    -> {side: spearman_tau_hhi}, r2_covering, r2_with_tau, tau_increment,
+       and with decay_scale: dwc_mean, dwc_increment, spearman_dwc_qspr,
+       spearman_dwc_centroid"""
     g = book_geometry_frame(df, asset, n_levels, tick_size)
     mid = (df[f"{asset}_bidprice_1"].to_numpy(float)
            + df[f"{asset}_askprice_1"].to_numpy(float)) / 2.0
@@ -197,33 +256,55 @@ def tau_redundancy_check(df: pd.DataFrame, asset: str, n_levels: int = 10,
         fwd[:-horizon] = np.abs(lm[horizon:] - lm[:-horizon]) * 1e4
     with np.errstate(divide="ignore", invalid="ignore"):
         ldep = np.log(g["depth_bid"].to_numpy() + g["depth_ask"].to_numpy())
-    cover = np.column_stack([ldep, g["centroid_bid"], g["centroid_ask"],
+    qspr = quoted_spread_bps(df, asset)
+    cover = np.column_stack([qspr, ldep, g["centroid_bid"], g["centroid_ask"],
                              g["hhi_bid"], g["hhi_ask"]])
     withtau = np.column_stack([cover, g["tau_bid"], g["tau_ask"]])
     r2_c = _r2(fwd, cover)
     r2_t = _r2(fwd, withtau)
-    return {"spearman_tau_hhi": {s: _spearman(g[f"tau_{s}"].to_numpy(),
-                                              g[f"hhi_{s}"].to_numpy())
-                                 for s in ("bid", "ask")},
-            "r2_covering": r2_c, "r2_with_tau": r2_t,
-            "tau_increment": (r2_t - r2_c) if np.isfinite(r2_c) and np.isfinite(r2_t)
+    out = {"spearman_tau_hhi": {s: _spearman(g[f"tau_{s}"].to_numpy(),
+                                             g[f"hhi_{s}"].to_numpy())
+                                for s in ("bid", "ask")},
+           "r2_covering": r2_c, "r2_with_tau": r2_t,
+           "tau_increment": (r2_t - r2_c) if np.isfinite(r2_c) and np.isfinite(r2_t)
+                            else float("nan"),
+           "n_obs": int(np.isfinite(fwd).sum()), "horizon_steps": int(horizon)}
+    if decay_scale is not None and np.isfinite(decay_scale) and decay_scale > 0:
+        dwc = dwc_fixed(df, asset, n_levels, decay_scale)
+        withdwc = np.column_stack([cover, dwc])
+        r2_d = _r2(fwd, withdwc)
+        out.update({
+            "dwc_mean": float(np.nanmean(dwc)),
+            "dwc_decay_scale": float(decay_scale),
+            "dwc_increment": (r2_d - r2_c) if np.isfinite(r2_c) and np.isfinite(r2_d)
                              else float("nan"),
-            "n_obs": int(np.isfinite(fwd).sum()), "horizon_steps": int(horizon)}
+            "spearman_dwc_qspr": _spearman(dwc, qspr),
+            "spearman_dwc_centroid": _spearman(
+                dwc, g["centroid_bid"].to_numpy() + g["centroid_ask"].to_numpy()),
+        })
+    return out
 
 
 def table_book_geometry(sessions, n_levels: int = 10,
-                        tick_sizes: dict | None = None, horizon: int = 60):
-    """Per-session geometry summary + the redundancy verdict, both assets.
+                        tick_sizes: dict | None = None, horizon: int = 60,
+                        decay_levels: float = 5.0):
+    """Per-session geometry summary + the redundancy verdicts, both assets.
     `sessions` = List[(date, regime, df)]. tick_sizes e.g. {'SPY': 0.01,
-    'ES': 0.25}. -> (per_day DataFrame, verdict dict of cross-day means)."""
+    'ES': 0.25}. One FIXED decay scale per asset (fixed_decay_scale: benchmark
+    median inside size x decay_levels) is resolved from the whole sample and
+    used on every session, so the decay-weighted cost's cross-regime variation
+    is the cost curve's, not the weighting window's.
+    -> (per_day DataFrame, verdict dict of cross-day means)."""
     tick_sizes = tick_sizes or {}
+    q0 = {a: fixed_decay_scale(sessions, a, decay_levels) for a in ("SPY", "ES")}
     rows = []
     for date, regime, df in sessions:
         for asset in ("SPY", "ES"):
             try:
                 g = book_geometry_frame(df, asset, n_levels, tick_sizes.get(asset))
                 chk = tau_redundancy_check(df, asset, n_levels,
-                                           tick_sizes.get(asset), horizon)
+                                           tick_sizes.get(asset), horizon,
+                                           decay_scale=q0.get(asset))
             except KeyError:
                 continue
             rows.append({
@@ -239,22 +320,39 @@ def table_book_geometry(sessions, n_levels: int = 10,
                 "spearman_tau_hhi_ask": chk["spearman_tau_hhi"]["ask"],
                 "r2_covering": chk["r2_covering"],
                 "tau_increment": chk["tau_increment"],
+                "dwc_mean": chk.get("dwc_mean", float("nan")),
+                "dwc_increment": chk.get("dwc_increment", float("nan")),
+                "spearman_dwc_qspr": chk.get("spearman_dwc_qspr", float("nan")),
+                "spearman_dwc_centroid": chk.get("spearman_dwc_centroid", float("nan")),
             })
     per_day = pd.DataFrame(rows)
     verdict = {}
     if not per_day.empty:
+        mean_rho = float(np.nanmean(
+            per_day[["spearman_tau_hhi_bid", "spearman_tau_hhi_ask"]].to_numpy()))
+        mean_tau_inc = float(np.nanmean(per_day["tau_increment"]))
+        mean_dwc_inc = float(np.nanmean(per_day["dwc_increment"]))
         verdict = {
-            "mean_spearman_tau_hhi": float(np.nanmean(
-                per_day[["spearman_tau_hhi_bid", "spearman_tau_hhi_ask"]].to_numpy())),
-            "mean_tau_increment": float(np.nanmean(per_day["tau_increment"])),
+            "mean_spearman_tau_hhi": mean_rho,
+            "mean_tau_increment": mean_tau_inc,
+            "mean_dwc_increment": mean_dwc_inc,
+            "dwc_decay_scale": {a: q0[a] for a in q0},
             "n_session_assets": int(len(per_day)),
             "reading": ("tau is rank-equivalent to the Herfindahl and adds no "
-                        "explanatory power over {depth, centroid, HHI}: keep it "
+                        "explanatory power over {spread, depth, centroid, HHI}: keep it "
                         "as a diagnostic, not a regressor"
-                        if np.nanmean(per_day[["spearman_tau_hhi_bid",
-                                               "spearman_tau_hhi_ask"]].to_numpy()) > 0.90
-                        and abs(np.nanmean(per_day["tau_increment"])) < 0.01
+                        if mean_rho > 0.90 and abs(mean_tau_inc) < 0.01
                         else "tau is NOT fully covered on this sample -- "
                              "inspect before dismissing it"),
+            "reading_dwc": ("the decay-weighted cost is spanned by its own Q0 limits "
+                            "(quoted spread + centroid): keep cost-to-fill as the "
+                            "headline and DWC as the no-hard-target robustness column"
+                            if np.isfinite(mean_dwc_inc) and abs(mean_dwc_inc) < 0.01
+                            else "interior cost-curve curvature carries information "
+                                 "beyond the spread/centroid endpoints on this sample "
+                                 "-- the DWC (or a deep-to-near marginal cost ratio) "
+                                 "deserves promotion; inspect before dismissing"
+                            if np.isfinite(mean_dwc_inc)
+                            else "DWC could not be computed (no usable decay scale)"),
         }
     return per_day, verdict
