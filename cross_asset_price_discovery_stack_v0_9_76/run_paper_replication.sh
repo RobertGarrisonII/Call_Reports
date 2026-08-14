@@ -429,6 +429,7 @@ if have_stage 1; then
            test_output_layout.py \
            test_contract_rule.py \
            test_horizon_profile.py \
+           test_design_sample.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi

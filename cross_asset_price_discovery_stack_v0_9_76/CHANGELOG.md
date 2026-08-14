@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.9.76 -- the sample design as code: design_sample.py
+
+The volatile-day selection moves from a manual workflow (top-10 log-diff days off a
+3-4 year V-Lab download, hand-picked controls) to a derivable rule, per the
+sample-size review:
+
+* **Fixed-threshold selection** on the daily log-difference of a supplied volatility
+  series (--stat level for the level): a day qualifies above a fixed quantile of the
+  WHOLE window -- portable across windows, n grows with the window, no
+  sample-relative top-N.
+* **Episode grouping**: qualifying days within --episode-gap trading days share an
+  episode; each episode contributes at most --max-per-episode days (highest
+  statistic first). The unit that buys power is the episode, not the day.
+* **Power-based sufficiency**: required days per regime from the closed form
+  n = ceil(2((z_{1-a/2}+z_pow) sd/diff)^2) with the day-level SD given directly or
+  estimated from a prior run's per-day CSV (--per-day-csv, --metric); the report
+  states required vs selected and the achieved power, with a SUFFICIENT /
+  INSUFFICIENT verdict. Defaults carry the 2026-08-14 run's numbers (SD 0.235,
+  diff 0.20 -> 22 per regime).
+* **Computed controls, not date ranges**: per selected day -- same weekday, 350-371
+  calendar days earlier, a trading day, not a one-off closure, not a qualifying
+  day, unique across pairs, and below the --control-max-q volatility-LEVEL screen,
+  with a GRADUATED fallback (--control-max-q -> q0.75, relaxation recorded per
+  pair) for spike years whose whole prior year sits above the median. Closest to
+  364 days wins. Explicit dates because the rule is per-day and the extraction
+  pipeline consumes date lists; ranges cannot express the screen.
+* **Mid-band dose-response days** (--n-mid): evenly spaced days in a mid-volatility
+  quantile band, each with a control, emitted SEPARATELY from --volatile/--baseline
+  so they cannot contaminate the binary regime contrast (they exist for the
+  regression on the continuous state).
+* --emit-args prints ready-to-paste driver lists; emitted pairs are re-validated
+  through validate_sample.check_pairing. Gate test_design_sample.py (4 checks)
+  registered in STAGE 1 (38 gates).
+
+
 ## v0.9.75 -- the propagation-horizon ladder (memo E1): STAGE 5e
 
 The 2026-08-14 findings memo bracketed the SPY<-ES cross-impact between ~0 at 10ms
