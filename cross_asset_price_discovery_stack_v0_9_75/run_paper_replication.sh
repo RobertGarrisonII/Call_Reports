@@ -98,6 +98,7 @@
 #                             write per-cell sign/star stability (table9_lag_band_*.csv). Off by
 #                             default -- it multiplies the estimation cost by the band width.
 #   T9_BAND_BOOT=199          bootstrap draws per band depth (0 = signs only)
+#   HORIZON_INTERVALS=...     STAGE 5e ladder (default 10ms,50ms,100ms,250ms,500ms,1s)
 #   MST_LAKEQUERY_BACKOFF=5   seconds before the first retry (doubles each attempt)
 # ==============================================================================
 set -euo pipefail
@@ -427,6 +428,7 @@ if have_stage 1; then
            test_memo_items.py \
            test_output_layout.py \
            test_contract_rule.py \
+           test_horizon_profile.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -1171,6 +1173,36 @@ if have_stage 5; then
           --out-dir "${OUT}/${FINE_INTERVAL}/geometry" \
         || info "STAGE 5d (${FINE_INTERVAL} geometry) FAILED -- see $LOG; continuing"
     fi
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 5e — the propagation-horizon ladder (memo E1, v0.9.75)
+#
+# The same estimators at several grids DERIVED from the fine frames (pull-once,
+# no new extraction): cross-impact lambda by direction, IS/CS/kappa, the
+# error-correction half-life, co-jump lead shares, and the staleness companion,
+# at HORIZON_INTERVALS (default 10ms,50ms,100ms,250ms,500ms,1s). The summary is
+# the HALF-IMPACT HORIZON: the interval at which the SPY<-ES impact ratio
+# crosses half its 1s value -- how fast tandem futures flow becomes equity
+# price. Needs the fine frames; skipped (with a note) when they are absent.
+# ══════════════════════════════════════════════════════════════════════════════
+if have_stage 5; then
+  say "STAGE 5e Propagation-horizon ladder: estimators vs sampling grid"
+  mkdir -p "${OUT}/horizon"
+  if [ "$SOURCE" = "demo" ]; then
+    run_show $PY run_horizon_profile.py --source demo --tag demo \
+        --out-dir "${OUT}/horizon" \
+      || info "STAGE 5e (demo horizon) FAILED -- see $LOG; continuing"
+  elif [ -n "${FINE_T9:-}" ] && { [ "$DRY" -eq 1 ] || [ -f "$FINE_T9" ]; }; then
+    run_show $PY run_horizon_profile.py --source load --pickle "$FINE_T9" \
+        --volatile "${VOLATILE},${MWCB}" --fine-interval "$FINE_INTERVAL" \
+        --intervals "${HORIZON_INTERVALS:-10ms,50ms,100ms,250ms,500ms,1s}" \
+        --tag "$FINE_INTERVAL" --out-dir "${OUT}/horizon" \
+      || info "STAGE 5e (horizon ladder) FAILED -- see $LOG; continuing"
+  else
+    info "no ${FINE_INTERVAL} frames found -- the ladder derives from the fine grid;"
+    info "re-run --source extract for the propagation-horizon exhibit"
   fi
 fi
 

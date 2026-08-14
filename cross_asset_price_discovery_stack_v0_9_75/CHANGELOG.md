@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.9.75 -- the propagation-horizon ladder (memo E1): STAGE 5e
+
+The 2026-08-14 findings memo bracketed the SPY<-ES cross-impact between ~0 at 10ms
+and ~0.4 at 1s; the ladder locates the horizon inside the bracket. New
+`horizon_profile.py` + `run_horizon_profile.py` + STAGE 5e:
+
+* An interval ladder (default 10ms, 50ms, 100ms, 250ms, 500ms, 1s -- 50ms added to
+  close the decade gap where the horizon plausibly sits) DERIVED from the fine
+  frames via derive_coarse_frame: pull-once, no new extraction. Per rung, the
+  estimators for which the grid IS the question: cross-impact lambda by direction
+  (fleeting-filter width and lag depth scaled per grid via frequency_defaults --
+  gate-pinned), information shares / CS / kappa (the resolution curve of price
+  discovery), the error-correction half-life ln2/kappa x dt (memo E4's
+  grid-dependence experiment rides along), co-jump lead shares, and the
+  zero-return-fraction staleness companion every rung must be read against.
+* The summary is the HALF-IMPACT HORIZON: per-bar lambdas are not unit-comparable
+  across grids, so the profile is the RATIO of the mean cross-impact to its
+  coarsest-rung value -- cumulative impact captured within dt -- and the horizon is
+  the log-interpolated interval where the SPY<-ES ratio crosses 0.5. Day-clustered
+  SE on the headline direction; outputs horizon_profile_per_day / _summary CSVs
+  under <run>/horizon/. HORIZON_INTERVALS overrides the ladder.
+* Gate test_horizon_profile.py: a planted 200ms uniform propagation kernel must
+  yield a monotone profile, <35% captured at 10ms, and a half-impact horizon in
+  [0.05s, 0.5s) -- while an instantaneous-impact DGP must pin the horizon at the
+  resolution floor (the CONTRAST is the check); half_impact_horizon unit behaviour
+  (log-interpolation, floor, never-crossed, NaN rungs); per-rung frequency scaling;
+  runner end-to-end. Registered in STAGE 1 (37 gates).
+
+
 ## v0.9.74 -- decay-weighted cost enters the STAGE 5d redundancy verdict (fixed Q0)
 
 The decay-weighted cost (lcm.decay_weighted_cost: expected marginal cost at an
