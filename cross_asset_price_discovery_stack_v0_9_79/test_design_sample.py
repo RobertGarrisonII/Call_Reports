@@ -52,6 +52,10 @@ def check_selection_and_episodes():
     spikes = [("2020-03-16", 3.0), ("2020-03-17", 9.0), ("2020-03-18", 27.0),
               ("2022-06-13", 2.5), ("2024-08-05", 2.7)]
     s = _flat_series(spikes)
+    # a PADDED holiday row with a huge spurious spike (the V-Lab 2026-01-19 MLK case):
+    # loaders drop it; the selection path must never see it. _flat_series uses
+    # bdate_range, which contains NYSE holidays, so plant on New Year's Day 2024.
+    s.loc[pd.Timestamp("2024-01-01")] = 500.0
     st = ds.selection_stat(s, "logdiff")
     sel = ds.select_volatile(s, st, threshold_q=0.997, episode_gap=5, max_per_episode=2)
     kept = {str(d.date()) for d in sel.index[sel["kept"]]}
@@ -62,9 +66,18 @@ def check_selection_and_episodes():
                        "episode"].nunique()
     ok_sel = {"2022-06-13", "2024-08-05"} <= kept
     ok_ep = ep_march == 1 and n_march_kept == 2
+    # the padded holiday row: simulate the loader's calendar filter, then select --
+    # neither the holiday nor its poisoned next-day log-diff may survive
+    import validate_sample as _vs
+    hols = set(_vs.NYSECalendar().holidays(start=s.index[0], end=s.index[-1]))
+    s2 = s.drop([d for d in s.index if d in hols or str(d.date()) in _vs._ONE_OFF])
+    sel2 = ds.select_volatile(s2, ds.selection_stat(s2, "logdiff"), 0.997, 5, 2)
+    kept2 = {str(d.date()) for d in sel2.index[sel2["kept"]]}
+    ok_hol = "2024-01-01" not in kept2 and "2024-01-02" not in kept2
+    print("    padded NYSE-holiday spike excluded after the calendar filter (%s)" % ok_hol)
     print("(1) planted spikes recovered (%s); March 2020 = ONE episode, capped at 2 of 3 "
           "days kept (%s)" % (ok_sel, ok_ep))
-    return bool(ok_sel and ok_ep)
+    return bool(ok_sel and ok_ep and ok_hol)
 
 
 def check_control_rules():

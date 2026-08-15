@@ -90,6 +90,21 @@ def load_series(path: str, date_col: str = "", col: str = "") -> pd.Series:
                   index=pd.to_datetime(df[dc], errors="coerce").dt.normalize())
     s = s[s.index.notna() & s.notna()].sort_index()
     s = s[~s.index.duplicated(keep="last")]
+    # Vendor series can PAD non-trading days (the live case: V-Lab carries a row on
+    # 2026-01-19, MLK Day, with a spurious +49% vol jump -- NYSE closed, VIX never
+    # printed, yet the row would have been SELECTED as a volatile day). Selection and
+    # control candidacy both assume "row = trading day", so weekends, NYSE holidays,
+    # and the one-off closures are dropped here, before any statistic is computed --
+    # a padded holiday row also poisons the NEXT day's log-diff if left in.
+    cal = vs.NYSECalendar()
+    hols = set(cal.holidays(start=s.index[0], end=s.index[-1]))
+    bad = [d for d in s.index
+           if d.weekday() >= 5 or d in hols or str(d.date()) in vs._ONE_OFF]
+    if bad:
+        print("NOTE: dropped %d non-trading row(s) the series carried (padded vendor "
+              "calendar), e.g. %s" % (len(bad), ", ".join(str(b.date()) for b in bad[:4])),
+              file=sys.stderr)
+        s = s.drop(bad)
     if len(s) < 300:
         raise SystemExit(f"{path}: only {len(s)} usable daily rows -- need a longer history")
     return s

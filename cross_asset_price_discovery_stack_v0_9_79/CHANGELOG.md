@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.9.79 -- the designed sample is the DEFAULT sample; vendor calendar padding fixed
+
+* **Hard-baked lists.** run_paper_replication.sh's VOLATILE/BASELINE defaults are now
+  the designed sample: 40 volatile days across 36 episodes (first 34 positionally
+  paired with the 34 controls; last 6 unpairable under the Trend screen, documented
+  in place) + the unchanged 4-day MWCB panel. Full provenance -- series file, rule
+  parameters, power verdict (34 pairs, 94%, SUFFICIENT), model-robustness pointer,
+  and the one-line regenerate command -- sits directly above the lists.
+  rank_sample.DEFAULT_* mirrors the driver. All previously extracted days are a
+  subset, so the cache pays for 24 of the ~78 sessions on the first full run.
+* **Non-trading vendor rows dropped before selection.** The V-Lab export pads
+  NYSE holidays (live case: 2026-01-19, MLK Day, carried a spurious +49% vol jump
+  and was SELECTED in v0.9.77/78). design_sample.load_series now drops weekends,
+  NYSE-calendar holidays, and the one-off closures before any statistic is
+  computed -- a padded row also poisons the NEXT day's log-diff. The MLK spike
+  correctly reattributes to 2026-01-20 (first trading day, control 2025-01-21).
+  sample_design_20260814.txt regenerated (41->40 days: the padded day out,
+  2026-01-20 in, 2021-01-04's poisoned log-diff no longer qualifies). Gate check
+  (1) extended with a planted holiday-spike row.
+
+
 ## v0.9.78 -- the model-robustness note: GJR-GARCH joins the committed series
 
 sample_inputs/ now carries the superseding V-Lab export with THREE columns

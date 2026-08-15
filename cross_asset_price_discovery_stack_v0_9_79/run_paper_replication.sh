@@ -179,8 +179,28 @@ QC_ACTION="warn"      # warn | drop | raise -- what to do with a session whose b
 # prints the ranked days, suggested same-weekday ~1y-prior pairs in --volatile/--baseline
 # form, and where each shipped day ranks under YOUR data. The paper should cite the daily
 # file the selection was run on.
-VOLATILE="2024-12-18,2026-06-05,2025-10-10,2024-09-03,2025-04-03,2024-08-05,2024-07-24,2025-01-27,2023-03-09,2025-08-01"
-BASELINE="2023-12-20,2025-06-13,2024-10-18,2023-09-05,2024-04-04,2023-08-07,2023-07-19,2024-01-29,2022-03-24,2024-08-09"
+# ── THE DESIGNED SAMPLE (v0.9.79) ────────────────────────────────────────────
+# Derived, not hand-picked: design_sample.py on the committed V-Lab MF2-GARCH
+# series (sample_inputs/vlab_vix_mf2garch_gjr_20160101_20260813.csv), rule =
+# log-diff >= q0.985 over 2016-01-01..2026-08-13, episodes joined at <=5
+# trading days, max 3 days/episode, control screen on the MF2 Trend component
+# (q0.50, recorded q0.75 fallback), non-trading vendor rows dropped by the
+# NYSE calendar. 40 volatile days across 36 episodes; the FIRST 34 pair
+# POSITIONALLY with the 34 BASELINE controls (same weekday, 350-371d prior,
+# vol-screened, unique); the LAST 6 volatile days are unpairable under the
+# screen (2016 window predates the series; 2020-01-27/02-24, 2022-06-13,
+# 2023-03-09 have hot prior years) -- they still carry the volatile label in
+# the two-group tables and serve the pooled/dose-response designs. Power vs
+# the 2026-08-14 run's dispersion: 34 pairs, 94%, SUFFICIENT (need 22).
+# Model-robust: GJR-GARCH selects 36 of these same days (Jaccard 0.78,
+# log-diff rank corr 0.99) -- see sample_inputs/model_overlap_20260814.txt.
+# Regenerate: python design_sample.py --series sample_inputs/vlab_vix_mf2garch_gjr_20160101_20260813.csv \
+#   --col "CBOE Volatility Index - MF2-GARCH Volatility" --screen-col "CBOE Volatility Index - MF2-GARCH Trend" \
+#   --window 2016-01-01:2026-08-13 --threshold-q 0.985 --emit-args
+# First full extraction is ~78 sessions (all previously extracted days are a
+# subset, so the cache pays for 24 of them); --volatile/--baseline override.
+VOLATILE="2017-05-17,2017-08-10,2017-09-05,2018-01-29,2018-02-02,2018-02-05,2018-03-19,2018-03-22,2018-05-29,2018-06-25,2018-10-04,2018-10-10,2018-12-04,2019-03-22,2019-08-05,2020-05-12,2020-06-11,2020-09-03,2020-10-26,2021-01-27,2021-02-25,2021-11-26,2022-02-10,2024-07-24,2024-08-05,2024-09-03,2024-12-18,2025-01-27,2025-02-21,2025-04-03,2025-08-01,2025-10-10,2026-01-20,2026-06-05,2016-06-24,2016-09-09,2020-01-27,2020-02-24,2022-06-13,2023-03-09"
+BASELINE="2016-05-18,2016-08-11,2016-09-06,2017-01-30,2017-02-03,2017-02-06,2017-03-20,2017-03-23,2017-05-23,2017-06-26,2017-10-05,2017-10-25,2017-12-05,2018-03-23,2018-08-06,2019-05-14,2019-06-13,2019-09-05,2019-10-28,2020-01-29,2020-02-27,2020-12-11,2021-02-04,2023-07-26,2023-08-07,2023-09-05,2023-12-20,2024-01-29,2024-02-23,2024-04-04,2024-08-02,2024-10-11,2025-01-21,2025-06-06"
 MWCB="2020-03-09,2020-03-12,2020-03-16,2020-03-18"
 # the published sample, Appendix Table A.1 (--paper-sample)
 PAPER_VOLATILE="2015-03-18,2015-10-02,2016-01-08,2016-01-27,2016-06-24,2015-08-21,2015-08-24,2015-09-01,2016-01-13,2016-01-20"
