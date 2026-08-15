@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.9.77 -- the sample designed from the real V-Lab series, committed into the stack
+
+* **--screen-col**: selection and the control screen can now run on DIFFERENT columns
+  of the series file -- the MF2-GARCH two-component split put to work: treatment days
+  selected on the total volatility's log-difference (transitory spikes), control days
+  screened on the long-run Trend component (the secular state). A candidate that is
+  calm in the selection series but hot in the screen series is rejected; the reported
+  control level comes from the screen series. Gate check (5).
+* **sample_inputs/**: the V-Lab MF2-GARCH-on-VIX series (2016-01-04..2026-08-13, both
+  components) is COMMITTED into the package with the derived design
+  (sample_design_20260814.txt), so the selection is re-derivable inside the airgapped
+  cluster with zero network access -- the series rides the release zip, versioned.
+* **The designed sample** (threshold q0.985 on the log-diff, episodes joined at 5
+  trading days, max 3/episode, Trend screen at q0.50 with the recorded q0.75
+  fallback): 41 volatile days across 37 episodes, 35 pairable -> 95% power against
+  the 2026-08-14 run's numbers (need 22/regime; verdict SUFFICIENT), plus 12
+  mid-band dose-response days. Alignment against known events verified
+  contemporaneous (2024-08-05 / 2025-04-03 / 2018-02-05 carry the log-diff peaks) --
+  no date shift needed. All 10 of the shipped volatile days reappear, so the 24
+  already-extracted sessions carry forward; the 2020 MWCB days enter as their own
+  panel as before (their LOG-DIFFS are mid-episode, the entry spikes 2020-01-27 and
+  2020-02-24 are selected instead -- the crash panel and the shock sample are
+  different objects, by design). The old 2022-03-24 "benchmark" is exactly what the
+  Trend screen now rejects.
+
+
 ## v0.9.76 -- the sample design as code: design_sample.py
 
 The volatile-day selection moves from a manual workflow (top-10 log-diff days off a

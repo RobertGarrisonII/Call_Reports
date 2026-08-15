@@ -109,6 +109,27 @@ def check_power_math():
     return bool(ok_n and ok_mono and ok_csv)
 
 
+def check_screen_col():
+    """Selection on one series, control screen on another: a candidate that is calm
+    in the SELECTION series but hot in the SCREEN series must be rejected -- the
+    two-component MF2-GARCH split (spike vs secular state) is the point."""
+    sel_series = _flat_series([("2024-08-05", 3.0)])
+    screen = sel_series * 0 + 10.0                       # flat, calm everywhere...
+    screen.loc[pd.Timestamp("2023-08-07")] = 60.0        # ...except the 364d candidate
+    v = pd.Timestamp("2024-08-05")
+    d = ds.build_design(sel_series, "logdiff", ("2018-01-01", "2026-08-14"),
+                        0.999, 5, 3, 0.5, (0.55, 0.85), 0, 0.20, 0.235, 0.05, 0.80,
+                        screen_series=screen)
+    ctl = d["controls"]
+    ok_sel = v in ctl.index
+    c = ctl.loc[v] if ok_sel else None
+    ok_skip = ok_sel and pd.notna(c["control"]) and str(c["control"].date()) != "2023-08-07"
+    ok_lvl = ok_sel and abs(c["control_level"] - 10.0) < 1e-9   # level reported from SCREEN series
+    print("(5) screen-col: hot-in-screen 364d candidate rejected (%s); control level "
+          "reported from the screen series (%s)" % (ok_skip, ok_lvl))
+    return bool(ok_sel and ok_skip and ok_lvl)
+
+
 def check_cli():
     s = _flat_series([("2020-03-16", 3.0), ("2022-06-13", 2.5), ("2024-08-05", 2.7)])
     with tempfile.TemporaryDirectory() as td:
@@ -149,7 +170,7 @@ def check_cli():
 
 def main():
     checks = [check_selection_and_episodes, check_control_rules, check_power_math,
-              check_cli]
+              check_screen_col, check_cli]
     res = []
     for fn in checks:
         try:

@@ -239,18 +239,27 @@ def day_sd_from_csv(path: str, metric: str = "CS_ES") -> float:
 
 # ── report ────────────────────────────────────────────────────────────────────
 def build_design(series, stat_kind, window, threshold_q, episode_gap, max_per_episode,
-                 control_max_q, mid_band, n_mid, diff, day_sd, alpha, power):
+                 control_max_q, mid_band, n_mid, diff, day_sd, alpha, power,
+                 screen_series=None):
+    """screen_series: optional SECOND series for the control screen (e.g. the
+    MF2-GARCH long-run Trend component while selection runs on the total
+    volatility's innovation). The two-component split is the point of using
+    MF2-GARCH at all: treatment days are transitory spikes, control days are
+    low SECULAR-state days -- a one-series screen cannot tell a quiet day
+    inside a stormy regime from a genuinely calm one. Defaults to the
+    selection series."""
     lo, hi = window
     s = series.loc[lo:hi]
     if len(s) < 300:
         raise SystemExit(f"window {lo}..{hi} holds only {len(s)} rows")
+    scr = s if screen_series is None else screen_series.loc[lo:hi].reindex(s.index)
     st = selection_stat(s, stat_kind)
     sel = select_volatile(s, st, threshold_q, episode_gap, max_per_episode)
     vol_days = list(sel.index[sel["kept"]])
     qualifying = set(sel.index)
-    ctl = assign_controls(vol_days, s, control_max_q, qualifying)
+    ctl = assign_controls(vol_days, scr, control_max_q, qualifying)
     mid_days = select_mid_band(s, st, mid_band, n_mid, qualifying)
-    mid_ctl = assign_controls(mid_days, s, control_max_q, qualifying) if mid_days else pd.DataFrame()
+    mid_ctl = assign_controls(mid_days, scr, control_max_q, qualifying) if mid_days else pd.DataFrame()
     n_vol = len(vol_days)
     paired = ctl[ctl["control"].notna()]
     n_req = required_days_per_group(diff, day_sd, alpha, power)
@@ -364,6 +373,9 @@ def main(argv=None) -> int:
     ap.add_argument("--series", default="", help="CSV with a date column + a volatility column")
     ap.add_argument("--date-col", default="")
     ap.add_argument("--col", default="", help="volatility column (default: last numeric)")
+    ap.add_argument("--screen-col", default="",
+                    help="column for the CONTROL screen (e.g. the MF2-GARCH Trend/long-run "
+                         "component); selection still runs on --col. Default: same as --col")
     ap.add_argument("--stat", choices=["logdiff", "level"], default="logdiff")
     ap.add_argument("--window", default="2018-01-01:2026-12-31", help="lo:hi dates")
     ap.add_argument("--threshold-q", type=float, default=0.95)
@@ -391,13 +403,14 @@ def main(argv=None) -> int:
     if not a.series:
         ap.error("--series is required (or --selftest)")
     s = load_series(a.series, a.date_col, a.col)
+    scr = load_series(a.series, a.date_col, a.screen_col) if a.screen_col else None
     lo, _, hi = a.window.partition(":")
     day_sd = day_sd_from_csv(a.per_day_csv, a.metric) if a.per_day_csv else a.day_sd
     b0, _, b1 = a.mid_band.partition(":")
     design = build_design(s, a.stat, (lo, hi or str(s.index[-1].date())), a.threshold_q,
                           a.episode_gap, a.max_per_episode, a.control_max_q,
                           (float(b0), float(b1)), a.n_mid, a.diff, day_sd,
-                          a.alpha, a.power)
+                          a.alpha, a.power, screen_series=scr)
     txt = render(design)
     print(txt)
     if a.emit_args:
