@@ -143,6 +143,42 @@ def check_screen_col():
     return bool(ok_sel and ok_skip and ok_lvl)
 
 
+def check_data_floor():
+    """v0.9.83: MIDAS carries no futures before 2017-06-26. The floor must (a) drop
+    a selected pre-floor day into dropped_below_floor -- reported, never silent;
+    (b) leave a just-post-floor volatile day UNPAIRABLE because every control
+    candidate (350-371d earlier) predates the tape; (c) not touch a later pair;
+    (d) surface the floor line in the rendered report. The series itself stays
+    un-truncated: only extractability is constrained."""
+    spikes = [("2018-06-25", 3.0),   # pre-floor: selected by the statistic, dropped by the floor
+              ("2019-08-05", 3.0),   # 35d post-floor: control window is entirely pre-floor
+              ("2024-08-05", 3.0)]   # far post-floor: must pair normally
+    s = _flat_series(spikes)
+    d = ds.build_design(s, "logdiff", ("2018-01-01", "2026-08-14"),
+                        0.999, 5, 3, 0.5, (0.55, 0.85), 0, 0.20, 0.235, 0.05, 0.80,
+                        data_floor="2019-07-01")
+    vol = {str(x.date()) for x in d["volatile"]}
+    ok_drop = "2018-06-25" in d["dropped_below_floor"] and "2018-06-25" not in vol
+    v_near, v_far = pd.Timestamp("2019-08-05"), pd.Timestamp("2024-08-05")
+    ctl = d["controls"]
+    ok_unpair = (v_near in ctl.index and pd.isna(ctl.loc[v_near, "control"]))
+    c_far = ctl.loc[v_far, "control"] if v_far in ctl.index else pd.NaT
+    ok_far = pd.notna(c_far) and c_far >= pd.Timestamp("2019-07-01")
+    txt = ds.render(d)
+    ok_line = "data floor" in txt and "2019-07-01" in txt and "2018-06-25" in txt
+    # without the floor the same design pairs BOTH near days -- the floor, not the
+    # rule, is what unpaired 2019-08-05
+    d0 = ds.build_design(s, "logdiff", ("2018-01-01", "2026-08-14"),
+                         0.999, 5, 3, 0.5, (0.55, 0.85), 0, 0.20, 0.235, 0.05, 0.80)
+    ok_ctrl = (v_near in d0["controls"].index
+               and pd.notna(d0["controls"].loc[v_near, "control"]))
+    print("(6) data floor: pre-floor day reported dropped (%s); just-post-floor day "
+          "unpairable under the floor (%s) but pairable without it (%s); later pair "
+          "untouched and control >= floor (%s); floor line rendered (%s)"
+          % (ok_drop, ok_unpair, ok_ctrl, ok_far, ok_line))
+    return bool(ok_drop and ok_unpair and ok_ctrl and ok_far and ok_line)
+
+
 def check_cli():
     s = _flat_series([("2020-03-16", 3.0), ("2022-06-13", 2.5), ("2024-08-05", 2.7)])
     with tempfile.TemporaryDirectory() as td:
@@ -183,7 +219,7 @@ def check_cli():
 
 def main():
     checks = [check_selection_and_episodes, check_control_rules, check_power_math,
-              check_screen_col, check_cli]
+              check_screen_col, check_data_floor, check_cli]
     res = []
     for fn in checks:
         try:

@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.9.83 -- the MIDAS data floor: 2017-06-26 as a design constraint
+
+MIDAS carries no futures before 2017-06-26, so the tape -- not the volatility
+record -- bounds the sample. The floor enters the design tool as a first-class
+constraint rather than a hand-trim:
+
+* **design_sample.py --data-floor**: the volatility SERIES stays un-truncated
+  (a longer history sharpens the selection quantile and the control screens);
+  only extractability is constrained. A selected day below the floor is dropped
+  into `dropped_below_floor` and REPORTED in the design record and the rendered
+  report -- never silently absent. `pick_control`/`assign_controls` skip any
+  candidate before the floor, so a volatile day within ~364d after the floor
+  goes honestly unpairable: its whole control window predates the data.
+* **The baked sample re-derived under the floor** (same V-Lab MF2-GARCH inputs,
+  same thresholds, --data-floor 2017-06-26): 37 volatile days / 36 episodes,
+  25 pairs, 85% achieved power -- still SUFFICIENT. Dropped below the floor:
+  2016-06-24 (Brexit), 2016-09-09, 2017-05-17. Newly unpairable (control
+  windows predate the floor): the 2017-08/09 days and the Volmageddon cluster
+  (2018-01-29..2018-05-29) -- retained as volatile, extracted unpaired, and
+  excluded from within-pair contrasts by construction. The earliest baked
+  control is 2017-06-26 itself. VOLATILE/BASELINE lists re-baked in
+  run_paper_replication.sh (~66 sessions), rank_sample defaults re-synced,
+  sample_inputs/sample_design_20260815.txt and model_overlap_20260815.txt
+  regenerated (MF2-vs-GJR core overlap 33 of 41 union under the floor).
+
+Gate check (6) added to test_design_sample.py: a planted pre-floor spike must
+land in `dropped_below_floor`, a just-post-floor volatile day must be unpairable
+under the floor but pairable without it, later pairs untouched, floor line
+rendered.
+
+
 ## v0.9.82 -- era controls: the within-pair permutation and the market-era flags
 
 Day clustering fixes inference, not confounding: over a 2016-2026 span, market
