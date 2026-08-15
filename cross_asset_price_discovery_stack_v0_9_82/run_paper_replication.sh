@@ -452,6 +452,7 @@ if have_stage 1; then
            test_design_sample.py \
            test_run_bundle.py \
            test_staleness_arms.py \
+           test_era_controls.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi

@@ -203,6 +203,24 @@ def main(argv=None) -> int:
         else:
             lines += ["volatile <-> baseline matching: all pairs same weekday, ~1 year apart", ""]
             has_pair_warn = False
+        # v0.9.82: the era-straddle check. A pair whose legs sit on opposite sides of a
+        # SHARP market-structure break (the 2025 tick/round-lot/fee bundle) mechanically
+        # contrasts two price-grid regimes on top of two volatility regimes -- the one
+        # thing the ~364-day matching cannot absorb, because the break falls inside the
+        # gap. Flagged pairs stay extractable; exclude them from spread/depth-denominated
+        # paired contrasts or carry an explicit regime dummy.
+        try:
+            import market_eras as me
+            strad = me.pair_straddle(groups["volatile"], groups["baseline"])
+            if len(strad):
+                lines += ["market-era straddle check (sharp breaks inside a pair's gap):",
+                          strad.to_string(index=False),
+                          "", "These pairs quote on different price grids; see market_eras.py.", ""]
+                has_pair_warn = True
+            else:
+                lines += ["market-era straddle check: no pair spans a sharp break", ""]
+        except Exception as exc:
+            lines += ["market-era straddle check unavailable: %s" % exc, ""]
     else:
         has_pair_warn = False
 

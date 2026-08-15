@@ -349,7 +349,8 @@ def estimate_sample(sessions, n_lags=5, names=("SPY", "ES"), criterion=None, pma
 
 
 # ── regime inference (small-N -> permutation, not asymptotics) ────────────────
-def compare_regimes(per_day, metric="CS_ES", n_perm=20000, seed=0, weights=None):
+def compare_regimes(per_day, metric="CS_ES", n_perm=20000, seed=0, weights=None,
+                    pairs=None):
     """Permutation test of mean(metric) across volatile vs benchmark sessions.
 
     weights: optional column name (e.g. 'kappa') or array of per-day weights. The weighted
@@ -358,7 +359,46 @@ def compare_regimes(per_day, metric="CS_ES", n_perm=20000, seed=0, weights=None)
     and its per-day value is noise -- weighting the contrast by kappa downweights exactly
     those days instead of letting them vote at full strength. Labels are permuted with
     (value, weight) pairs kept together, so the null preserves each day's precision.
-    Unweighted path unchanged (draw-for-draw) from prior releases."""
+    Unweighted path unchanged (draw-for-draw) from prior releases.
+
+    pairs: optional list of (volatile_date, baseline_date) -- the WITHIN-PAIR variant
+    (v0.9.82). The free permutation shuffles labels across ALL days, which is exactly
+    where a decade of market-structure drift enters the null: if volatile days cluster in
+    late-sample years, 'volatile vs benchmark' partially measures era, and a clustered SE
+    cannot remove a bias. Flipping labels only WITHIN each matched pair (sign-flip of the
+    per-pair difference) makes every comparison two days ~364 days apart -- era-robust by
+    construction, the matched design promoted from sampling convention to identification.
+    Quote it beside the free test: agreement is the clean outcome; free-significant but
+    within-pair-not is the era-confounding signature. Mutually exclusive with weights."""
+    if pairs is not None:
+        if weights is not None:
+            raise ValueError("pairs and weights are mutually exclusive")
+        idx = {str(k)[:10]: k for k in per_day.index.astype(str)}
+        d = []
+        used = []
+        for v, b in pairs:
+            kv, kb = idx.get(str(v)[:10]), idx.get(str(b)[:10])
+            if kv is None or kb is None:
+                continue
+            dv = float(pd.to_numeric(per_day.loc[per_day.index.astype(str) == kv, metric],
+                                     errors="coerce").iloc[0])
+            db = float(pd.to_numeric(per_day.loc[per_day.index.astype(str) == kb, metric],
+                                     errors="coerce").iloc[0])
+            if np.isfinite(dv) and np.isfinite(db):
+                d.append(dv - db)
+                used.append((str(v)[:10], str(b)[:10]))
+        d = np.asarray(d, float)
+        if len(d) == 0:
+            return {"metric": metric, "mode": "within_pair", "n_pairs": 0,
+                    "mean_pair_diff": float("nan"), "p_perm": float("nan")}
+        obs = float(np.mean(d))
+        rng = np.random.default_rng(seed)
+        cnt = 0
+        for _ in range(n_perm):
+            if abs(float(np.mean(d * rng.choice([-1.0, 1.0], size=len(d))))) >= abs(obs) - EPS:
+                cnt += 1
+        return {"metric": metric, "mode": "within_pair", "n_pairs": int(len(d)),
+                "mean_pair_diff": obs, "p_perm": (cnt + 1) / (n_perm + 1)}
     if weights is None:
         vol = per_day.loc[per_day.regime == "volatile", metric].to_numpy()
         ben = per_day.loc[per_day.regime == "benchmark", metric].to_numpy()

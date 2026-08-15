@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.9.82 -- era controls: the within-pair permutation and the market-era flags
+
+Day clustering fixes inference, not confounding: over a 2016-2026 span, market
+structure drifts, and the free label permutation lets era enter the regime
+contrast. Two additions:
+
+* **compare_regimes(pairs=...)**: labels flipped only WITHIN each matched pair
+  (sign-flip of per-pair differences) -- every comparison is two days ~364 days
+  apart, era-robust by construction; the matched design promoted from sampling
+  convention to identification. Wired as regime_test_within_pair (pairs = the
+  driver's positional volatile/benchmark zip) with a summary.json pick. The gate
+  plants the REAL sample's exposure -- balanced era-internal pairs plus unpaired
+  hot-era volatile days (the designed sample carries 6 with no era
+  counterweight) -- and pins the double dissociation: the free test fires
+  falsely on the composition imbalance (p 0.0007), the within-pair test stays
+  quiet (p 0.26), and a planted true effect is detected (p 0.0002). Absent pair
+  members degrade to fewer pairs; pairs+weights rejected.
+* **market_eras.py**: the span's structural events as dated flags -- MES launch
+  (2019-05-06), MEMX/MIAX (2020-09-21), the retail-surge window (2020-03..
+  2021-12), T+1 (2024-05-28), and the SHARP 2025 tick/round-lot/access-fee
+  bundle (compliance ~2025-11-03; verify the rollout) -- stamped as post_*
+  columns into the information-shares per-day table so the cross-day
+  dose-response regressions have their era controls in the same CSV as the
+  estimands. The Tick Size Pilot is deliberately absent (small-caps only; never
+  touched SPY). `pair_straddle` flags any pair whose legs sit on opposite sides
+  of a sharp break; the STAGE 0 validator prints the verdict -- today that
+  flags exactly the two baked 2026 pairs (post-break volatile day, pre-break
+  control), which should be excluded from spread/depth-denominated paired
+  contrasts or carried with a regime dummy.
+
+Gate test_era_controls.py (4 checks) registered in STAGE 1 (42 gates).
+
+
 ## v0.9.81 -- the two staleness arms: HRY lead-lag wired, Kalman-VECM for E4
 
 * **The Hoffmann-Rosenbaum-Yoshida lead-lag becomes a stage.** The estimator sat

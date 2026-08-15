@@ -394,6 +394,17 @@ def run_information_shares(sessions, args):
     if "kappa" in per_day.columns:
         med = float(np.nanmedian(per_day["kappa"]))
         per_day["low_kappa"] = per_day["kappa"] < 0.25 * med
+    # v0.9.82: market-era flags stamped into the day-level headline table, so the
+    # cross-day regressions (the one place era drift can masquerade as a volatility
+    # effect) have their controls sitting in the same CSV as the estimands.
+    try:
+        import market_eras as me
+        era = me.era_flags(per_day.index)
+        era.index = per_day.index
+        per_day = per_day.join(era)
+        res["per_day"] = per_day
+    except Exception as e:
+        res["era_flags_error"] = str(e)
     if len({r for _, r, _ in sessions}) >= 2:
         try: res["regime_test"] = pds.compare_regimes(per_day, metric="CS_ES")
         except Exception as e: res["regime_test_error"] = str(e)
@@ -406,6 +417,18 @@ def run_information_shares(sessions, args):
                 per_day, metric="CS_ES", weights="kappa")
         except Exception as e:
             res["regime_test_kappa_weighted_error"] = str(e)
+        # v0.9.82: the ERA-ROBUST variant -- labels flipped only within the matched
+        # pairs (positional zip of --volatile/--benchmark, the driver's convention),
+        # so every comparison is two days ~a year apart. Free-significant but
+        # within-pair-not is the era-confounding signature.
+        vol_l, ben_l = getattr(args, "volatile", None), getattr(args, "benchmark", None)
+        if vol_l and ben_l:
+            try:
+                prs = list(zip([d.strip() for d in vol_l], [d.strip() for d in ben_l]))
+                res["regime_test_within_pair"] = pds.compare_regimes(
+                    per_day, metric="CS_ES", pairs=prs)
+            except Exception as e:
+                res["regime_test_within_pair_error"] = str(e)
     try: res["panel_vecm"] = pds.panel_vecm(mids, n_lags=args.n_lags)
     except Exception as e: res["panel_vecm_error"] = str(e)
     return res
@@ -785,7 +808,8 @@ def _scalar_summary(results):
         s["cojump_mean_lead_share"] = lt.get("mean_lead_share")
         s["cojump_lead_p_flip"] = lt.get("p_flip")
     for key, name in (("regime_test", "regime_p_CS"), ("regime_test_IS", "regime_p_IS"),
-                      ("regime_test_kappa_weighted", "regime_p_CS_kappa_w")):
+                      ("regime_test_kappa_weighted", "regime_p_CS_kappa_w"),
+                      ("regime_test_within_pair", "regime_p_CS_within_pair")):
         rt = g(["information_shares", key])
         if isinstance(rt, dict):
             s[name] = rt.get("p_perm")
