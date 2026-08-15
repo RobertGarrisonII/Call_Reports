@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.9.78 -- the model-robustness note: GJR-GARCH joins the committed series
+
+sample_inputs/ now carries the superseding V-Lab export with THREE columns
+(MF2-GARCH Volatility, MF2-GARCH Trend, GJR-GARCH Volatility; 2016-01-04..
+2026-08-13) and a new model_overlap_20260814.txt: the identical selection rule run
+on the asymmetric GJR conditional volatility against the MF2 primary. Measured:
+Spearman rank correlation 0.9421 (levels) / 0.9896 (log-diffs); each model selects
+41 days; 36-day intersection (Jaccard 0.78) containing every one of the shipped
+volatile days; five borderline days per side, all sitting at the threshold by
+construction. The reading -- the selection is model-invariant at the core; MF2
+stays primary (its Trend component drives the control screen); the overlap file is
+the sample appendix's one-line robustness claim. sample_design_20260814.txt
+regenerated against the superseding file; the single-model CSV removed. No code
+changes.
+
+
 ## v0.9.77 -- the sample designed from the real V-Lab series, committed into the stack
 
 * **--screen-col**: selection and the control screen can now run on DIFFERENT columns
