@@ -181,7 +181,37 @@ def _hy_cov_shifted(a1, b1, r1, a2, b2, r2, theta):
     return cov
 
 
-def lead_lag(t1, lp1, t2, lp2, max_lag, n_grid=81, normalize=True):
+def _hy_cov_shifted_fast(a1, b1, r1, S2, as2, bs2):
+    """Vectorized twin of _hy_cov_shifted: for interval i of series 1, the overlapping
+    series-2 returns are the contiguous index range [lo_i, hi_i) with
+    lo_i = first j whose shifted right endpoint exceeds a1_i and hi_i = first j whose
+    shifted left endpoint reaches b1_i -- both binary searches on the sorted shifted
+    endpoints -- so the inner sum telescopes through the cumulative S2. O(n log m) per
+    shift instead of a Python-level two-pointer walk over every (i, j) overlap, which
+    at ~700k daily refresh returns x 201 shifts was minutes per session; this is
+    seconds. Identical sum to the loop (gate-pinned to 1e-10)."""
+    lo = np.searchsorted(bs2, a1, side="right")
+    hi = np.searchsorted(as2, b1, side="left")
+    hi = np.maximum(hi, lo)
+    return float(np.sum(r1 * (S2[hi] - S2[lo])))
+
+
+def preaverage(t, lp, k):
+    """Non-overlapping k-update block means of a log-price series (Podolskij-Vetter
+    style local smoothing): kills observation-level noise, keeps the asynchronous
+    time stamps (each block is stamped at its last update). k <= 1 returns the
+    inputs unchanged. -> (t_blocks, lp_blocks)."""
+    t = np.asarray(t, float); lp = np.asarray(lp, float)
+    k = int(k)
+    if k <= 1 or len(lp) < 2 * k:
+        return t, lp
+    n = (len(lp) // k) * k
+    blocks = lp[:n].reshape(-1, k).mean(axis=1)
+    stamps = t[:n].reshape(-1, k)[:, -1]
+    return stamps, blocks
+
+
+def lead_lag(t1, lp1, t2, lp2, max_lag, n_grid=81, normalize=True, preavg_k=0):
     """Hoffmann-Rosenbaum-Yoshida (2013) lead-lag estimator for two ASYNCHRONOUS price series.
 
     Scans the shifted HY cross-covariance contrast U(theta) over candidate shifts theta in
@@ -192,13 +222,21 @@ def lead_lag(t1, lp1, t2, lp2, max_lag, n_grid=81, normalize=True):
     CONVENTION: a POSITIVE ``lead_lag`` means the FIRST series (t1/lp1) LEADS the second by that
     many time units (the second is a delayed reflection of the first); negative means the second
     leads. ``contrast`` is the cross-correlation-scaled curve over ``thetas`` for plotting/CIs.
-    O((n+m) * n_grid); under heavy microstructure noise combine with pre-averaging (the raw HY
-    contrast is consistent for the lead-lag but noisy at the finest scales)."""
+    O(n log m) per shift (vectorized; see _hy_cov_shifted_fast). ``preavg_k`` > 1 pre-averages
+    BOTH series in non-overlapping k-update blocks first -- the Podolskij-Vetter smoothing that
+    kills observation noise while keeping the asynchronous stamps; the raw contrast is
+    consistent for the lead-lag but noisy at the finest scales."""
     t1 = np.asarray(t1, float); t2 = np.asarray(t2, float)
+    if preavg_k and preavg_k > 1:
+        t1, lp1 = preaverage(t1, lp1, preavg_k)
+        t2, lp2 = preaverage(t2, lp2, preavg_k)
     r1 = np.diff(np.asarray(lp1, float)); a1, b1 = t1[:-1], t1[1:]
     r2 = np.diff(np.asarray(lp2, float)); a2, b2 = t2[:-1], t2[1:]
     thetas = np.linspace(-float(max_lag), float(max_lag), int(n_grid))
-    cov = np.array([_hy_cov_shifted(a1, b1, r1, a2, b2, r2, th) for th in thetas])
+    S2 = np.concatenate([[0.0], np.cumsum(r2)])
+    a2 = np.asarray(a2, float); b2 = np.asarray(b2, float)
+    cov = np.array([_hy_cov_shifted_fast(a1, b1, r1, S2, a2 - th, b2 - th)
+                    for th in thetas])
     if normalize:
         denom = np.sqrt(np.sum(r1 * r1) * np.sum(r2 * r2) + EPS)
         contrast = cov / denom

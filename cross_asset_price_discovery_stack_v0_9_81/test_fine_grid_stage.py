@@ -20,7 +20,7 @@ Pinned here:
       otherwise only discover a rename at hour three of a real run
   (4) the load-path fallback cannot self-match: a pickle named without the interval token must
       report "no fine frames", not silently hand the 1s frames to the fine stages
-  (5) the curated list actually RUNS on 10ms frames: 6/6 stages ok on synthetic sub-second
+  (5) the curated list actually RUNS on 10ms frames: all curated stages ok on synthetic sub-second
       sessions, with the sub-second path engaged (auto lag rescale, Lee-Mykland, fleeting filter)
 
 Run: python test_fine_grid_stage.py
@@ -39,8 +39,10 @@ import pandas as pd
 
 TZ = "America/New_York"
 DRIVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_paper_replication.sh")
+# v0.9.81 added lead_lag: the HRY estimator earns its keep exactly at the fine grid
+# (at 1s the resolution floors the measurable lead -- F5's all-simultaneous co-jumps).
 CURATED = ["information_shares", "ecm_sde", "liquidity_conditional", "cross_impact",
-           "jumps", "microstructure"]
+           "jumps", "lead_lag", "microstructure"]
 
 
 def _dry(*args):
@@ -153,12 +155,13 @@ def check_curated_list_runs_on_10ms_frames():
                      capture_output=True, text=True, timeout=540,
                      cwd=os.path.dirname(DRIVER))
         out = res.stdout + res.stderr
-    ran = "6/6 stages ok" in out
+    ran = ("%d/%d stages ok" % (len(CURATED), len(CURATED))) in out
     sub = '"path": "sub-second"' in out and '"jump_method": "lee_mykland"' in out
     lag = '"n_lags": 60' in out                     # frequency rescale, not the 1s number
     ok = res.returncode == 0 and ran and sub and lag
-    print("(5) curated list on 10ms frames: 6/6 stages ok (%s), sub-second path engaged with "
-          "Lee-Mykland (%s), lag auto-rescaled to 60 (%s) : %s" % (ran, sub, lag, ok))
+    print("(5) curated list on 10ms frames: %d/%d stages ok (%s), sub-second path engaged with "
+          "Lee-Mykland (%s), lag auto-rescaled to 60 (%s) : %s"
+          % (len(CURATED), len(CURATED), ran, sub, lag, ok))
     return ok
 
 

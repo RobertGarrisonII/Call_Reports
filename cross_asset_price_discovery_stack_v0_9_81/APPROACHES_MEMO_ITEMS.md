@@ -40,7 +40,19 @@ headline number. Cost: five cross-impact passes over derived frames — hours, n
 days; no new estimator code. Caveat to encode: the fleeting-quote filter must scale
 its `min_rest_steps` with the grid (the frequency_defaults mechanism already does).
 
-### E4 — Grid-dependence of the error-correction half-life (9–12s vs 177–205s)
+### E4 — Grid-dependence of the error-correction half-life — KALMAN ARM SHIPPED (v0.9.81)
+
+`kalman_ecm.py` + `run_halflife_experiment.py`: kappa by JOINT Kalman-VECM MLE with
+staleness as missing data (the likelihood scores only actual quote refreshes). The
+pilot delivered a sharper mechanism than the memo hypothesized: at 85–90% missingness
+the raw stale ECM locks onto the QUOTE-REFRESH rate rather than the price process
+(planted kappa 0.02 → raw 0.061), and a smooth-then-regress two-step manufactures
+persistence (→ 0.0014); the joint MLE recovers 0.014–0.021. Remaining from the
+original design: the synthetic-staleness bracket as the measured cross-check, and the
+lag-depth sweep — both still worth running before the paper quotes a corrected
+half-life.
+
+### E4 (original design) — Grid-dependence of the error-correction half-life (9–12s vs 177–205s)
 
 **Question.** Same adjustment process, twenty-fold half-life disagreement across
 grids. Truncation artifact (60 lags = 0.6s of memory at 10ms) or staleness

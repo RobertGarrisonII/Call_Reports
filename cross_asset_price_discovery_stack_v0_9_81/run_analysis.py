@@ -597,6 +597,59 @@ def run_jumps(sessions, args):
         out["cojump_by_day_error"] = str(e)
     return out
 
+def run_lead_lag(sessions, args):
+    """Hoffmann-Rosenbaum-Yoshida lead-lag, per session (v0.9.81; memo E2's formal
+    estimator). The shifted-HY contrast U(theta) is scanned over +/- max_lag seconds on
+    each leg's REFRESH times (rows where the mid actually changed -- staleness becomes
+    asynchrony, which HY is built for, instead of fake zero returns). CONVENTION: ES is
+    the FIRST series, so theta_hat > 0 means the FUTURES LEAD by theta_hat seconds --
+    the paper's assumed Cholesky ordering, measured. A pre-averaged variant (k=5 update
+    blocks) rides as the noise-robustness column -- its resolution floor is ~k x the
+    median update gap, so read it as confirming SIGN and order of magnitude, not the
+    millisecond value; day-level sign-flip inference on theta_hat. At 1s the grid resolution floors the measurable lead (F5: co-jumps all
+    'simultaneous' at 1s); the fine grid is where this stage earns its keep."""
+    dt = float(args._freq["dt"])
+    max_lag = max(2.0, 10.0 * dt)
+    n_grid = int(min(201, 2 * round(max_lag / dt) + 1))
+    rows = []
+    for date, regime, df in sessions:
+        row = {"date": str(date), "regime": regime}
+        try:
+            legs = {}
+            for a in ("ES", "SPY"):
+                mid = np.asarray(ca._mid(df, a), float)
+                tsec = df.index.view("int64").astype(float) / 1e9
+                fin = np.isfinite(mid)
+                mid, tsec = mid[fin], tsec[fin]
+                chg = np.concatenate([[True], np.diff(mid) != 0.0])
+                legs[a] = (tsec[chg], np.log(mid[chg]))
+            res = nrc.lead_lag(legs["ES"][0], legs["ES"][1], legs["SPY"][0], legs["SPY"][1],
+                               max_lag=max_lag, n_grid=n_grid)
+            pre = nrc.lead_lag(legs["ES"][0], legs["ES"][1], legs["SPY"][0], legs["SPY"][1],
+                               max_lag=max_lag, n_grid=n_grid, preavg_k=5)
+            row.update({"theta_s": res["lead_lag"], "peak_contrast": res["peak_contrast"],
+                        "theta_preavg_s": pre["lead_lag"],
+                        "n_upd_ES": len(legs["ES"][0]), "n_upd_SPY": len(legs["SPY"][0])})
+        except Exception as e:
+            row["error"] = str(e)
+        rows.append(row)
+    per_day = pd.DataFrame(rows).set_index("date")
+    out = {"per_day": per_day, "max_lag_s": max_lag, "n_grid": n_grid,
+           "convention": "theta_s > 0 means ES LEADS SPY by theta_s seconds"}
+    th = pd.to_numeric(per_day.get("theta_s"), errors="coerce").dropna().to_numpy() \
+        if "theta_s" in per_day.columns else np.array([])
+    if len(th):
+        rng = np.random.default_rng(0)
+        obs = float(np.mean(th))
+        cnt = sum(abs(float(np.mean(th * rng.choice([-1.0, 1.0], size=len(th))))) >= abs(obs) - 1e-15
+                  for _ in range(2000))
+        out["lead_lag_test"] = {"mean_theta_s": obs, "median_theta_s": float(np.median(th)),
+                                "n_days": int(len(th)),
+                                "n_days_es_leads": int((th > 0).sum()),
+                                "p_flip": (cnt + 1) / 2001}
+    return out
+
+
 def run_ecm_sde(sessions, args):
     """Liquidity-conditional price discovery as a state-dependent ECM-SDE: the pooled
     Euler-Maruyama interacted estimator. The loading gradient a1 (coef on z*S) with its
@@ -679,6 +732,7 @@ STAGES = [
     ("dcc", run_dcc),
     ("irf", run_irf),
     ("jumps", run_jumps),
+    ("lead_lag", run_lead_lag),
     ("robustness", run_robustness),
     ("microstructure", run_microstructure),
     ("events", run_events),
@@ -719,6 +773,11 @@ def _scalar_summary(results):
     s["mean_ISj_ES"] = g(["jumps", "mean_ISj_ES"])
     s["mean_jump_frac_cf"] = g(["jumps", "mean_jump_frac_cf"])
     s["mean_jump_frac_cf_lm"] = g(["jumps", "mean_jump_frac_cf_lm"])
+    llt = g(["lead_lag", "lead_lag_test"])
+    if isinstance(llt, dict):
+        s["hry_median_theta_s"] = llt.get("median_theta_s")
+        s["hry_n_days_es_leads"] = llt.get("n_days_es_leads")
+        s["hry_p_flip"] = llt.get("p_flip")
     # memo items E2/E3: the population lead-lag verdict and the robust regime contrasts
     lt = g(["jumps", "cojump_lead_test"])
     if isinstance(lt, dict):

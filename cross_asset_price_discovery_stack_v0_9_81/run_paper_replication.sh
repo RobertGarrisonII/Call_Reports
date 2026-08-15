@@ -127,7 +127,7 @@ FINE_INTERVAL="10ms"
 # first pass: the per-worker peak has never been measured at 10ms; frames are ~100x the rows).
 WITH_FINE=1
 FINE_DATES=""
-FINE_STAGES="information_shares,ecm_sde,liquidity_conditional,cross_impact,jumps,microstructure"
+FINE_STAGES="information_shares,ecm_sde,liquidity_conditional,cross_impact,jumps,lead_lag,microstructure"
 N_BOOT=499
 CORR_WINDOW=100
 N_LAGS="bic"          # integer, or an information criterion: bic | aic | hq
@@ -451,6 +451,7 @@ if have_stage 1; then
            test_horizon_profile.py \
            test_design_sample.py \
            test_run_bundle.py \
+           test_staleness_arms.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi

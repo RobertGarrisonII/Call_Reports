@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.9.81 -- the two staleness arms: HRY lead-lag wired, Kalman-VECM for E4
+
+* **The Hoffmann-Rosenbaum-Yoshida lead-lag becomes a stage.** The estimator sat
+  fully coded but unwired in noise_robust_cov; it now runs per session as
+  run_analysis stage `lead_lag` (in the fine-grid default list): each leg reduced
+  to its REFRESH times (staleness becomes asynchrony, which HY is built for),
+  U(theta) scanned over +/-max(2s, 10dt), ES passed first so theta > 0 == the
+  futures lead, a pre-averaged (k=5 blocks) noise-robustness column with its
+  resolution floor documented (~k x the median update gap: sign and order of
+  magnitude, not the millisecond value), day-level sign-flip inference, and
+  summary.json picks. Made affordable by a VECTORIZED shifted-HY cross-covariance
+  (cumsum + two binary searches per shift, gate-pinned equal to the two-pointer
+  loop to 1e-10): 101 shifts over 300k updates in ~1.3s where the loop took
+  minutes. With the co-jump lead shares and the half-impact horizon this
+  triangulates the SPY/ES latency three independent ways.
+* **The Kalman-VECM E4 arm (kalman_ecm.py + run_halflife_experiment.py).** kappa
+  by joint MLE with the error-correction term IN the transition and staleness as
+  MISSING DATA -- the likelihood scores only actual quote refreshes. The pilot
+  sharpened the memo's hypothesis into two measured failure modes, both worth
+  quoting: at 85-90% missingness the raw stale ECM locks onto the QUOTE-REFRESH
+  rate (planted kappa 0.02 -> raw 0.061), and a smooth-then-regress two-step
+  manufactures persistence (-> 0.0014, the RW transition bridging gaps); the
+  joint MLE recovers 0.014-0.021 and is strictly closer than raw on every planted
+  day (gate-pinned). The RTS smoother is retained for gap filling (log-price RMSE
+  to the latent path roughly halves) and explicitly NOT used for kappa. Runner
+  derives the experiment grid from the fine frames (default 100ms); verdict
+  printed with the filtered-not-measured caveat; APPROACHES E4 updated.
+
+Gate test_staleness_arms.py (6 checks) registered in STAGE 1 (40 gates).
+
+
 ## v0.9.80 -- the analysis bundle: one archive per run, readable by Claude Code
 
 `bundle_run.py` + STAGE 7b: after the manifest, every run zips its EXHIBITS --
