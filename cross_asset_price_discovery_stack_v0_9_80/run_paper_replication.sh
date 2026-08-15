@@ -450,6 +450,7 @@ if have_stage 1; then
            test_contract_rule.py \
            test_horizon_profile.py \
            test_design_sample.py \
+           test_run_bundle.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
     if run_rc $PY "$t"; then info "PASS  $t"; else info "FAIL  $t"; FAILED="$FAILED $t"; fi
@@ -1342,6 +1343,15 @@ if have_stage 7; then
       n_lags="$N_LAGS" n_lags_resolved="${N_LAGS_INT:-per-driver}" pmax="$PMAX" \
       contract_rule="${CONTRACT_RULE:-activity}" run_id="$RUN_ID" \
     || info "manifest generation FAILED -- see $LOG"
+
+  # ── STAGE 7b — the analysis bundle (v0.9.80) ────────────────────────────────
+  # Everything the interpretive report is written from -- exhibits, reports,
+  # summaries, QC, the log -- zipped with the tree intact and WITHOUT the frame
+  # pickles / datasets, plus an ANALYSIS_GUIDE.md ingestion contract so the
+  # archive can be handed to a Claude Code session (or a co-author) whole.
+  say "STAGE 7b analysis bundle (exhibits only, data files excluded)"
+  run_show $PY bundle_run.py "$OUT" \
+    || info "bundle generation FAILED -- see $LOG"
 fi
 
 say "done — ${OUT}"

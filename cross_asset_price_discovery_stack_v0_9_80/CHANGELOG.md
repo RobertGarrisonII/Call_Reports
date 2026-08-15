@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.9.80 -- the analysis bundle: one archive per run, readable by Claude Code
+
+`bundle_run.py` + STAGE 7b: after the manifest, every run zips its EXHIBITS --
+tables, reports, summaries, QC text, nulls, the driver log, MANIFEST -- with the
+structured tree intact and the DATA excluded (*.pkl / *.pickle / *.parquet /
+*.csv.gz, the extract cache, and any single file above --max-file-mb 50, each
+exclusion recorded with its reason). Injected at the archive root:
+
+* BUNDLE_MANIFEST.json -- run id, stack version, the run's resolved config,
+  the included inventory, and the excluded list with reasons.
+* ANALYSIS_GUIDE.md -- the ingestion contract: the directory map, the exhibit
+  glossary, the nine reading conventions every number must be interpreted under
+  (day-level effective n; IS-primary/kappa fragility; the RealBar lag policy and
+  band stability; GFEVD under correlated flow; the DCC boundary; 10ms jump
+  caution; the tau/DWC check verdicts; the half-impact horizon definition; the
+  designed sample's provenance), and the findings-of-record report template.
+  A fresh Claude Code session handed only the archive can produce the report.
+
+Gate test_run_bundle.py (4 checks: exclusion rules + oversize skip with recorded
+reason; injected roots complete; byte-for-byte round trip and no
+self-containment; driver wiring after the manifest) registered in STAGE 1
+(39 gates).
+
+
 ## v0.9.79 -- the designed sample is the DEFAULT sample; vendor calendar padding fixed
 
 * **Hard-baked lists.** run_paper_replication.sh's VOLATILE/BASELINE defaults are now
