@@ -124,8 +124,11 @@ def check_dates(groups: dict, today: pd.Timestamp | None = None) -> pd.DataFrame
             elif d > today:
                 level, reason = "ERROR", "in the future"
             elif _early_close(d):
-                level, reason = "WARN", (f"{_early_close(d)} -- 13:00 ET close, so a 09:30-16:00 grid "
-                                         f"is ~65% empty and the session is not comparable to a full day")
+                level, reason = "WARN", (f"{_early_close(d)} -- 13:00 ET close. Post-close snapshots "
+                                         f"are QC-excluded and estimator-masked like halt rows "
+                                         f"(v0.9.84), so the session contributes its 3.5h open "
+                                         f"segment; length-sensitive quantities are still not "
+                                         f"comparable to a full day")
             seen.setdefault(s, grp)
             rows.append({"group": grp, "date": s, "dow": d.strftime("%a"), "level": level,
                          "reason": reason})

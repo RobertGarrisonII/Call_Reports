@@ -59,7 +59,9 @@ def qc_sessions(sessions, assets=("SPY", "ES"), crossed_tol: float = 0.005) -> p
     for date, regime, df in sessions:
         rep = ml.session_qc(df, assets=assets, crossed_tol=crossed_tol, date=date)
         row = {"date": str(date), "regime": regime, "rows": rep["n_rows"], "ok": rep["ok"],
-               "halt": rep.get("halt_snapshots", 0), "reasons": " | ".join(rep["reasons"])}
+               "halt": rep.get("halt_snapshots", 0),
+               "early_close": rep.get("early_close_snapshots", 0),
+               "reasons": " | ".join(rep["reasons"])}
         for a in assets:
             row[f"{a}_finite"] = rep[a]["n_finite"]
             row[f"{a}_crossed"] = rep[a]["crossed_frac"]
@@ -204,6 +206,17 @@ def main(argv=None) -> int:
         body += ["",
                  "LULD bands: not reported by this source on any session. The columns exist and are",
                  "all-NaN, so do NOT use them as a control -- an all-NaN regressor still fits."]
+    ecs = tbl[tbl["early_close"] > 0] if "early_close" in tbl.columns else tbl.iloc[:0]
+    if len(ecs):
+        body += ["",
+                 "EARLY-CLOSE (13:00 ET) sessions: %s"
+                 % ", ".join("%s (%d post-close snapshots)" % (d, int(r["early_close"]))
+                             for d, r in ecs.iterrows()),
+                 "  Matching stops at the close but the grid runs to 16:00, and the venues freeze or",
+                 "  purge their books at staggered times, so the consolidated top of differently-",
+                 "  frozen books crosses -- exactly the halt phenomenology. crossed_open excludes",
+                 "  those snapshots, and the estimators mask them like halt rows. The open 09:30-",
+                 "  13:00 segment is judged normally and is the only part that enters any estimate."]
     halted = tbl[tbl["halt"] > 0] if "halt" in tbl.columns else tbl.iloc[:0]
     if len(halted):
         body += ["",

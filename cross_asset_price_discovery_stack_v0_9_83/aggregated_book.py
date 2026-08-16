@@ -167,7 +167,15 @@ def ladder_integrity(df: pd.DataFrame, asset: str = "ES", levels: int = 10) -> d
     b1, a1 = bids[0], asks[0]
     if len(df) > 1:
         same = (b1[1:] == b1[:-1]) & (a1[1:] == a1[:-1])
-        rep["stale_frac"] = float(np.mean(same))
+        # Early close (v0.9.84): a frozen ladder after the 13:00 ET close is a CLOSED market, not a
+        # carried-forward leg -- judge staleness on the open segment only, or every half day reads
+        # as degraded no matter how live its morning was.
+        try:
+            import market_halts as _mh
+            open_rows = ~_mh.early_close_mask(df.index)[1:]
+        except Exception:
+            open_rows = np.ones(len(same), bool)
+        rep["stale_frac"] = float(np.mean(same[open_rows])) if open_rows.any() else float(np.mean(same))
 
     if rep["monotone_violations"]:
         rep["ok"] = False

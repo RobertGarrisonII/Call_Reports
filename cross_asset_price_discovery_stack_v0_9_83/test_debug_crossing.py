@@ -9,6 +9,10 @@ right reason -- not merely that it runs:
   bad_side     one feed encodes side as 'B'/'S'                     -> CODE (adds silently dropped)
   code_orphan  cancels precede their own adds (ordering fault)      -> CODE, add PRESENT in messages
   pre_window   cancels for orders resting before 09:30              -> DATA, but flagged BENIGN (early)
+  purge_only   a handful of bids lose their in-session cancels and   -> DATA via CHECK 10; the venue's
+               are cancelled only in the 16:30 post-close purge         post-close purge hides them from
+                                                                        the end-of-stream census (the
+                                                                        2017-12-05 signature)
 
 The last two are the pair that matters. Both produce orphaned removals; only one is a code fault, and
 the discriminator is whether an add for that reference exists anywhere in the fetched messages. If the
@@ -49,6 +53,24 @@ def build(kind):
     ref_n = 0
     mid = 400.0
     n_cycles = 900                                  # ~ every 4s over 6.5h
+    # purge_only: these feed-0 bid cycles (near the sinusoid's peak, so the later drift strands
+    # them ABOVE the market) lose their in-session cancel and are cancelled only at 16:30 --
+    # after the close, in the venue's purge. Chosen off the c%7 trade cycles to stay clean.
+    purge_cycles = {101, 102, 103, 104, 106, 108, 109}
+    purge_at_close = []                             # (feed, ref, price) awaiting the 16:30 purge
+    if kind == "purge_only":
+        # A deep resting base book (far from the market on both sides, resting all day), so the
+        # seven stranded bids are a 1.1x blip on the resting count -- as on the real session, where
+        # ~900 stuck orders sat in an ~9k-order book -- and CHECK 6 cannot call it accumulation.
+        for f in FEEDS:
+            for side, px in (("Bid", 300.0), ("Ask", 500.0)):
+                for i in range(30):
+                    ref_n += 1
+                    seq[f] += 1
+                    adds.append(dict(ts=OPEN + pd.Timedelta(milliseconds=100 + ref_n), f=f,
+                                     side=side, price=px - i * 0.01 if side == "Bid" else px + i * 0.01,
+                                     quantity=100.0, orderreferencenumber="R%08d" % ref_n,
+                                     sequencenumber=seq[f]))
     for c in range(n_cycles):
         t0 = OPEN + pd.Timedelta(seconds=4 * c + 1)
         mid = 400.0 + 3.0 * np.sin(c / 90.0)        # drift, so stale orders WILL cross if not removed
@@ -78,6 +100,14 @@ def build(kind):
                     # genuinely absent from the fetch, but this is expected, not a fault.
                     cancels.append(x)
                     continue
+                if kind == "purge_only":
+                    if f == FEEDS[0] and side == "Bid" and c in purge_cycles:
+                        adds.append(a)               # rests marketable for hours...
+                        purge_at_close.append((f, ref, px))
+                        continue                     # ...its cancel arrives only at 16:30
+                    if c == n_cycles - 1:
+                        adds.append(a)               # the last cycle RESTS: a live two-sided book
+                        continue                     # at the close for the census to judge against
                 adds.append(a)
                 cancels.append(x)
                 if fi == 0 and side == "Bid":
@@ -89,6 +119,11 @@ def build(kind):
             trades.append(dict(ts=t0 + pd.Timedelta(seconds=1), f=FEEDS[0], side="Bid",
                                price=px, quantity=100.0, orderreferencenumber=ref,
                                sequencenumber=add_seq + 0.5))
+    for f, ref, px in purge_at_close:                # the venue's post-close purge (16:30 ET)
+        seq[f] += 1
+        cancels.append(dict(ts=OPEN + pd.Timedelta(hours=7), f=f, side="Bid", price=px,
+                            previousquantity=200.0, orderreferencenumber=ref,
+                            sequencenumber=seq[f]))
     msgs = {"mt_add_order": _frame(adds),
             "mt_cancel_order": _frame([] if kind == "no_cancels" else cancels),
             "mt_modify_order": pd.DataFrame(),
@@ -166,6 +201,27 @@ def main():
     f_ok = ("CODE" in run("code_orphan")[1]) and ("CODE" not in run("pre_window")[1])
     print("(F) same symptom, opposite verdicts (code_orphan=CODE, pre_window=not CODE) : %s" % f_ok)
     ok &= f_ok
+
+    # (G) the 2017-12-05 signature: bids stranded above the market with their cancels arriving only
+    #     in the venue's post-close purge. CHECK 5 sees no orphans (every cancel matches), CHECK 8's
+    #     end-of-stream census reads 0 (the purge already removed the evidence), and CHECK 7's
+    #     'single venue crossed, not accumulating -> CODE' inference fires falsely. CHECK 10 must
+    #     take the census AT the close, classify the pins as purge-only, deliver the DATA verdict,
+    #     and withdraw the CHECK 7 inference.
+    f, kinds, cross, R, txt = run("purge_only")
+    ws_post = sum(len(v) for v in (R.get("wrong_side") or {}).values())
+    n_pin = len(R.get("pin_life") or [])
+    n_purge = sum(1 for p in (R.get("pin_life") or []) if p["cls"] == "purge_only")
+    data_msg = any("post-close purge" in m for k, s, m in f if k == "DATA" and s == "SEVERE")
+    g_ok = ("CODE" not in kinds and data_msg and cross > 0.5
+            and n_pin >= 7 and n_purge >= 7 and ws_post == 0 and "WITHDRAWN" in txt)
+    print("(G) purge_only  -> kinds=%s crossed=%.1f%% pins_at_close=%d (purge_only=%d) "
+          "post-stream census=%d check7_withdrawn=%s : %s"
+          % (sorted(kinds), 100 * cross, n_pin, n_purge, ws_post, "WITHDRAWN" in txt, g_ok))
+    if not g_ok:
+        for k, s, m in f:
+            print("      [%s/%s] %s" % (k, s, m[:140]))
+    ok &= g_ok
 
     print("\ndebug-crossing checks ->", ok)
     return ok

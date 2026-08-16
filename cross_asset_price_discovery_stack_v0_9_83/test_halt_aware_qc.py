@@ -53,6 +53,35 @@ def _session(day, cross_halt=True, cross_open=0, es=True):
     return df
 
 
+def check_early_close_half_day():
+    """2021-11-26 (Omicron, the day after Thanksgiving): matching stops at 13:00 ET but the grid
+    runs to 16:00; the venues freeze/purge at staggered times and the consolidated top of
+    differently-frozen books crosses -- 44% of that real session's snapshots, all post-close,
+    zero single-venue crossing. A book crossed ONLY after the early close must PASS; the same
+    crossing pattern on a full day must FAIL; a fault in the half day's open morning must FAIL."""
+    day = "2021-11-26"
+    df = _session(day, cross_halt=False)
+    ec = mh.early_close_mask(df.index)
+    n_ec = int(ec.sum())
+    df.loc[ec, "SPY_askprice_1"] = df.loc[ec, "SPY_bidprice_1"] - 0.02
+    q = ml.session_qc(df, date=day)
+    a = (q["ok"] and q.get("early_close_snapshots") == n_ec == 10801
+         and np.isclose(q["SPY"]["crossed_frac_ex_halt"], 0.0, atol=1e-9))
+    day2 = "2021-11-19"                              # ordinary full Friday, same pattern
+    df2 = _session(day2, cross_halt=False)
+    post = df2.index >= pd.Timestamp(f"{day2} 13:00", tz=TZ)
+    df2.loc[post, "SPY_askprice_1"] = df2.loc[post, "SPY_bidprice_1"] - 0.02
+    q2 = ml.session_qc(df2, date=day2)
+    b = (not q2["ok"]) and q2.get("early_close_snapshots", 0) == 0
+    q3 = ml.session_qc(_session(day, cross_halt=False, cross_open=4000), date=day)
+    c = not q3["ok"]
+    ok = a and b and c
+    print("(0) early close: post-13:00 crossing on the half day passes with %d snapshots excluded "
+          "(%s); the same pattern on a full day FAILS (%s); a morning fault on the half day still "
+          "FAILS (%s) : %s" % (n_ec, a, b, c, ok))
+    return ok
+
+
 def check_halt_table():
     ok = []
     n09 = int(mh.halt_mask(pd.date_range("2020-03-09 09:30", "2020-03-09 16:00", freq="s",
@@ -302,7 +331,8 @@ def check_one_venue_is_not_a_market_halt():
 
 
 def main():
-    checks = [check_halt_table, check_qc_passes_a_halt, check_qc_still_catches_a_fault,
+    checks = [check_early_close_half_day,
+              check_halt_table, check_qc_passes_a_halt, check_qc_still_catches_a_fault,
               check_non_halt_date_unaffected, check_missing_leg_still_fatal,
               check_opens_into_a_halt, check_halt_derived_from_tape,
               check_frame_attrs_override_the_table, check_one_venue_is_not_a_market_halt]

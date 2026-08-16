@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.9.84 -- the early-close mask and the pinned-order lifecycle trace
+
+Two findings from the first full MIDAS run (66 sessions, STAGE 3 gate failure on
+2017-12-05 and 2021-11-26), each now handled where it belongs:
+
+* **Early closes are halts, calendar-scheduled.** On 2021-11-26 (Omicron, the
+  day after Thanksgiving) matching stopped at 13:00 ET but the grid ran to
+  16:00; the venues froze/purged their books at staggered times (13:00-17:00),
+  and the consolidated top of differently-frozen books crossed on 44.05% of
+  snapshots -- ALL post-close, with zero single-venue crossing. Correct book,
+  closed market. `market_halts.early_close_reason/early_close_end/
+  early_close_mask` encode the NYSE 13:00 half-day rule (day after
+  Thanksgiving, weekday Jul 3, weekday Dec 24); the QC (`session_qc`,
+  qc_frames) excludes post-close snapshots from the crossed fraction (reported
+  in a separate `early_close` column, never conflated with the halt count), the
+  estimators NaN-mask them like halt rows (unioned per leg even over positive
+  no-halt attrs -- `mask_frame`), the ladder staleness check judges the open
+  segment only, and debug_crossing judges the open segment. The Omicron
+  volatile day is thereby RETAINED as a 3.5-hour session instead of dropped;
+  masks are computed at read time from the calendar, so cached frames need no
+  re-extraction. validate_sample still WARNs (length-sensitive quantities are
+  not full-day comparable).
+* **debug_crossing CHECK 10: the lifecycle of the orders pinning a crossed
+  venue top AT the close.** CHECK 5 interrogates removals that arrived; it is
+  structurally blind to an order whose removal never came, and CHECK 8's
+  wrong-side census runs after the venues' post-close purge has cancelled the
+  evidence (2017-12-05 read 0 there while pinned crossed for four hours). The
+  census is now taken AT the close and each pinning order's reference is traced
+  through the full message stream: no removal anywhere / removed only in the
+  post-close purge (-> DATA: a displayed order resting through the opposite
+  side is marketable, and a matching engine executes marketable orders
+  immediately -- hours of pinned rest with no tape removal means lost
+  removals/executions or a corrupted add) / removal precedes the add or an
+  in-session cancel went unapplied (-> CODE). A CHECK 10 DATA verdict WITHDRAWS
+  CHECK 7's "single venue crossed, not accumulating -> CODE" inference, which
+  fired on 2017-12-05 with no order-level evidence. Gate scenario (G) plants
+  the exact signature -- stranded bids cancelled only at 16:30 -- and pins the
+  discrimination: CHECK 5 clean, CHECK 8 census 0, CHECK 10 names the purge,
+  verdict DATA only.
+
+Re-run `debug_crossing.py --date 20171205 --product SPY` to get the CHECK 10
+verdict for that session before deciding re-fetch vs drop. Checks added to
+test_debug_crossing (G), test_halt_aware_qc (0), test_halt_masked_estimation
+(0); no new gate files (STAGE 1 list unchanged at 41).
+
+
 ## v0.9.83 -- the MIDAS data floor: 2017-06-26 as a design constraint
 
 MIDAS carries no futures before 2017-06-26, so the tape -- not the volatility

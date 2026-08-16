@@ -367,16 +367,22 @@ def mask_frame(df, assets=("SPY", "ES"), tz: str = TZ):
     # and masked frames simultaneously -- at a 10ms grid that is GBs per session of pure
     # no-op residency. On the no-halt path the ORIGINAL frame is returned (attrs annotated);
     # callers already treat the return as their new reference, not a scratch buffer.
+    # Early close (v0.9.84): after the 13:00 ET close matching has stopped on BOTH legs, so those
+    # rows are excluded like halt rows -- unioned per leg regardless of what the halt attrs say
+    # (a positive 'this leg did not halt' is true and irrelevant: the market is simply closed).
+    ec = early_close_mask(df.index, tz=tz)
     todo = []
     for a in assets:
         key = f"halt_windows_{a}"
         wins = attrs[key] if key in attrs else attrs.get("halt_windows")
         wins = [(pd.Timestamp(x), pd.Timestamp(y)) for x, y in wins] if wins else None
         if wins is None and key in attrs:            # positive empty: this leg did not halt
-            continue
-        m = halt_mask(df.index, windows=wins, tz=tz)
+            hm = np.zeros(len(df), bool)
+        else:
+            hm = halt_mask(df.index, windows=wins, tz=tz)
+        m = hm | ec
         if m.any():
-            todo.append((a, m))
+            todo.append((a, m, int(hm.sum())))
     if not todo:
         # Return the ORIGINAL untouched -- including its attrs. Annotating it with
         # halt_masked={...: 0} (the first version of this fast path) leaked a truthy dict
@@ -390,7 +396,8 @@ def mask_frame(df, assets=("SPY", "ES"), tz: str = TZ):
     # (estimation memos are stripped from the COPY: they were built on the unmasked data,
     # and while their fingerprint would go stale anyway, a memoized X can be hundreds of MB
     # at a fine grid -- dead weight traveling on every masked frame.)
-    for a, m in todo:
+    halt_only = {}
+    for a, m, nh in todo:
         cols = [c for c in out.columns if c.startswith(f"{a}_")
                 and any(t in c.lower() for t in _MARKET)
                 and not c.lower().endswith(("_ssr",)) and "_luld" not in c.lower()]
@@ -401,7 +408,14 @@ def mask_frame(df, assets=("SPY", "ES"), tz: str = TZ):
                 v[m] = np.nan
                 out[c] = v
         rep[a] = int(m.sum())
-    out.attrs["halt_masked"] = dict(rep)
+        if nh:
+            halt_only[a] = nh
+    if halt_only:
+        # halt rows ONLY -- ab_halt_mask keys off this attr, and an all-zero dict is truthy
+        # (the documented v0.9.64 leak), so it is stamped only when a halt actually masked rows
+        out.attrs["halt_masked"] = halt_only
+    if ec.any():
+        out.attrs["early_close_masked"] = int(ec.sum())
     return out, rep
 
 
@@ -441,6 +455,62 @@ def halt_mask(index: pd.DatetimeIndex, date=None, tz: str = TZ, windows=None) ->
 
 def is_halt_date(date) -> bool:
     return bool(halt_windows(date))
+
+
+# ---------------------------------------------------------------------------------------------------
+# NYSE early closes (v0.9.84). On a 13:00 ET half day the grid still runs 09:30-16:00, and the
+# post-close segment is a no-matching window with exactly the halt phenomenology: matching stops,
+# resting orders stay, and the venues freeze/purge their books at STAGGERED times (on 2021-11-26 the
+# feeds shut down anywhere from 13:00 to 17:00), so the consolidated top of differently-frozen books
+# crosses for the rest of the grid -- 44.05% of that session's snapshots, all after 13:00, with ZERO
+# single-venue crossing. That is a correct book for a closed market, not a replay fault, and it is
+# excluded from the crossed-rate arithmetic and from every estimator the same way a halt is. The
+# rule-based calendar below mirrors validate_sample._early_close; both legs are masked from the
+# EQUITY close (CME's own half-day close is 13:15 ET -- the 15-minute ES-only tail carries no pair
+# information, since every pair estimator needs both legs finite).
+
+_EARLY_CLOSE_END = "13:00"
+
+
+def early_close_reason(date) -> str:
+    """NYSE 13:00 ET half days. Returns the reason, or '' for a full session."""
+    d = pd.Timestamp(str(date)[:10])
+    if d.month == 11 and d.weekday() == 4 and 23 <= d.day <= 29:
+        return "day after Thanksgiving"
+    if d.month == 7 and d.day == 3 and d.weekday() <= 3:      # Fri Jul 3 is the observed holiday
+        return "July 3"
+    if d.month == 12 and d.day == 24 and d.weekday() <= 3:    # Fri Dec 24 is the observed holiday
+        return "Christmas Eve"
+    return ""
+
+
+def early_close_end(date, tz: str = TZ):
+    """-> tz-aware Timestamp of the 13:00 ET close on an early-close date, else None."""
+    if not early_close_reason(date):
+        return None
+    return pd.Timestamp(f"{str(date)[:10]} {_EARLY_CLOSE_END}", tz=tz)
+
+
+def early_close_mask(index: pd.DatetimeIndex, date=None, tz: str = TZ) -> np.ndarray:
+    """Boolean mask, True at/after the early close on a half day; all-False on a full session.
+
+    ``date`` defaults to the index's own first date, so a session frame needs no extra argument.
+    This is deliberately independent of the halt plumbing: halt windows come from the tape (and
+    present-but-empty attrs are a positive 'did not halt'), while the early close is a calendar
+    fact that holds no matter what the status stream said -- so callers union this mask
+    unconditionally rather than routing it through the halt-window resolution."""
+    if index is None or len(index) == 0:
+        return np.zeros(0, bool)
+    if not isinstance(index, pd.DatetimeIndex):
+        index = pd.DatetimeIndex(index)
+    if date is None:
+        d0 = index[0]
+        date = (d0.tz_convert(tz) if getattr(index, "tz", None) is not None else d0).strftime("%Y-%m-%d")
+    end = early_close_end(date, tz=tz)
+    if end is None:
+        return np.zeros(len(index), bool)
+    idx = index.tz_localize(tz) if getattr(index, "tz", None) is None else index.tz_convert(tz)
+    return np.asarray(idx >= end, dtype=bool)
 
 
 def describe(date, tz: str = TZ) -> str:

@@ -1189,6 +1189,17 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
     # union (df.attrs["halt_windows"]) is for pair estimates, which need both legs live.
     halt = _mask("halt_windows")
     rep["halt_snapshots"] = int(halt.sum())
+    # Early close (v0.9.84): after the 13:00 ET close matching has stopped, resting orders stay,
+    # and the venues freeze/purge at staggered times -- the consolidated top of differently-frozen
+    # books crosses exactly like a halt (2021-11-26: 44.05% crossed, all of it post-close, zero
+    # single-venue crossing). Correct book, closed market: excluded from the crossed fraction,
+    # reported separately from the halt count so a half day is never mislabelled an MWCB session.
+    try:
+        import market_halts as _mh
+        ec = _mh.early_close_mask(df.index, date=date)
+    except Exception:
+        ec = np.zeros(len(df), bool)
+    rep["early_close_snapshots"] = int(ec.sum())
     # Per-leg halt counts, because the union alone hides which leg contributed. The 2026-08-04 run
     # reported 900/900/900/901 snapshots on the four MWCB days -- the SPY windows exactly -- and
     # there was no way to tell from the output whether the ES windows had been derived at all.
@@ -1204,6 +1215,8 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
         crossed = (bid > ask + EPS) & both
         frac = float(crossed[both].mean()) if n_fin else float("nan")
         open_mkt = both & ~halt if halt.size == both.size else both
+        if ec.size == open_mkt.size:
+            open_mkt = open_mkt & ~ec
         n_open = int(open_mkt.sum())
         frac_ex = float(crossed[open_mkt].mean()) if n_open else float("nan")
         rep[a] = {"n": int(len(df)), "n_finite": n_fin,
@@ -1216,8 +1229,12 @@ def session_qc(df: pd.DataFrame, assets: Sequence[str] = ("SPY", "ES"),
                                   f"finite bid AND ask) -- the leg is missing, not thin")
         elif np.isfinite(frac_ex) and frac_ex > crossed_tol:
             rep["ok"] = False
+            n_ec = rep.get("early_close_snapshots", 0)
             extra = (f" ({frac:.1%} including the {n_halt} halt snapshot(s), which "
                      f"are expected to cross)" if n_halt else "")
+            if n_ec:
+                extra += (f" ({frac:.1%} including the {n_ec} post-early-close snapshot(s), "
+                          f"where matching had stopped)")
             rep["reasons"].append(f"{a}: top is CROSSED on {frac_ex:.1%} of {n_open} snapshots "
                                   f"OUTSIDE any halt{extra} (tolerance {crossed_tol:.1%}) -- the "
                                   f"replay is dropping removals or inventing levels")

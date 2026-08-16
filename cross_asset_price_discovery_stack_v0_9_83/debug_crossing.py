@@ -418,6 +418,27 @@ def instrumented_replay(msgs, tz, clock, price_scale, session, date_str, interva
     resurrect_keys = {}             # composite key -> ts of the resurrecting modify
     pin_price = Counter()           # (feed, side, price) -> snapshots this price held a venue crossed
     gi, ng = 0, len(grid_ns)
+    close_census = None             # (feed,ref) keys pinning a crossed venue top AT the session close
+
+    def _pin_census():
+        """The orders holding a crossed venue top apart AT THIS MOMENT. Taken when the grid is
+        exhausted (the session close), NOT after the message stream ends: venues purge resting
+        orders in their post-close cleanup, so an end-of-stream census reads 0 on a session that
+        was pinned crossed for hours (the 2017-12-05 blind spot -- CHECK 8's census is post-purge)."""
+        pins = {}
+        for fd in set(list(book.bid.keys()) + list(book.ask.keys())):
+            b = book.bid.get(fd) or {}
+            a = book.ask.get(fd) or {}
+            bb = max((p for p, s in b.items() if s > EPS), default=None)
+            aa = min((p for p, s in a.items() if s > EPS), default=None)
+            if bb is None or aa is None or not (bb > aa + EPS):
+                continue
+            for (f2, rf), (sd, px, sz) in book.orders.items():
+                if int(f2) != int(fd):
+                    continue
+                if (sd == 0 and px > aa + EPS) or (sd == 1 and px < bb - EPS):
+                    pins[int(f2) * span + int(rf)] = (int(fd), int(sd), float(px), float(sz))
+        return pins
 
     def _snap(ts_ns):
         bagg, aagg = book.consolidated("Bid", 100, True), book.consolidated("Ask", 100, True)
@@ -444,6 +465,8 @@ def instrumented_replay(msgs, tz, clock, price_scale, session, date_str, interva
         ts = ev.ts[j]
         while gi < ng and grid_ns[gi] < ts:
             _snap(grid_ns[gi]); gi += 1
+        if gi >= ng and close_census is None:       # the close just passed; events continue after it
+            close_census = _pin_census()
         code, feed = ev.code[j], ev.feed[j]
         if code == lr._ADD:
             book.add(feed, ev.ref[j], ev.side[j], ev.price[j], ev.size[j])
@@ -509,6 +532,38 @@ def instrumented_replay(msgs, tz, clock, price_scale, session, date_str, interva
                 killed.add(int(feed) * span + int(ev.ref[j]))
     while gi < ng:
         _snap(grid_ns[gi]); gi += 1
+    if close_census is None:                        # the stream ended before the close
+        close_census = _pin_census()
+
+    # CHECK 10 lifecycle: for every order pinning a crossed venue top at the close, what does the
+    # capture hold for its reference? CHECK 5 can only interrogate removals that ARRIVED; an order
+    # whose removal is missing leaves no orphan and rests forever, and this is the only place that
+    # asks the question in that direction.
+    pin_life = []
+    if close_census:
+        close_ns = int(grid_ns[-1])
+        rm_mask = np.isin(ev.code, (lr._CANCEL, lr._TRADE))
+        pk = np.fromiter(close_census.keys(), dtype=np.int64)
+        sel = rm_mask & np.isin(key_all, pk)
+        rem_by_key = {}
+        for kk, tt, cc in zip(key_all[sel], ev.ts[sel], ev.code[sel]):
+            rem_by_key.setdefault(int(kk), []).append((int(tt), int(cc) == lr._CANCEL))
+        for k, (fd, sd, px, sz) in close_census.items():
+            b_ts = born.get(k)
+            evs = sorted(rem_by_key.get(k, []))
+            canc_in = [t for t, isc in evs if isc and (b_ts is None or t > b_ts) and t <= close_ns]
+            canc_pre = [t for t, isc in evs if isc and b_ts is not None and t <= b_ts]
+            post = [t for t, _isc in evs if t > close_ns]
+            if canc_in:            # a cancel fully removes; it arrived in session and the order rests
+                cls, t0 = "in_session_cancel_unapplied", min(canc_in)
+            elif canc_pre:         # its cancel was spent BEFORE this incarnation existed
+                cls, t0 = "removal_pre_add", max(canc_pre)
+            elif post:             # the venue removed it only in its post-close purge
+                cls, t0 = "purge_only", min(post)
+            else:                  # the capture holds no cancel for it at any hour
+                cls, t0 = "no_removal", None
+            pin_life.append(dict(feed=fd, side=sd, price=px, size=sz, born=b_ts,
+                                 cls=cls, removal_ts=t0))
 
     # End-of-session census of orders sitting on the WRONG side of their own venue's top. Each one is
     # an order the venue removed and our replay kept. Reported with the time it entered the book, so a
@@ -537,6 +592,7 @@ def instrumented_replay(msgs, tz, clock, price_scale, session, date_str, interva
                 resurrect_by_feed=resurrect_by_feed,
                 n_resurrect_resting=len(set(resurrect_keys) & resting_keys),
                 resurrect_keys=resurrect_keys, pin_price=pin_price, wrong_side=wrong_side,
+                pin_life=pin_life, close_ns=int(grid_ns[-1]) if ng else None,
                 stats=dict(book.stats), tz=tz)
 
 
@@ -669,6 +725,29 @@ def report_replay(R, L):
             L.append("      from any lead-lag / correlation / information-share estimate -- they add a")
             L.append("      mechanical comovement that is not price discovery.")
             cross_rate = ex_halt if np.isfinite(ex_halt) else cross_rate     # judge on the open market
+        # Early close (v0.9.84): after the 13:00 ET close matching has stopped and the venues
+        # freeze/purge at STAGGERED times, so the consolidated top of differently-frozen books
+        # crosses -- the halt phenomenology, calendar-scheduled. Judged the same way: excluded.
+        try:
+            import market_halts as mh_ec
+            ecm = mh_ec.early_close_mask(R["grid"])
+            ec_reason = mh_ec.early_close_reason(R["g0"].strftime("%Y-%m-%d"))
+        except Exception:
+            ecm, ec_reason = np.zeros(n, bool), ""
+        if ecm.size == n and ecm.any():
+            halt_mask_all = halt_mask_all | ecm
+            in_ec = float(np.mean(R["crossed"][ecm]))
+            open_m = ~halt_mask_all
+            ex_ec = float(np.mean(R["crossed"][open_m])) if open_m.any() else float("nan")
+            L.append("    EARLY CLOSE on this date (%s -- 13:00 ET):" % ec_reason)
+            L.append("      crossed AFTER the close (%d snapshots)  : %.1f%%" % (int(ecm.sum()), 100 * in_ec))
+            L.append("      crossed in the OPEN 09:30-13:00 segment : %.2f%%"
+                     % (100 * ex_ec if np.isfinite(ex_ec) else float("nan")))
+            L.append("      Matching stops at the close but the grid runs to 16:00; the venues freeze")
+            L.append("      or purge their books at staggered times, so the consolidated top of")
+            L.append("      differently-frozen books crosses. That is a CORRECT book for a closed")
+            L.append("      market. Only the open segment is judged, and only it enters any estimate.")
+            cross_rate = ex_ec if np.isfinite(ex_ec) else cross_rate
         # Structural faults (side/scale/column parsing) cross from the very FIRST snapshots with a
         # STABLE book. Accumulation faults also reach a high rate early when the leak is fast, so
         # "crossed early" alone cannot separate them -- the resting-order growth is what does.
@@ -723,6 +802,22 @@ def report_replay(R, L):
                              "or leak explanation can account for"))
 
     findings += report_pins(R, growth, L)
+    pin_findings = report_pin_lifecycle(R, L)
+    # CHECK 7's "single venue crossed, not accumulating -> a venue replay is wrong" is an INFERENCE
+    # with no order-level evidence behind it. CHECK 10 holds the direct record; when that record says
+    # the pinning orders have no in-session removals in the capture, the inference is withdrawn --
+    # this is exactly the 2017-12-05 shape, where five venues pin simultaneously from mid-morning
+    # while five sibling sessions of the same era replay 0.00% crossed under the identical code.
+    if any(k == "DATA" for k, _s, _m in pin_findings):
+        kept = [f for f in findings if not (f[0] == "CODE" and f[2].startswith("individual venue books"))]
+        if len(kept) != len(findings):
+            L.append("")
+            L.append("    NOTE: CHECK 7's 'single venue crossed while not accumulating -> CODE' inference")
+            L.append("    is WITHDRAWN: CHECK 10's order-level record shows the pinning orders have no")
+            L.append("    in-session removals in the capture. The venue book crosses because the data")
+            L.append("    behind it is incomplete, not because its replay is wrong.")
+            findings = kept
+    findings += pin_findings
     return findings
 
 
@@ -778,7 +873,8 @@ def report_pins(R, growth, L):
 
     ws = R.get("wrong_side") or {}
     n_ws = sum(len(v) for v in ws.values())
-    L.append("    orders resting on the WRONG side of their own venue's top at the close : %s" % f"{n_ws:,}")
+    L.append("    orders resting on the WRONG side of their own venue's top at the END OF THE "
+             "MESSAGE STREAM (post-purge; CHECK 10 holds the state AT the close) : %s" % f"{n_ws:,}")
     for fd, rows in sorted(ws.items(), key=lambda kv: -len(kv[1]))[:6]:
         rows = sorted(rows, key=lambda r: (r[3] is None, r[3]))
         n_from_res = sum(1 for r in rows if r[4])
@@ -801,6 +897,83 @@ def report_pins(R, growth, L):
         for (fd, sd, px), k in pin.most_common(6):
             L.append("      %-24s %s %10.4f  %s snapshots" % (_fn(fd)[:24], "Bid" if sd == 0 else "Ask",
                                                               px, f"{k:,}"))
+    return findings
+
+
+def report_pin_lifecycle(R, L):
+    """CHECK 10 -- the capture's own record for every order pinning a crossed venue top AT the close.
+
+    CHECK 5 interrogates removals that ARRIVED ("where is this cancel's order?"). It is structurally
+    blind to the opposite fault: an order whose removal never arrived leaves no orphan and rests
+    forever. And CHECK 8's wrong-side census runs after the whole message stream, where the venues'
+    post-close purge has already cancelled the evidence -- a session pinned crossed for hours reads
+    0 there. This check takes the census AT the session close and asks, per pinned order, what the
+    fetch actually holds for its reference:
+
+      no_removal                   no cancel anywhere in the day          -> DATA (lost removals)
+      purge_only                   cancelled only AFTER the close          -> DATA (see below)
+      removal_pre_add              its cancel precedes this incarnation    -> CODE (ordering/ref reuse)
+      in_session_cancel_unapplied  a cancel arrived; the order still rests -> CODE (match fault)
+
+    purge_only is the sharp one: a displayed limit order resting THROUGH the opposite side is
+    marketable, and a matching engine executes marketable orders immediately. An order that sat
+    crossing the top for hours, that the venue itself removed only in its end-of-day purge, is an
+    order whose in-session executions/removals the capture does not contain (or whose add carries a
+    wrong price/symbol). Either way the fault is in the data, and no replay change can repair it."""
+    findings = []
+    pl = R.get("pin_life") or []
+    fname = R["feed_names"]
+    tz = R.get("tz", "America/New_York")
+
+    def _fn(c):
+        return fname[c] if c < len(fname) else str(c)
+
+    def _hhmm(ts):
+        return "  ?  " if ts is None else pd.Timestamp(int(ts), tz="UTC").tz_convert(tz).strftime("%H:%M:%S")
+
+    L.append("")
+    L.append("CHECK 10 lifecycle of the orders pinning a crossed venue top AT the close")
+    if not pl:
+        L.append("    no venue's own book is crossed at the session close -- nothing to trace")
+        return findings
+    n = len(pl)
+    cnt = Counter(p["cls"] for p in pl)
+    L.append("    pinned orders at the close: %s" % f"{n:,}")
+    L.append("      no removal anywhere in the capture       : %6s  -> DATA (lost removals)"
+             % f"{cnt.get('no_removal', 0):,}")
+    L.append("      removed only in the post-close purge     : %6s  -> DATA (see docstring)"
+             % f"{cnt.get('purge_only', 0):,}")
+    L.append("      removal precedes the order's own add     : %6s  -> CODE (ordering/ref reuse)"
+             % f"{cnt.get('removal_pre_add', 0):,}")
+    L.append("      in-session cancel arrived, never applied : %6s  -> CODE (match fault)"
+             % f"{cnt.get('in_session_cancel_unapplied', 0):,}")
+    by_feed = Counter(p["feed"] for p in pl)
+    L.append("      by feed: %s" % ", ".join("%s=%s" % (_fn(k), f"{v:,}") for k, v in by_feed.most_common(6)))
+    for p in sorted(pl, key=lambda q: (q["born"] is None, q["born"]))[:6]:
+        L.append("        %-24s %s %10.4f x%-8.0f entered %s  %s%s"
+                 % (_fn(p["feed"])[:24], "Bid" if p["side"] == 0 else "Ask", p["price"], p["size"],
+                    _hhmm(p["born"]), p["cls"],
+                    "" if p["removal_ts"] is None else " (removal %s)" % _hhmm(p["removal_ts"])))
+    n_data = cnt.get("no_removal", 0) + cnt.get("purge_only", 0)
+    n_code = cnt.get("removal_pre_add", 0) + cnt.get("in_session_cancel_unapplied", 0)
+    if n_code >= 5 and n_code > 0.5 * n:
+        findings.append(("CODE", "SEVERE",
+                         "%s of the %s orders pinning a crossed venue top at the close HAVE a removal "
+                         "in the capture that the replay failed to honour (cancel before the add, or a "
+                         "cancel that arrived and was not applied) -- the data was there; the replay's "
+                         "ordering/reference matching lost it" % (f"{n_code:,}", f"{n:,}")))
+    if n_data >= 5 and n_data > 0.5 * n:
+        findings.append(("DATA", "SEVERE",
+                         "%s of the %s orders pinning a crossed venue top at the close have NO "
+                         "in-session removal in the capture (%s none at all, %s cancelled only in the "
+                         "venue's post-close purge). A displayed order resting through the opposite "
+                         "side is marketable and a matching engine executes it immediately, so hours of "
+                         "pinned rest with no execution or cancel on the tape means the capture's "
+                         "message stream for these orders is wrong or incomplete (lost removals/"
+                         "executions, or adds carrying a wrong price/symbol). Not repairable in "
+                         "replay: re-fetch the day or drop the session"
+                         % (f"{n_data:,}", f"{n:,}", f"{cnt.get('no_removal', 0):,}",
+                            f"{cnt.get('purge_only', 0):,}")))
     return findings
 
 

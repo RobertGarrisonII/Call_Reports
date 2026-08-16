@@ -222,10 +222,13 @@ def _mask_halt_rows(sessions, enabled=True, assets=("SPY", "ES")):
     for d, r, df in sessions:
         masked, rep = mh.mask_frame(df, assets=assets)
         if any(rep.values()):
-            LOG.info("session %s: halt-masked %s row(s) -- excluded from every estimator (the halt "
+            n_ec = masked.attrs.get("early_close_masked", 0)
+            LOG.info("session %s: halt-masked %s row(s)%s -- excluded from every estimator (the halt "
                      "has no valid midpoint; the QC gate already excluded these, the estimators "
                      "now do too)", str(d),
-                     ", ".join("%s=%d" % (a, n) for a, n in rep.items() if n))
+                     ", ".join("%s=%d" % (a, n) for a, n in rep.items() if n),
+                     " (incl. %d post-13:00 early-close rows: matching had stopped)" % n_ec
+                     if n_ec else "")
         out.append((d, r, masked))
     return out
 

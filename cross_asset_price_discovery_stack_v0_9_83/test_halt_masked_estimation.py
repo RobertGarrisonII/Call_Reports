@@ -65,6 +65,40 @@ def _mid(df, a):
             + pd.to_numeric(df[f"{a}_askprice_1"], errors="coerce").to_numpy(float)) / 2.0
 
 
+def check_early_close_masks_like_a_halt():
+    """The estimation-side counterpart of the QC's early-close exclusion: post-13:00 rows on a
+    half day are NaN'd like halt rows, EVEN when the halt attrs positively say 'this leg did not
+    halt' (they are right, and irrelevant -- the market is closed). Full days stay untouched."""
+    day = "2021-11-26"
+    df, _ = _pair_session(n=23401, day=day, gap_bps=0.0)
+    df.attrs["halt_windows_SPY"] = []               # positive statement: no halt on either leg --
+    df.attrs["halt_windows_ES"] = []                # the union must still mask the closed afternoon
+    df.attrs["halt_windows"] = []
+    ec = mh.early_close_mask(df.index)
+    n_ec = int(ec.sum())
+    masked, rep = mh.mask_frame(df)
+    spy = pd.to_numeric(masked["SPY_bidprice_1"], errors="coerce")
+    a = rep == {"SPY": n_ec, "ES": n_ec} and n_ec == 10801
+    b = int(spy.isna().sum()) == n_ec and bool(spy[~ec].notna().all())
+    c = (masked.attrs.get("early_close_masked") == n_ec
+         and "halt_masked" not in masked.attrs)     # no halt rows -> the halt attr must NOT stamp
+    full, _ = _pair_session(n=23401, day="2021-11-19", gap_bps=0.0)
+    for k in ("halt_windows_SPY", "halt_windows_ES", "halt_windows"):
+        full.attrs[k] = []
+    m2, rep2 = mh.mask_frame(full)
+    d = not any(rep2.values()) and "early_close_masked" not in m2.attrs
+    e = (mh.early_close_reason("2021-11-26") == "day after Thanksgiving"
+         and bool(mh.early_close_reason("2024-11-29")) and bool(mh.early_close_reason("2024-12-24"))
+         and mh.early_close_reason("2022-12-24") == ""      # Saturday: no session at all
+         and mh.early_close_reason("2021-11-19") == "")
+    ok = a and b and c and d and e
+    print("(0) early close: half day masks %d post-close rows per leg over positive no-halt attrs "
+          "(%s), exactly those rows (%s), recorded separately from halt_masked (%s); a full day is "
+          "untouched (%s); the calendar rule is right on knowns (%s) : %s"
+          % (n_ec, a, b, c, d, e, ok))
+    return ok
+
+
 def check_mask_frame_masks_the_right_rows():
     df, n_halt = _pair_session()
     masked, rep = mh.mask_frame(df)
@@ -171,7 +205,8 @@ def check_driver_helper_and_escape_hatch():
 
 
 def main():
-    checks = [check_mask_frame_masks_the_right_rows,
+    checks = [check_early_close_masks_like_a_halt,
+              check_mask_frame_masks_the_right_rows,
               check_per_leg_masking_preserves_the_sole_venue_window,
               check_design_drops_halt_seam_and_lag_windows,
               check_vecm_still_estimates_and_no_seam_return,
