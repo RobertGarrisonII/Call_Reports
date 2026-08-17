@@ -250,6 +250,52 @@ def measure_roll_at_extraction(label, symbol: str = "ES", rollover_days: int = 8
     return off, rep
 
 
+def _activity_table_fallback(symbol: str, d, front: str, rollover_days: int, tag: str,
+                             off: int, why: str):
+    """The lake head-read failed; consult the committed cleared-volume/OI table (es_activity).
+
+    CONFIRM AND REPORT, NEVER OVERRIDE: the table's field is CLEARED volume, which diverges
+    from the tape's TRADED volume exactly at roll inflections (2020-03-16: cleared favoured
+    ESH0 3:1 the prior day while the tape's traded volume on the session had already moved to
+    ESM0 at 60.4%), so an offline contradiction is reported for the appendix, not acted on.
+    The extracted contract is the calendar pick either way. -> report dict or None."""
+    try:
+        import es_activity
+        prev, _f, nxt = adjacent_contracts(symbol, d.date() if hasattr(d, "date") else d,
+                                           rollover_days)
+        rival = nxt if off <= 0 else prev
+        rep = es_activity.prior_session_stats(front, rival, d.strftime("%Y-%m-%d"))
+    except Exception as exc:
+        log.warning("%s: activity rule could not measure the contract split at %+d day(s) from "
+                    "the boundary (%s), and the offline table could not either (%s) -- FALLING "
+                    "BACK to the calendar pick %s.", tag, off, why,
+                    str(exc).splitlines()[0][:80], front)
+        return None
+    if not rep.get("measured"):
+        log.warning("%s: activity rule could not measure the contract split at %+d day(s) from "
+                    "the boundary (%s); offline table: %s -- FALLING BACK to the calendar "
+                    "pick %s.", tag, off, why, rep.get("note") or "not measured", front)
+        return None
+    rep.update({"rule": "activity", "calendar_pick": front, "activity_pick": front,
+                "overrode": False, "roll_offset_days": off})
+    share = rep.get("front_share", float("nan"))
+    if rep["note"]:
+        log.info("%s: lake measurement failed (%s); the offline cleared-volume table CONFIRMS "
+                 "the calendar pick %s trivially: %s.", tag, why, front, rep["note"])
+    elif share >= 0.5:
+        log.info("%s: lake measurement failed (%s); the offline cleared-volume table CONFIRMS "
+                 "the calendar pick %s (%.1f%% of prior-session two-contract cleared volume, "
+                 "as of %s).", tag, why, front, 100 * share, rep["asof"])
+    else:
+        log.warning("%s: lake measurement failed (%s); the offline cleared-volume table "
+                    "CONTRADICTS the calendar pick %s (only %.1f%% of prior-session "
+                    "two-contract cleared volume as of %s). Cleared and traded volume diverge "
+                    "at roll inflections, so the table does NOT override -- extracting the "
+                    "calendar pick and reporting the split for the sample appendix.",
+                    tag, why, front, 100 * share, rep["asof"])
+    return rep
+
+
 def select_contract(symbol: str, as_of_date, rollover_days: int = 8, rule: str = "calendar",
                     label=None, activity_window: int = 14, _measure=None):
     """The contract the ES leg extracts: calendar rule, or the ACTIVITY rule (v0.9.73).
@@ -284,15 +330,12 @@ def select_contract(symbol: str, as_of_date, rollover_days: int = 8, rule: str =
             _measure = _cr.measure
         rep = dict(_measure(d.strftime("%Y-%m-%d"), symbol, rollover_days))
     except Exception as exc:
-        log.warning("%s: activity rule could not measure the contract split at %+d day(s) from "
-                    "the boundary (%s) -- FALLING BACK to the calendar pick %s.",
-                    tag, off, str(exc).splitlines()[0][:120], front)
-        return front, None
+        return front, _activity_table_fallback(symbol, d, front, rollover_days, tag, off,
+                                               str(exc).splitlines()[0][:120])
     vols = {k: v for k, v in (rep.get("volume") or {}).items() if np.isfinite(v)}
     if not rep.get("measured") or not vols:
-        log.warning("%s: activity rule measured nothing usable (%s) -- FALLING BACK to the "
-                    "calendar pick %s.", tag, rep.get("note", "no finite volume"), front)
-        return front, rep
+        return front, _activity_table_fallback(symbol, d, front, rollover_days, tag, off,
+                                               rep.get("note", "no finite volume"))
     ois = rep.get("open_interest") or {}
     pick = max(vols, key=lambda c: (vols[c], ois.get(c, float("-inf"))))
     rep.update({"rule": "activity", "calendar_pick": front, "activity_pick": pick,

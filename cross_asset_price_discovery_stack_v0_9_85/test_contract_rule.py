@@ -116,20 +116,67 @@ def check_confirmation():
 
 
 def check_failure_falls_back():
-    d = ml._parse_yyyymmdd("20241218")
-
+    """v0.9.86: a lake failure now consults the committed cleared-volume table BEFORE the bare
+    calendar fallback. On a table-covered date the calendar pick is CONFIRMED with the cleared
+    share (never overridden -- cleared and traded volume diverge at roll inflections); only a
+    date the table cannot resolve falls back bare, with the warning."""
     def _boom(*a):
         raise RuntimeError("lakequery: connection refused")
 
+    d = ml._parse_yyyymmdd("20241218")                    # covered: ESH5 53.7% on 2024-12-17
     h = _cap()
     try:
         con, rep = ml.select_contract("ES", d, rule="activity", _measure=_boom)
     finally:
         ml.log.removeHandler(h)
     want = ml.get_front_month_contract("ES", as_of_date=d)
-    ok = con == want and rep is None and "FALLING BACK" in h.text()
-    print("(5) lake failure: calendar fallback %s, warning logged, no exception : %s"
-          % (con, ok))
+    a = (con == want and rep is not None and rep.get("source") == "cleared_table"
+         and rep.get("overrode") is False and 0.50 < rep.get("front_share", 0) < 0.60
+         and "CONFIRMS" in h.text() and "FALLING BACK" not in h.text())
+    d2 = ml._parse_yyyymmdd("20160613")                   # in-window, pre-table: bare fallback
+    h2 = _cap()
+    try:
+        con2, rep2 = ml.select_contract("ES", d2, rule="activity", _measure=_boom)
+    finally:
+        ml.log.removeHandler(h2)
+    want2 = ml.get_front_month_contract("ES", as_of_date=d2)
+    b = con2 == want2 and rep2 is None and "FALLING BACK" in h2.text()
+    ok = a and b
+    print("(5) lake failure, table-covered date: calendar pick %s CONFIRMED from cleared table "
+          "(share %.1f%%) (%s); pre-table date: bare calendar fallback with warning (%s) : %s"
+          % (con, 100 * (rep or {}).get("front_share", float("nan")), a, b, ok))
+    return bool(ok)
+
+
+def check_table_contradiction_reported_not_acted():
+    """The 2020-03-16 shape: prior-session CLEARED volume favours the old contract 3:1 while the
+    tape's traded volume on the session itself had moved to the calendar pick (60.4%). The table
+    must REPORT the contradiction and leave the calendar pick alone; 2023-12-20 (rival expired)
+    must confirm trivially."""
+    def _boom(*a):
+        raise RuntimeError("lakequery: connection refused")
+
+    d = ml._parse_yyyymmdd("20200316")
+    h = _cap()
+    try:
+        con, rep = ml.select_contract("ES", d, rule="activity", _measure=_boom)
+    finally:
+        ml.log.removeHandler(h)
+    a = (con == "ESM0" and rep is not None and rep.get("front_share", 1) < 0.30
+         and rep.get("overrode") is False and "CONTRADICTS" in h.text()
+         and "does NOT override" in h.text())
+    d2 = ml._parse_yyyymmdd("20231220")
+    h2 = _cap()
+    try:
+        con2, rep2 = ml.select_contract("ES", d2, rule="activity", _measure=_boom)
+    finally:
+        ml.log.removeHandler(h2)
+    b = (con2 == "ESH4" and rep2 is not None and rep2.get("front_share") == 1.0
+         and "trivially" in h2.text())
+    ok = a and b
+    print("(5b) cleared-table contradiction (2020-03-16, front %.1f%%) reported NOT acted on, "
+          "pick stays %s (%s); expired rival (2023-12-20) confirms trivially (%s) : %s"
+          % (100 * (rep or {}).get("front_share", float("nan")), con, a, b, ok))
     return bool(ok)
 
 
@@ -175,7 +222,8 @@ def check_surface():
 
 def main():
     checks = [check_calendar_untouched, check_out_of_window_free, check_override,
-              check_confirmation, check_failure_falls_back, check_minority_demotion,
+              check_confirmation, check_failure_falls_back, check_table_contradiction_reported_not_acted,
+              check_minority_demotion,
               check_surface]
     res = []
     for fn in checks:

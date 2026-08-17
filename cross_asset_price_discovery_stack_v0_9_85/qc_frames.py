@@ -190,8 +190,32 @@ def main(argv=None) -> int:
             body += ["",
                      "IN A ROLL WINDOW BUT NOT MEASURED: %s"
                      % ", ".join(str(d) for d in unmeasured.index),
-                     "  (frame predates roll measurement at extraction, or the lake read failed).",
-                     "  Run check_roll.py --dates on these, or re-extract."]
+                     "  (frame predates roll measurement at extraction, or the lake read failed)."]
+            # v0.9.86: fill the hole from the committed cleared-volume/OI table -- offline,
+            # deterministic, and labelled as CLEARED volume so it is never conflated with the
+            # tape-measured traded shares in the columns above (the two diverge at roll
+            # inflections; see es_activity's module docstring).
+            try:
+                import es_activity
+                import mstbook_loader as _ml
+                for dstr in unmeasured.index:
+                    d = pd.Timestamp(str(dstr))
+                    prev, front, nxt = _ml.adjacent_contracts("ES", d.date())
+                    off = _ml.roll_window_days(d.date())
+                    rival = nxt if off <= 0 else prev
+                    r = es_activity.prior_session_stats(front, rival, str(dstr))
+                    if r.get("measured"):
+                        body.append("  %s: offline CLEARED-volume table (as of %s): calendar "
+                                    "front %s carried %.1f%% vs %s%s" %
+                                    (dstr, r["asof"], front, 100 * r["front_share"], rival,
+                                     " -- " + r["note"] if r["note"] else ""))
+                    else:
+                        body.append("  %s: offline table cannot resolve it either (%s)"
+                                    % (dstr, r.get("note") or "not measured"))
+                body.append("  Cleared volume is the CLEARING figure, not the tape's traded "
+                            "volume; report it as such.")
+            except Exception:
+                body.append("  Run check_roll.py --dates on these, or re-extract.")
     _es_luld = [c for c in tbl.columns if c.endswith("_luld_known")]
     if _es_luld and float(tbl[_es_luld].fillna(0).to_numpy(float).max()) > 0:
         # NOTE this block first shipped appending to `lines`, a name that does not exist in this

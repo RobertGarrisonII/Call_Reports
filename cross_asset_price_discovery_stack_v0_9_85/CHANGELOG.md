@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.9.86 -- the offline ES activity table closes the contract-rule gaps
+
+The activity rule's lake head-read failed on six sample sessions ("could not
+read volume for both contracts"), leaving the calendar fallback with an
+UNKNOWN share in the QC report. The committed per-contract daily table
+(sample_inputs/es_activity_oi_volume.csv: open interest + cleared volume for
+every ES contract, 2017-01-01..2026-08-16; es_activity.py loads it, last
+report of the day wins) now resolves them offline -- deterministic and
+airgap-friendly:
+
+  2018-03-19 ESM8 79.5% CONFIRMED     2018-03-22 rival expired, CONFIRMED
+  2020-09-03 ESU0 98.9% CONFIRMED     2023-12-20 rival expired, CONFIRMED
+  2020-03-16 ESM0 24.7% CONTRADICTED  2022-06-13 ESU2 46.6% CONTRADICTED
+
+**CONFIRM AND REPORT, NEVER OVERRIDE.** The table's field is CLEARED volume,
+and cleared vs TRADED volume demonstrably diverge at roll inflections: on
+2020-03-16 prior-day clearing favoured ESH0 3:1 while the tape's traded volume
+on the session itself had already moved to ESM0 (60.4% -- the calendar pick
+was right). An offline override would have put an MWCB session on the contract
+carrying 39.6% of the day's trading. So the fallback tier is: lake measurement
+(decides) -> offline table (confirms unambiguous calendar picks, REPORTS
+contradictions with the cleared share for the appendix) -> bare calendar
+(pre-table dates only). On the three lake-measured sessions the table agrees
+directionally every time (2020-12-11 ESZ0, 2020-03-18 ESM0, 2024-12-18 ESH5)
+-- mutual validation of the two sources.
+
+qc_frames fills "IN A ROLL WINDOW BUT NOT MEASURED" from the table, labelled
+as cleared volume so it is never conflated with tape-measured traded shares.
+Gate: check (5) re-pinned to the tiered fallback (covered date -> CONFIRMED
+from the table; pre-table in-window date -> bare fallback with warning); new
+check (5b) pins the 2020-03-16 contradiction reported-not-acted and the
+expired-rival trivial confirmation. STAGE 1 list unchanged (41 gates).
+
+
 ## v0.9.85 -- the 2017-12-05 verdict, its sample consequence, and a headerless-response refetch
 
 **CHECK 10 ruled on 2017-12-05: DATA, unanimously.** All 776 orders pinning a
