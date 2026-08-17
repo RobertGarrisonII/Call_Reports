@@ -822,21 +822,38 @@ def _fetch_messages(date_str: str, product: str, product_type: str, message_type
            "-p", product, "-m", message_type, "--print-headers", "--format", "csv"]
     fd, tmp = tempfile.mkstemp(prefix=f"mstwx_{product}_{message_type}_", suffix=".csv", dir=_MST_TMPDIR)
     os.close(fd)
+    cands = _CLOCK_COLS.get(clock, _CLOCK_COLS["receipt"])
+    tcol = None
     try:
-        _run_mstwx_lakequery_to_file(cmd, tmp)          # stream stdout to disk (no multi-GB string)
-        df = _read_messages_csv(tmp, message_type)      # prune book types; aux types read full
+        # The lake occasionally returns the CSV WITHOUT its header row despite --print-headers --
+        # rc=0, so the subprocess-level retries never see it, and pandas parses the first DATA row
+        # as column names (the give-away: a "column" named after the message type itself, plus
+        # mangled duplicates). 2020-05-12 ESM0 at 10ms died on exactly this while the identical
+        # fetch succeeded hours later: a transient fault, so it is REFETCHED, not fatal.
+        for attempt in range(1, 4):
+            _run_mstwx_lakequery_to_file(cmd, tmp)      # stream stdout to disk (no multi-GB string)
+            df = _read_messages_csv(tmp, message_type)  # prune book types; aux types read full
+            if df.empty:
+                return df
+            tcol = next((c for c in cands if c in df.columns), None)
+            if tcol is not None:
+                break
+            headerless = any(str(c).startswith("mt_") for c in df.columns)
+            if headerless and attempt < 3:
+                log.warning("%s %s %s: lake response arrived WITHOUT its header row (first data "
+                            "row parsed as column names) -- transient; refetching (attempt %d/3)",
+                            date_str, product, message_type, attempt)
+                continue
+            raise ValueError(f"clock={clock!r}: expected one of {cands} in {message_type} output; "
+                             f"got {df.columns.tolist()}"
+                             + (f" -- the response was HEADERLESS on {attempt} consecutive "
+                                f"fetch(es); the lake kept returning it, so this is no longer "
+                                f"transient" if headerless else ""))
     finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
-    if df.empty:
-        return df
-    cands = _CLOCK_COLS.get(clock, _CLOCK_COLS["receipt"])
-    tcol = next((c for c in cands if c in df.columns), None)
-    if tcol is None:
-        raise ValueError(f"clock={clock!r}: expected one of {cands} in {message_type} output; "
-                         f"got {df.columns.tolist()}")
     idx = pd.to_datetime(df[tcol], unit="ns", utc=True).dt.tz_convert(tz)
     df = df.drop(columns=[tcol]).set_index(idx)
     df.index.name = "time"

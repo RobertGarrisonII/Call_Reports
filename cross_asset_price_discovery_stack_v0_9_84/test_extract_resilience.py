@@ -106,6 +106,51 @@ def check_retry():
     return ok
 
 
+# ── (1b) a HEADERLESS lake response (rc=0!) is refetched, not fatal ──────────────────────────────
+def check_headerless_refetch():
+    """The 2020-05-12 ESM0 failure: mstwx-lakequery exited 0 but returned the CSV without its
+    header row, so the first DATA row became the column names and the clock-column check raised --
+    killing the session at 10ms while the identical fetch succeeded at 1s hours later. A transient
+    fault with rc=0 is invisible to the rc-based retries; _fetch_messages must refetch on the
+    headerless signature (a column named after the message type itself) and only raise when the
+    lake keeps returning it."""
+    GOOD = ("receipttimestamp,exchangetimestamp,feed,product,bidquantity_1,bidprice_1\n"
+            "1589286600000000000,1589286600000000001,cme_globex30_cme,ESM0,100,291000\n"
+            "1589286601000000000,1589286601000000001,cme_globex30_cme,ESM0,120,291025\n")
+    BAD = ("mt_aggregated_price_update,1589256000003781892,2020-05-12,cme_globex30_cme,ESM0,290350\n"
+           "mt_aggregated_price_update,1589256000003791892,2020-05-12,cme_globex30_cme,ESM0,290375\n")
+    calls = {"n": 0}
+
+    def fake_fetch_bad_then_good(cmd, path, **kw):
+        calls["n"] += 1
+        with open(path, "w") as fh:
+            fh.write(BAD if calls["n"] == 1 else GOOD)
+
+    def fake_fetch_always_bad(cmd, path, **kw):
+        calls["n"] += 1
+        with open(path, "w") as fh:
+            fh.write(BAD)
+
+    real = ml._run_mstwx_lakequery_to_file
+    try:
+        ml._run_mstwx_lakequery_to_file = fake_fetch_bad_then_good
+        df = ml._fetch_messages("20200512", "ESM0", "futures", "mt_aggregated_price_update")
+        recovered = calls["n"] == 2 and len(df) == 2 and df.index.name == "time"
+        calls["n"] = 0
+        ml._run_mstwx_lakequery_to_file = fake_fetch_always_bad
+        try:
+            ml._fetch_messages("20200512", "ESM0", "futures", "mt_aggregated_price_update")
+            exhausted = False
+        except ValueError as exc:
+            exhausted = "HEADERLESS" in str(exc) and calls["n"] == 3
+    finally:
+        ml._run_mstwx_lakequery_to_file = real
+    ok = recovered and exhausted
+    print("(1b) headerless response then a good one -> recovered on refetch : %s | always "
+          "headerless -> raises naming the condition after 3 fetches : %s" % (recovered, exhausted))
+    return ok
+
+
 # ── (2) one session's exception cannot discard the finished ones ─────────────────────────────────
 def check_batch_isolation():
     specs = [(f"2024-01-{d:02d}", "benchmark") for d in range(1, 6)]
@@ -313,7 +358,7 @@ def check_cache_resume():
 
 
 def main():
-    checks = [check_retry, check_batch_isolation, check_strict_fetch,
+    checks = [check_retry, check_headerless_refetch, check_batch_isolation, check_strict_fetch,
               check_empty_book_is_refused, check_session_qc, check_cache_resume]
     results = []
     for fn in checks:

@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.9.85 -- a headerless lake response is refetched, not fatal
+
+From the second full MIDAS run: the 2020-05-12 10ms extraction died with
+"clock='receipt': expected one of ('receipttimestamp', ...) -- got
+['mt_aggregated_price_update', '1589256000003781892', ...]". Those "columns"
+are VALUES: mstwx-lakequery exited 0 but returned the CSV without its header
+row, so pandas parsed the first data row as column names (the give-away is a
+column named after the message type itself, plus mangled duplicates). rc=0
+means the subprocess-level retries never fire, and the clock-column check
+turned a transient lake fault into a dead session -- while the identical
+fetch succeeded at the 1s stage six hours later.
+
+`_fetch_messages` now recognizes the headerless signature (any column name
+starting with `mt_`) when the clock column is missing, and refetches up to
+three times before raising; the terminal error names the condition ("the
+response was HEADERLESS on N consecutive fetches") so a persistent lake fault
+is still distinguishable from a schema change. Gate check (1b) in
+test_extract_resilience.py fakes the exact 2020-05-12 response: headerless
+then good -> recovered on the refetch; always headerless -> raises naming the
+condition after 3 fetches. STAGE 1 list unchanged (41 gates).
+
+Verified in the same run: the v0.9.84 early-close handling worked end to end
+on real data -- 2021-11-26 passed the STAGE 3 gate (crossed_open 0.01%,
+10,801 post-close snapshots excluded and estimator-masked, ES ladder
+staleness judged on the open segment: 0.31 vs 0.60 raw).
+
+
 ## v0.9.84 -- the early-close mask and the pinned-order lifecycle trace
 
 Two findings from the first full MIDAS run (66 sessions, STAGE 3 gate failure on
