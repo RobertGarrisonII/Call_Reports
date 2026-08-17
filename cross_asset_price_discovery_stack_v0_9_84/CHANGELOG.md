@@ -1,8 +1,35 @@
 # Changelog
 
-## v0.9.85 -- a headerless lake response is refetched, not fatal
+## v0.9.85 -- the 2017-12-05 verdict, its sample consequence, and a headerless-response refetch
 
-From the second full MIDAS run: the 2020-05-12 10ms extraction died with
+**CHECK 10 ruled on 2017-12-05: DATA, unanimously.** All 776 orders pinning a
+crossed venue top at the close have no in-session removal in the capture --
+326 with no removal anywhere in the day, 450 cancelled only in the venue's
+post-close purge -- across five independent feeds, with zero orders in either
+CODE class. A displayed order resting through the opposite side is marketable
+and a matching engine executes it immediately, so the SPY capture for that day
+is missing in-session removals/executions wholesale. Two independent runs
+fetched byte-identical content (78.4% crossed both times), so the lake's copy
+is stable-bad: the day is dropped, not re-fetched. CHECK 7's false "single
+venue crossed -> CODE" inference was withdrawn by the new evidence, exactly as
+the v0.9.84 design intended.
+
+* **design_sample.py --forbid-control**: dates whose TAPE is known bad may
+  never serve as controls; the picker routes around them to the next-best
+  same-weekday candidate, the exclusion is recorded in the design dict and the
+  rendered report. Gate check (7): forbidding the natural pick reroutes to
+  another in-window candidate, the forbidden date appears in no pair, the
+  report names it.
+* **The baked sample re-derived** with --forbid-control 2017-12-05: ONE date
+  changes -- 2018-12-04's control becomes 2017-11-28 (371d, same Tuesday,
+  passes the STRICT q0.50 screen; no relaxation needed). 37 volatile days, 25
+  pairs, 85% power, SUFFICIENT -- the 25th pair is recovered rather than lost
+  to the bad tape. run_paper_replication.sh / rank_sample.py re-baked;
+  sample_inputs/sample_design_20260817.txt is the design of record. One new
+  session to extract (2017-11-28); 2017-12-05 leaves the universe.
+
+**A headerless lake response is refetched, not fatal.** From the second full
+MIDAS run: the 2020-05-12 10ms extraction died with
 "clock='receipt': expected one of ('receipttimestamp', ...) -- got
 ['mt_aggregated_price_update', '1589256000003781892', ...]". Those "columns"
 are VALUES: mstwx-lakequery exited 0 but returned the CSV without its header

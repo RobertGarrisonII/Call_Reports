@@ -195,16 +195,21 @@ QC_ACTION="warn"      # warn | drop | raise -- what to do with a session whose b
 # 2020-01-27/02-24, 2022-06-13, 2023-03-09 have hot prior years) -- they still
 # carry the volatile label and serve the pooled/dose-response designs; the
 # within-pair regime test uses the 25 pairs. Power vs the 2026-08-14 run's
-# dispersion: 25 pairs, 85%, SUFFICIENT (need 22).
+# dispersion: 25 pairs, 85%, SUFFICIENT (need 22). 2017-12-05 is FORBIDDEN as
+# a control (v0.9.85): its SPY capture is missing in-session removals across
+# five feeds (debug_crossing CHECK 10, verdict DATA -- 776/776 pinning orders
+# with no in-session removal), so 2018-12-04's control is the next-best
+# Tuesday, 2017-11-28 (371d, strict q0.50 screen).
 # Model-robust: GJR-GARCH selects 36 of these same days (Jaccard 0.78,
 # log-diff rank corr 0.99) -- see sample_inputs/model_overlap_20260814.txt.
 # Regenerate: python design_sample.py --series sample_inputs/vlab_vix_mf2garch_gjr_20160101_20260813.csv \
 #   --col "CBOE Volatility Index - MF2-GARCH Volatility" --screen-col "CBOE Volatility Index - MF2-GARCH Trend" \
-#   --window 2016-01-01:2026-08-13 --threshold-q 0.985 --data-floor 2017-06-26 --emit-args
+#   --window 2016-01-01:2026-08-13 --threshold-q 0.985 --data-floor 2017-06-26 \
+#   --forbid-control 2017-12-05 --emit-args
 # First full extraction is ~66 sessions (all previously extracted days are a
 # subset, so the cache pays for 24 of them); --volatile/--baseline override.
 VOLATILE="2018-06-25,2018-10-04,2018-10-10,2018-12-04,2019-03-22,2019-08-05,2020-05-12,2020-06-11,2020-09-03,2020-10-26,2021-01-27,2021-02-25,2021-11-26,2022-02-10,2024-07-24,2024-08-05,2024-09-03,2024-12-18,2025-01-27,2025-02-21,2025-04-03,2025-08-01,2025-10-10,2026-01-20,2026-06-05,2017-08-10,2017-09-05,2018-01-29,2018-02-02,2018-02-05,2018-03-19,2018-03-22,2018-05-29,2020-01-27,2020-02-24,2022-06-13,2023-03-09"
-BASELINE="2017-06-26,2017-10-05,2017-10-25,2017-12-05,2018-03-23,2018-08-06,2019-05-14,2019-06-13,2019-09-05,2019-10-28,2020-01-29,2020-02-27,2020-12-11,2021-02-04,2023-07-26,2023-08-07,2023-09-05,2023-12-20,2024-01-29,2024-02-23,2024-04-04,2024-08-02,2024-10-11,2025-01-21,2025-06-06"
+BASELINE="2017-06-26,2017-10-05,2017-10-25,2017-11-28,2018-03-23,2018-08-06,2019-05-14,2019-06-13,2019-09-05,2019-10-28,2020-01-29,2020-02-27,2020-12-11,2021-02-04,2023-07-26,2023-08-07,2023-09-05,2023-12-20,2024-01-29,2024-02-23,2024-04-04,2024-08-02,2024-10-11,2025-01-21,2025-06-06"
 MWCB="2020-03-09,2020-03-12,2020-03-16,2020-03-18"
 # the published sample, Appendix Table A.1 (--paper-sample)
 PAPER_VOLATILE="2015-03-18,2015-10-02,2016-01-08,2016-01-27,2016-06-24,2015-08-21,2015-08-24,2015-09-01,2016-01-13,2016-01-20"

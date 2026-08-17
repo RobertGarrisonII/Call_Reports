@@ -179,6 +179,36 @@ def check_data_floor():
     return bool(ok_drop and ok_unpair and ok_ctrl and ok_far and ok_line)
 
 
+def check_forbid_control():
+    """v0.9.85: a date whose TAPE is known bad (2017-12-05: lossy SPY capture, CHECK 10
+    verdict DATA) may never serve as a control even though its volatility record is calm.
+    The picker must route around it to the next-best same-weekday candidate, the forbidden
+    date must never appear anywhere in the controls, and the report must say so."""
+    s = _flat_series([("2024-08-05", 3.0)])
+    v = pd.Timestamp("2024-08-05")                   # Monday
+    s.loc[pd.Timestamp("2023-08-07")] = 14.0         # natural pick: calm Monday, exactly 364d
+    s.loc[pd.Timestamp("2023-08-14")] = 14.2         # the alternate the picker must reroute to
+    d0 = ds.build_design(s, "logdiff", ("2018-01-01", "2026-08-14"),
+                         0.999, 5, 3, 0.5, (0.55, 0.85), 0, 0.20, 0.235, 0.05, 0.80)
+    nat = d0["controls"].loc[v, "control"]
+    ok_nat = pd.notna(nat)
+    d1 = ds.build_design(s, "logdiff", ("2018-01-01", "2026-08-14"),
+                         0.999, 5, 3, 0.5, (0.55, 0.85), 0, 0.20, 0.235, 0.05, 0.80,
+                         forbid_controls=[str(nat.date())] if ok_nat else [])
+    c1 = d1["controls"].loc[v, "control"]
+    ok_rerouted = (ok_nat and pd.notna(c1) and c1 != nat
+                   and c1.dayofweek == v.dayofweek
+                   and 350 <= int((v - c1).days) <= 371)
+    all_ctl = [x for x in d1["controls"]["control"] if pd.notna(x)]
+    ok_absent = nat not in all_ctl
+    txt = ds.render(d1)
+    ok_line = "FORBIDDEN" in txt and (str(nat.date()) in txt if ok_nat else False)
+    print("(7) forbid-control: natural pick exists (%s); forbidding it reroutes to another "
+          "same-weekday in-window candidate (%s); the forbidden date appears in no pair (%s); "
+          "report names it (%s)" % (ok_nat, ok_rerouted, ok_absent, ok_line))
+    return bool(ok_nat and ok_rerouted and ok_absent and ok_line)
+
+
 def check_cli():
     s = _flat_series([("2020-03-16", 3.0), ("2022-06-13", 2.5), ("2024-08-05", 2.7)])
     with tempfile.TemporaryDirectory() as td:
@@ -219,7 +249,7 @@ def check_cli():
 
 def main():
     checks = [check_selection_and_episodes, check_control_rules, check_power_math,
-              check_screen_col, check_data_floor, check_cli]
+              check_screen_col, check_data_floor, check_forbid_control, check_cli]
     res = []
     for fn in checks:
         try:

@@ -38,7 +38,8 @@ import numpy as np
 import pandas as pd
 
 # the shipped default sample (run_paper_replication.sh); --compare ranks these
-# v0.9.83 (data floor 2017-06-26 applied; MIDAS carries no futures before it).
+# v0.9.85 (data floor 2017-06-26; 2017-12-05 forbidden as control -- lossy SPY capture,
+# CHECK 10 verdict DATA -- so 2018-12-04 pairs with 2017-11-28).
 # v0.9.79: the DESIGNED sample (design_sample.py on the committed V-Lab series;
 # see run_paper_replication.sh for the full provenance comment). First 34 volatile
 # pair positionally with the 34 baselines; the last 6 are unpairable under the
@@ -51,7 +52,7 @@ DEFAULT_VOLATILE = ["2018-06-25", "2018-10-04", "2018-10-10", "2018-12-04", "201
                     "2017-08-10", "2017-09-05", "2018-01-29", "2018-02-02", "2018-02-05",
                     "2018-03-19", "2018-03-22", "2018-05-29", "2020-01-27", "2020-02-24",
                     "2022-06-13", "2023-03-09"]
-DEFAULT_BASELINE = ["2017-06-26", "2017-10-05", "2017-10-25", "2017-12-05", "2018-03-23",
+DEFAULT_BASELINE = ["2017-06-26", "2017-10-05", "2017-10-25", "2017-11-28", "2018-03-23",
                     "2018-08-06", "2019-05-14", "2019-06-13", "2019-09-05", "2019-10-28",
                     "2020-01-29", "2020-02-27", "2020-12-11", "2021-02-04", "2023-07-26",
                     "2023-08-07", "2023-09-05", "2023-12-20", "2024-01-29", "2024-02-23",

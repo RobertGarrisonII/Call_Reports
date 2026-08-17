@@ -201,14 +201,18 @@ def pick_control(day, series: pd.Series, level_caps, forbidden: set, floor=None)
 
 
 def assign_controls(days, series: pd.Series, control_max_q: float, qualifying: set,
-                    fallback_q: float = 0.75, floor=None):
+                    fallback_q: float = 0.75, floor=None, forbid=None):
     """Controls for `days` in order (highest-priority first). -> DataFrame with
     the screen quantile each pair needed (screen_q > control_max_q marks the
-    relaxed pairs -- report them, they are controls with a caveat)."""
+    relaxed pairs -- report them, they are controls with a caveat). `forbid`:
+    dates that may NEVER serve as controls -- days whose TAPE is known bad
+    (2017-12-05: the SPY capture is missing in-session removals across five
+    feeds, CHECK 10 verdict DATA); the volatility record is fine, the data are
+    not, so the picker routes around them and takes the next-best candidate."""
     caps = [(control_max_q, float(series.quantile(control_max_q)))]
     if fallback_q > control_max_q:
         caps.append((fallback_q, float(series.quantile(fallback_q))))
-    used = set()
+    used = set(pd.Timestamp(x).normalize() for x in (forbid or ()))
     rows = []
     for d in days:
         c, gap, sq, why = pick_control(d, series, caps, qualifying | used, floor=floor)
@@ -257,7 +261,7 @@ def day_sd_from_csv(path: str, metric: str = "CS_ES") -> float:
 # ── report ────────────────────────────────────────────────────────────────────
 def build_design(series, stat_kind, window, threshold_q, episode_gap, max_per_episode,
                  control_max_q, mid_band, n_mid, diff, day_sd, alpha, power,
-                 screen_series=None, data_floor=None):
+                 screen_series=None, data_floor=None, forbid_controls=None):
     """screen_series: optional SECOND series for the control screen (e.g. the
     MF2-GARCH long-run Trend component while selection runs on the total
     volatility's innovation). The two-component split is the point of using
@@ -286,11 +290,14 @@ def build_design(series, stat_kind, window, threshold_q, episode_gap, max_per_ep
         dropped_floor = [d for d in vol_days if d < floor]
         vol_days = [d for d in vol_days if d >= floor]
     qualifying = set(sel.index)
-    ctl = assign_controls(vol_days, scr, control_max_q, qualifying, floor=floor)
+    forbid = [pd.Timestamp(x).normalize() for x in (forbid_controls or ())]
+    ctl = assign_controls(vol_days, scr, control_max_q, qualifying, floor=floor,
+                          forbid=forbid)
     mid_days = select_mid_band(s, st, mid_band, n_mid, qualifying)
     if floor is not None:
         mid_days = [d for d in mid_days if d >= floor]
-    mid_ctl = assign_controls(mid_days, scr, control_max_q, qualifying, floor=floor) \
+    mid_ctl = assign_controls(mid_days, scr, control_max_q, qualifying, floor=floor,
+                              forbid=forbid) \
         if mid_days else pd.DataFrame()
     n_vol = len(vol_days)
     paired = ctl[ctl["control"].notna()]
@@ -298,6 +305,7 @@ def build_design(series, stat_kind, window, threshold_q, episode_gap, max_per_ep
     pw = achieved_power(diff, day_sd, len(paired), len(paired), alpha)
     return {"series_window": (str(s.index[0].date()), str(s.index[-1].date())),
             "data_floor": (str(floor.date()) if floor is not None else None),
+            "forbidden_controls": [str(d.date()) for d in forbid],
             "dropped_below_floor": [str(d.date()) for d in dropped_floor],
             "threshold": float(sel.attrs.get("threshold", np.nan)),
             "selected": sel, "volatile": vol_days, "controls": ctl,
@@ -322,6 +330,9 @@ def render(design) -> str:
                  % (design["data_floor"],
                     "; dropped below floor: " + ", ".join(design["dropped_below_floor"])
                     if design["dropped_below_floor"] else ""))
+    if design.get("forbidden_controls"):
+        L.append("controls FORBIDDEN (tape known bad on those dates): %s"
+                 % ", ".join(design["forbidden_controls"]))
     L.append("selection: %s >= q%.2f (threshold %.4f); episodes joined at <=%d trading days;"
              % (p["stat"], p["threshold_q"], design["threshold"], p["episode_gap"]))
     L.append("           max %d day(s)/episode; control screen: level <= q%.2f"
@@ -423,6 +434,11 @@ def main(argv=None) -> int:
     ap.add_argument("--data-floor", default="",
                     help="earliest date the tape can supply (MIDAS: 2017-06-26 for futures); "
                          "selected days and controls below it are excluded and reported")
+    ap.add_argument("--forbid-control", default="",
+                    help="CSV of dates that may never serve as controls -- days whose TAPE is "
+                         "known bad (2017-12-05: SPY capture missing in-session removals, "
+                         "debug_crossing CHECK 10 verdict DATA); the picker takes the "
+                         "next-best same-weekday candidate instead")
     ap.add_argument("--control-max-q", type=float, default=0.50,
                     help="control days must sit below this vol-LEVEL quantile")
     ap.add_argument("--mid-band", default="0.55:0.85", help="quantile band for dose-response days")
@@ -453,7 +469,8 @@ def main(argv=None) -> int:
                           a.episode_gap, a.max_per_episode, a.control_max_q,
                           (float(b0), float(b1)), a.n_mid, a.diff, day_sd,
                           a.alpha, a.power, screen_series=scr,
-                          data_floor=(a.data_floor or None))
+                          data_floor=(a.data_floor or None),
+                          forbid_controls=[x for x in a.forbid_control.split(",") if x])
     txt = render(design)
     print(txt)
     if a.emit_args:
