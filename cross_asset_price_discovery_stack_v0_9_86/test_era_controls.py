@@ -181,6 +181,48 @@ def check_ex_straddle_row():
     return bool(ok_row and ok_n and ok_which and ok_p and ok_mean)
 
 
+def check_within_pair_is_twin():
+    """(v0.9.87) The within-pair test must cover the IS metric, not only CS. The 20260817
+    run's only significant regime result was the free-permutation IS test; era-robust
+    within-pair inference existed only for CS, so the IS result had no era-robust
+    counterpart on the record. Planted DGP: per-day table where IS_mid_ES carries a +0.30
+    pair difference and CS_ES carries none -- the IS twin must reject, the CS row must
+    not, and the suffixed keys (incl. the ex-straddle twin) must all be present."""
+    import numpy as np
+    import pandas as pd
+    import run_analysis as ra
+    rng = np.random.default_rng(11)
+    vol = [str(pd.Timestamp("2024-01-01") + pd.Timedelta(days=7 * i)).split()[0] for i in range(12)]
+    ben = [str(pd.Timestamp("2023-01-02") + pd.Timedelta(days=7 * i)).split()[0] for i in range(12)]
+    rows = []
+    for i, (v, b) in enumerate(zip(vol, ben)):
+        base_cs = 0.40 + rng.normal(0, 0.02)
+        rows.append({"date": v, "regime": "volatile",
+                     "CS_ES": base_cs + rng.normal(0, 0.01),
+                     "IS_mid_ES": 0.45 + 0.30 + rng.normal(0, 0.02)})
+        rows.append({"date": b, "regime": "benchmark",
+                     "CS_ES": base_cs + rng.normal(0, 0.01),
+                     "IS_mid_ES": 0.45 + rng.normal(0, 0.02)})
+    per_day = pd.DataFrame(rows).set_index("date")
+    out = {}
+    out.update(ra._within_pair_tests(per_day, vol, ben, metric="CS_ES"))
+    out.update(ra._within_pair_tests(per_day, vol, ben, metric="IS_mid_ES", key_suffix="_IS"))
+    keys_ok = all(k in out for k in ("regime_test_within_pair", "regime_test_within_pair_IS",
+                                     "regime_test_within_pair_ex_straddle",
+                                     "regime_test_within_pair_ex_straddle_IS"))
+    p_is = out.get("regime_test_within_pair_IS", {}).get("p_perm", 1.0)
+    p_cs = out.get("regime_test_within_pair", {}).get("p_perm", 0.0)
+    d_is = out.get("regime_test_within_pair_IS", {}).get("mean_pair_diff", 0.0)
+    a = keys_ok
+    b_ = p_is < 0.05 and abs(d_is - 0.30) < 0.05
+    c = p_cs > 0.1
+    ok = a and b_ and c
+    print("(8) within-pair IS twin: suffixed keys present (%s); planted IS pair diff %.3f "
+          "detected p=%.4f (%s); null CS row does not reject p=%.3f (%s) : %s"
+          % (a, d_is, p_is, b_, p_cs, c, ok))
+    return bool(ok)
+
+
 def check_es_stale_frac():
     """(v0.9.87) The per-day ES staleness covariate: a planted frame with the ES top
     frozen on a known block of open rows must yield exactly frozen/open to 1e-6, with
@@ -246,6 +288,7 @@ def check_es_stale_frac():
 
 def main():
     checks = [check_double_dissociation, check_era_flags, check_straddle, check_wiring,
+              check_within_pair_is_twin,
               check_ex_straddle_row, check_es_stale_frac]
     res = []
     for fn in checks:

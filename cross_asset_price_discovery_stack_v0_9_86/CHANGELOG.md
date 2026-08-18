@@ -50,6 +50,15 @@
   frame itself excluding halt and post-early-close rows -- the dose-response
   covariate for the staleness robustness spec.
 
+* **The within-pair IS twin** (run_analysis). The 20260817 run's only
+  significant regime result was the free-permutation IS test (p = 0.032 at
+  1s), and the era-robust within-pair design existed only for CS -- where it
+  reverses sign (p = 0.976). The within-pair and ex-straddle tests now run on
+  IS_mid_ES as well (regime_test_within_pair_IS, regime_p_IS_within_pair
+  picks), so the primary metric's regime claim has its era-robust counterpart
+  on every future run. Gate check (8) in test_era_controls plants an IS-only
+  pair difference: the IS twin rejects, the CS row does not.
+
 Gates test_table5_inference.py, test_lp_table9.py, test_staleness_bias.py
 registered in STAGE 1 (44 gates); checks appended to test_copula_tables,
 test_era_controls, test_memo_items. All new/changed gates verified on numpy

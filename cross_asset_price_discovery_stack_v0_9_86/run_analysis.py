@@ -380,7 +380,7 @@ def run_liquidity_curves(sessions, args):
                      "total_depth": float(np.nanmean(m[f"{a}_bid_total_depth"]))})
     return {"sample_session": str(date), "bid_curve_means": pd.DataFrame(rows)}
 
-def _within_pair_tests(per_day, vol_l, ben_l, metric="CS_ES"):
+def _within_pair_tests(per_day, vol_l, ben_l, metric="CS_ES", key_suffix=""):
     """The v0.9.82 era-robust within-pair sign-flip on the positional (volatile,
     benchmark) pairs, PLUS its ex-straddle variant: a pair whose two legs sit on opposite
     sides of a SHARP market-structure break (market_eras.pair_straddle -- the 2025-11-03
@@ -390,12 +390,13 @@ def _within_pair_tests(per_day, vol_l, ben_l, metric="CS_ES"):
     signature; the exclusion is derived from the SAME volatile/benchmark lists, no extra
     configuration. Returns the result dict(s) keyed for the results/summary plumbing."""
     out = {}
+    k1 = "regime_test_within_pair" + key_suffix
+    k2 = "regime_test_within_pair_ex_straddle" + key_suffix
     prs = list(zip([str(d).strip() for d in vol_l], [str(d).strip() for d in ben_l]))
     try:
-        out["regime_test_within_pair"] = pds.compare_regimes(per_day, metric=metric,
-                                                             pairs=prs)
+        out[k1] = pds.compare_regimes(per_day, metric=metric, pairs=prs)
     except Exception as e:
-        out["regime_test_within_pair_error"] = str(e)
+        out[k1 + "_error"] = str(e)
     try:
         import market_eras as me
 
@@ -411,9 +412,9 @@ def _within_pair_tests(per_day, vol_l, ben_l, metric="CS_ES"):
         r = pds.compare_regimes(per_day, metric=metric, pairs=keep)
         r["n_pairs_excluded"] = len(prs) - len(keep)
         r["excluded_pairs"] = sorted("%s/%s" % vb for vb in bad)
-        out["regime_test_within_pair_ex_straddle"] = r
+        out[k2] = r
     except Exception as e:
-        out["regime_test_within_pair_ex_straddle_error"] = str(e)
+        out[k2 + "_error"] = str(e)
     return out
 
 
@@ -466,6 +467,12 @@ def run_information_shares(sessions, args):
         vol_l, ben_l = getattr(args, "volatile", None), getattr(args, "benchmark", None)
         if vol_l and ben_l:
             res.update(_within_pair_tests(per_day, vol_l, ben_l, metric="CS_ES"))
+            # v0.9.87: the IS twin. The 20260817 run's ONLY significant regime result was
+            # the free-permutation IS test; the era-robust within-pair design existed only
+            # for CS, so that result had no era-robust counterpart on the record. IS is the
+            # primary metric (CS is the lag/kappa-fragile one) -- the pair test must cover it.
+            res.update(_within_pair_tests(per_day, vol_l, ben_l, metric="IS_mid_ES",
+                                          key_suffix="_IS"))
     try: res["panel_vecm"] = pds.panel_vecm(mids, n_lags=args.n_lags)
     except Exception as e: res["panel_vecm_error"] = str(e)
     return res
@@ -848,7 +855,10 @@ def _scalar_summary(results):
                       ("regime_test_kappa_weighted", "regime_p_CS_kappa_w"),
                       ("regime_test_within_pair", "regime_p_CS_within_pair"),
                       ("regime_test_within_pair_ex_straddle",
-                       "regime_p_CS_within_pair_ex_straddle")):
+                       "regime_p_CS_within_pair_ex_straddle"),
+                      ("regime_test_within_pair_IS", "regime_p_IS_within_pair"),
+                      ("regime_test_within_pair_ex_straddle_IS",
+                       "regime_p_IS_within_pair_ex_straddle")):
         rt = g(["information_shares", key])
         if isinstance(rt, dict):
             s[name] = rt.get("p_perm")
