@@ -109,6 +109,11 @@ def build_parser():
                          "no criterion -- the bar DV has no window to chase)")
     ap.add_argument("--n-boot", type=int, default=499,
                     help="day-level cluster-bootstrap draws for the mediation CI")
+    ap.add_argument("--controls-standardize", choices=["pooled", "day"], default="pooled",
+                    help="mediation-panel control scaling: 'pooled' (legacy default; one "
+                         "SD across the whole panel) or 'day' (within-day; makes the "
+                         "panel invariant to a per-day level+scale break in the "
+                         "spread/state controls, e.g. the 2025-11-03 tick regime)")
     ap.add_argument("--ms-boot", type=int, default=99,
                     help="parametric-bootstrap LR draws per day PER STAGE for the "
                          "sequential MS regime-count test")
@@ -179,6 +184,16 @@ def main(argv=None):
     _emit(pt.Table("Tandem flow by a-priori regime (Tier 1)", df1.round(4), n1),
           f"flow_corr_tier1_{tag}b{a.bar_seconds}s", a.out_dir)
 
+    # Tier 1 per-day rows with the ES top-of-book staleness covariate (es_stale_frac,
+    # halt/early-close rows out of the denominator) -- the cross-era control lives in
+    # the same CSV as the per-day estimands.
+    per_day1 = fc.tier1_per_day(sessions, bars=bars)
+    if a.out_dir and not per_day1.empty:
+        os.makedirs(a.out_dir, exist_ok=True)
+        pd_path = os.path.join(a.out_dir, f"flow_corr_tier1_per_day_{tag}b{a.bar_seconds}s.csv")
+        per_day1.to_csv(pd_path, index=False)
+        print(f"wrote {pd_path} ({len(per_day1)} day rows, es_stale_frac included)")
+
     print("[flow] downside/upside semicorrelation asymmetry ...", flush=True)
     dfa, na = fc.table_flow_corr_asymmetry(sessions, a.n_levels, a.min_rest_steps,
                                            a.ar_order, n_flip=a.n_perm, seed=a.seed)
@@ -190,10 +205,14 @@ def main(argv=None):
         df2, n2 = fc.table_flow_corr_mediation(sessions, a.bar_seconds, a.n_levels,
                                                a.min_rest_steps, a.ar_order,
                                                n_lags=a.n_lags, n_boot=a.n_boot,
-                                               seed=a.seed, bars=bars)
+                                               seed=a.seed, bars=bars,
+                                               controls_standardize=a.controls_standardize)
+        # non-default scaling gets its own stem so a 'day' pass never overwrites the
+        # legacy pooled table
+        med_stem = f"flow_corr_mediation_{tag}b{a.bar_seconds}s_p{a.n_lags}" + \
+            ("" if a.controls_standardize == "pooled" else "_ctlday")
         _emit(pt.Table("Does tandem flow mediate the RV -> return-correlation link? (Tier 2)",
-                       df2, n2),
-              f"flow_corr_mediation_{tag}b{a.bar_seconds}s_p{a.n_lags}", a.out_dir)
+                       df2, n2), med_stem, a.out_dir)
     except Exception as e:
         print(f"[flow] mediation FAILED: {type(e).__name__}: {e}")
 

@@ -306,14 +306,38 @@ def _regime_order(labels):
     return [r for r in pref if r in seen] + sorted(r for r in seen if r not in pref)
 
 
-def table_flow_corr_regimes(sessions, bar_seconds=60, n_levels=10, min_rest_steps=0,
-                            ar_order=5, n_perm=20000, seed=0, bars=None):
-    """Tier 1 -> (DataFrame, notes). Rows: each a-priori regime plus the
-    volatile-minus-benchmark contrast; columns: mean flow correlation (tanh of the mean
-    day-level z), mean z, day-clustered SE, within-day corr(z_flow, book state), days,
-    bars. The contrast row carries the day-level permutation p."""
-    bars = per_day_bars(sessions, bar_seconds, n_levels, min_rest_steps, ar_order) \
-        if bars is None else bars
+def es_stale_frac(df, date=None):
+    """Fraction of OPEN grid rows whose ES top of book (bid1, ask1) equals the previous
+    row's -- the per-day staleness covariate for the Tier 1 per-day table.
+
+    Why it exists: the 2025-11-03 tick-regime break changes what a book update MEANS
+    (half-penny quoting, ~40-share round lots), so any cross-era read of the flow tables
+    needs a per-day measure of how often the ES top actually moves sitting in the same
+    CSV as the estimands. Computed from the session frame alone -- no cross-stage
+    plumbing. Halt rows (market_halts.halt_mask) and post-early-close rows
+    (early_close_mask) leave the DENOMINATOR: a closed market is stale by construction
+    and would read as a data property of exactly the stressed/half-day sessions. A row
+    whose predecessor is masked (NaN top) compares unequal, so reopen rows never count
+    as stale. NaN when the frame has no open rows. ``date`` defaults to the index's own
+    date; an unparseable label (demo fixtures) falls back to the index."""
+    import market_halts as mh
+    if date is not None:
+        try:
+            date = str(pd.Timestamp(str(date)[:10]).date())
+        except (ValueError, TypeError):
+            date = None
+    a1 = df["ES_askprice_1"].to_numpy(float)
+    b1 = df["ES_bidprice_1"].to_numpy(float)
+    stale = np.zeros(len(df), bool)
+    if len(df) > 1:
+        stale[1:] = (a1[1:] == a1[:-1]) & (b1[1:] == b1[:-1])
+    open_m = ~(mh.halt_mask(df.index, date=date) | mh.early_close_mask(df.index, date=date))
+    n = int(open_m.sum())
+    return float(stale[open_m].sum() / n) if n else float("nan")
+
+
+def _tier1_day_rows(bars):
+    """Per-day Tier 1 rows (date, regime, mean z_flow, n_bars, corr with book state)."""
     rows = []
     for date, regime, b in bars:
         z = b["z_flow"].to_numpy(float)
@@ -325,7 +349,35 @@ def table_flow_corr_regimes(sessions, bar_seconds=60, n_levels=10, min_rest_step
         rows.append({"date": str(date), "regime": str(regime),
                      "z_flow": float(np.nanmean(z)), "n_bars": int(m.sum()),
                      "corr_state": c_state})
-    per_day = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+def tier1_per_day(sessions, bars=None, bar_seconds=60, n_levels=10, min_rest_steps=0,
+                  ar_order=5):
+    """The Tier 1 PER-DAY table with the staleness covariate -> DataFrame[date, regime,
+    z_flow, n_bars, corr_state, es_stale_frac]. The aggregated Tier 1 exhibit averages
+    these rows; exporting them per day (with es_stale_frac from the session frame, see
+    es_stale_frac) is what lets a cross-era regression control for the tick-regime
+    change in ES top-of-book update frequency."""
+    bars = per_day_bars(sessions, bar_seconds, n_levels, min_rest_steps, ar_order) \
+        if bars is None else bars
+    per_day = _tier1_day_rows(bars)
+    if per_day.empty:
+        return per_day
+    stale = {str(date): es_stale_frac(df, date=date) for date, _r, df in sessions}
+    per_day["es_stale_frac"] = per_day["date"].map(stale)
+    return per_day
+
+
+def table_flow_corr_regimes(sessions, bar_seconds=60, n_levels=10, min_rest_steps=0,
+                            ar_order=5, n_perm=20000, seed=0, bars=None):
+    """Tier 1 -> (DataFrame, notes). Rows: each a-priori regime plus the
+    volatile-minus-benchmark contrast; columns: mean flow correlation (tanh of the mean
+    day-level z), mean z, day-clustered SE, within-day corr(z_flow, book state), days,
+    bars. The contrast row carries the day-level permutation p."""
+    bars = per_day_bars(sessions, bar_seconds, n_levels, min_rest_steps, ar_order) \
+        if bars is None else bars
+    per_day = _tier1_day_rows(bars)
     if per_day.empty:
         return pd.DataFrame(), "no usable sessions"
 
@@ -386,9 +438,21 @@ def _day_design(b, n_lags):
     return d
 
 
-def _fe_panel(bars, n_lags):
-    """Stack per-day designs: standardize the controls POOLED (per-1-SD coefficients),
-    demean EVERY column within day (day FE), drop non-finite rows. Returns (frame, day)."""
+def _fe_panel(bars, n_lags, controls_standardize="pooled"):
+    """Stack per-day designs: standardize the controls (see below), demean EVERY column
+    within day (day FE), drop non-finite rows. Returns (frame, day).
+
+    controls_standardize='pooled' (legacy, default): one mean/SD across the whole panel,
+    so coefficients read per 1 pooled SD. 'day': each control standardized WITHIN its own
+    day. The day variant exists for the 2025-11-03 tick-regime break: half-penny quoting
+    changes the LEVEL and SCALE of the spread controls, and pooled scaling lets that break
+    leak into the per-SD coefficients (post-break days contribute spread variation on a
+    different ruler). A per-day affine transform of any control is exactly undone by
+    within-day standardization, so the 'day' panel is invariant to the break by
+    construction. Day FE remove the level either way; the scale is what 'day' fixes."""
+    if controls_standardize not in ("pooled", "day"):
+        raise ValueError("controls_standardize must be 'pooled' or 'day', got %r"
+                         % (controls_standardize,))
     frames, days = [], []
     for date, _r, b in bars:
         d = _day_design(b, n_lags)
@@ -397,10 +461,17 @@ def _fe_panel(bars, n_lags):
     if not frames:
         return pd.DataFrame(), np.array([])
     big = pd.concat(frames, axis=0, ignore_index=True)
-    for c in _CONTROLS:
-        v = big[c].to_numpy(float)
-        sd = np.nanstd(v)
-        big[c] = (v - np.nanmean(v)) / (sd if sd > EPS else 1.0)
+    if controls_standardize == "day":
+        g = big.groupby("__day")
+        for c in _CONTROLS:
+            mu = g[c].transform(lambda s: np.nanmean(s.to_numpy(float)))
+            sd = g[c].transform(lambda s: np.nanstd(s.to_numpy(float)))
+            big[c] = (big[c] - mu) / sd.where(sd > EPS, 1.0)
+    else:
+        for c in _CONTROLS:
+            v = big[c].to_numpy(float)
+            sd = np.nanstd(v)
+            big[c] = (v - np.nanmean(v)) / (sd if sd > EPS else 1.0)
     cols = [c for c in big.columns if c != "__day"]
     big[cols] = big.groupby("__day")[cols].transform(lambda s: s - s.mean())
     m = np.all(np.isfinite(big[cols].to_numpy(float)), axis=1)
@@ -423,15 +494,16 @@ def _norm_p(t):
     return float(2.0 * (1.0 - _norm_cdf(abs(t)))) if np.isfinite(t) else np.nan
 
 
-def mediation_from_bars(bars, n_lags=3, n_boot=499, seed=0):
+def mediation_from_bars(bars, n_lags=3, n_boot=499, seed=0, controls_standardize="pooled"):
     """Tier 2 core on prepared per-day bars -> dict of the three regressions plus the
     RV_ES mediation decomposition with a day-level cluster-bootstrap CI.
 
     Eq A : dz_flow ~ FE + dz_flow lags + controls(L1)
     Eq B0: dz_ret  ~ FE + dz_ret lags + controls(L1)            (total)
     Eq B1: dz_ret  ~ FE + dz_ret lags + controls(L1) + dz_flow  (direct + mediator)
-    indirect(RV_ES) = beta_total - beta_direct; share = indirect / beta_total."""
-    panel, day = _fe_panel(bars, n_lags)
+    indirect(RV_ES) = beta_total - beta_direct; share = indirect / beta_total.
+    controls_standardize: 'pooled' (legacy) or 'day' -- see _fe_panel."""
+    panel, day = _fe_panel(bars, n_lags, controls_standardize=controls_standardize)
     if panel.empty or len(panel) < 10 * (n_lags + len(_CONTROLS)):
         raise ValueError("not enough finite bar rows for the mediation panel")
     la_f = [f"dz_flow_l{i}" for i in range(1, n_lags + 1)]
@@ -481,12 +553,15 @@ def mediation_from_bars(bars, n_lags=3, n_boot=499, seed=0):
 
 
 def table_flow_corr_mediation(sessions, bar_seconds=60, n_levels=10, min_rest_steps=0,
-                              ar_order=5, n_lags=3, n_boot=499, seed=0, bars=None):
+                              ar_order=5, n_lags=3, n_boot=499, seed=0, bars=None,
+                              controls_standardize="pooled"):
     """Tier 2 -> (DataFrame, notes). Columns: Eq A (d z_flow), Eq B total (d z_ret without
-    the mediator), Eq B direct (with it). Coefficients x100, per 1 SD of each control."""
+    the mediator), Eq B direct (with it). Coefficients x100, per 1 SD of each control
+    (pooled SD by default; per-day SD under controls_standardize='day')."""
     bars = per_day_bars(sessions, bar_seconds, n_levels, min_rest_steps, ar_order) \
         if bars is None else bars
-    res = mediation_from_bars(bars, n_lags=n_lags, n_boot=n_boot, seed=seed)
+    res = mediation_from_bars(bars, n_lags=n_lags, n_boot=n_boot, seed=seed,
+                              controls_standardize=controls_standardize)
 
     def _cell(bvec, svec, j):
         b, s = 100.0 * bvec[j], 100.0 * svec[j]
@@ -515,12 +590,15 @@ def table_flow_corr_mediation(sessions, bar_seconds=60, n_levels=10, min_rest_st
                                    if np.isfinite(res["share"]) else "--")}
     df = pd.DataFrame(rows).T
     df.index.name = "regressor"
-    notes = ("Bar-level FE panel (%d days, %d rows, %ds bars): every column demeaned within "
-             "day, controls standardized pooled (coefficients x100 per 1 SD), day-clustered "
-             "SEs in parentheses. Signed OFI is excluded by construction and all controls "
-             "enter at lag 1 (same-bar RV shares sub-returns with the same-bar correlation "
-             "estimate). Indirect effect and share via day-level cluster bootstrap "
-             "(%d/%d draws usable), 95%% percentile CI."
+    std_txt = ("pooled (coefficients x100 per 1 SD)" if controls_standardize == "pooled"
+               else "WITHIN DAY (coefficients x100 per 1 day-SD; invariant to a per-day "
+                    "level+scale break in the controls, e.g. the 2025-11-03 tick regime)")
+    notes = (("Bar-level FE panel (%d days, %d rows, %ds bars): every column demeaned within "
+              "day, controls standardized " + std_txt + ", day-clustered "
+              "SEs in parentheses. Signed OFI is excluded by construction and all controls "
+              "enter at lag 1 (same-bar RV shares sub-returns with the same-bar correlation "
+              "estimate). Indirect effect and share via day-level cluster bootstrap "
+              "(%d/%d draws usable), 95%% percentile CI.")
              % (res["n_days"], res["n_rows"], bar_seconds, res["n_boot_ok"], n_boot))
     return df, notes
 

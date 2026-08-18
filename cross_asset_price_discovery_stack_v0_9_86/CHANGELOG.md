@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.9.87 -- the inference batch: five items from the 20260817 run review
+
+* **Day-clustered inference for the Table 5 corner log OR** (table5_inference.py,
+  run_table5_inference.py; STAGE 4 wiring). The Woolf SE treats pooled bars as
+  IID multinomial draws -- the run printed z = 159-214, a statement about the
+  bar count, not the evidence. Days are now the inference unit: per-day 3x3
+  COUNT matrices (the pooled log OR from summed counts equals
+  table5_from_sessions' point estimate to machine precision -- new inference,
+  old number), day bootstrap per panel (jackknife + caveat below 6 days, so
+  MWCB), and the within-pair sign-flip contrast of per-day log ORs with the
+  free permutation quoted beside it. Gate pins the z=214 pathology (Woolf
+  20.8x the day-cluster z on a planted serially-dependent DGP).
+* **Local-projection Table 9 counterpart** (lp_table9.py; STAGE 5, T9_LP=1
+  opt-in). Jorda projections per horizon on the bar frames: day FE, strictly
+  within-day windows (halt/day-boundary responses dropped, not zero-filled),
+  day-cluster bootstrap SEs, SVAR-IRF comparison column. Lag-order free, so
+  the AIC-at-bound / MA(W) window arguments cannot touch it. Gate demonstrates
+  the selling point rather than asserting it: a deliberately truncated SVAR(1)
+  on a VAR(3) DGP is biased at h>=2 (error 51 at h=3) while the LP stays
+  inside its CI (error 2.2).
+* **Nonparametric tail dependence beside the copula menu** (copula_garch
+  empirical_tail_dependence + tail_concentration; new *_np columns in the
+  copula tables). The run exposed the vulnerability: the t family wins 19/25
+  benchmark days and t FORCES lambda_L = lambda_U, so the parametric tail-
+  asymmetry test hinges on family selection. Schmidt-Stadtmueller-type
+  empirical lambdas at q=0.95 with the same per-day sign-flip test impose no
+  family. Gate: planted Clayton/Gumbel recover L>U / U>L against closed forms;
+  planted t shows |asym| < 0.05 -- the estimator does not manufacture
+  asymmetry where none exists.
+* **Measured staleness bias curve** (run_staleness_bias.py; STAGE 4d). Whether
+  carry-forward ES staleness biases the Tier-1 flow correlation up (refresh
+  clustering) or down (attenuation) is measured, not assumed: planted
+  rho_true through the REAL flow_corr_bars pipeline at stale fractions
+  0..0.95. Measured answer: ATTENUATION -- bias -0.90 z at s=0.85, monotone
+  (Spearman 1.0) -- so the mostly-stale benchmark regime is understated and
+  the volatile > benchmark Tier-1 gap is conservative under this mechanism.
+  Caveat carried in the output: the DGP's refresh times are independent of the
+  other leg, so the refresh-clustering channel is not in the curve. Also:
+  es_contract column in the QC table (kills the roll_rule_ok=NO ambiguity).
+* **Tick-regime controls wired** (flow_correlation, run_analysis).
+  --controls-standardize {pooled,day} for the mediation panel (day
+  standardization is invariant to the 2025-11-03 level+scale break in the
+  spread controls -- pinned in the gate; default pooled, legacy bit-identical;
+  FLOW_CTRL_STD=day in the driver); regime_test_within_pair_ex_straddle rows
+  dropping the two tick-straddling 2026 pairs (25 -> 23; on a DGP where only
+  the straddling pairs carry a spurious effect, p moves 0.255 -> 1.000);
+  es_stale_frac per-day column in the Tier-1 flow output, computed from the
+  frame itself excluding halt and post-early-close rows -- the dose-response
+  covariate for the staleness robustness spec.
+
+Gates test_table5_inference.py, test_lp_table9.py, test_staleness_bias.py
+registered in STAGE 1 (44 gates); checks appended to test_copula_tables,
+test_era_controls, test_memo_items. All new/changed gates verified on numpy
+2.4.6 and 1.26.4; legacy default outputs bit-identical throughout.
+
+
 ## v0.9.86 -- the offline ES activity table closes the contract-rule gaps
 
 The activity rule's lake head-read failed on six sample sessions ("could not

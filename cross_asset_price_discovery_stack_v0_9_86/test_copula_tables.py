@@ -16,6 +16,15 @@
       contrast in table_copula_flows with a small sign-flip p
   (6) driver/runner wiring: STAGE 5c calls run_copula.py; the parser carries the
       documented flags; the self-test jobs exist in build_all_tables
+  (7) nonparametric estimator vs a KNOWN answer: planted Clayton -> empirical lambda_L
+      at q=0.95 lands on the closed-form Clayton tail concentration C(u,u)=(2u^-th-1)^
+      (-1/th) evaluated at that level; upper concentration small; L beats U decisively
+  (8) planted Gumbel -> the mirror image (empirical U on its closed-form diagonal, U>L)
+  (9) planted symmetric t data -> the empirical asymmetry is ~0: the np estimator must
+      not manufacture asymmetry where none exists (it exists to REMOVE the constraint
+      channel, not to add a biased one)
+  (10) the *_np columns appear in the rendered regime/liquidity tables and the existing
+      parametric columns are byte-identical with and without the np record fields
 
 Run: python test_copula_tables.py
 """
@@ -190,6 +199,122 @@ def check_wiring():
     return ok1 and ok2 and ok3
 
 
+def _clayton_diag(w, th):
+    """Closed-form Clayton copula on the diagonal: C(w,w) = (2 w^-theta - 1)^(-1/theta)."""
+    return (2.0 * w**(-th) - 1.0)**(-1.0 / th)
+
+
+def _gumbel_diag(w, th):
+    """Closed-form Gumbel copula on the diagonal: C(w,w) = w^(2^(1/theta))."""
+    return w**(2.0**(1.0 / th))
+
+
+def check_np_clayton():
+    """WHY: the empirical estimator must land on a KNOWN answer, and the known answer at
+    fixed q is the level-q tail CONCENTRATION (not the asymptotic lambda) -- Clayton's
+    diagonal is closed-form, so both targets are exact by construction. Clayton is the
+    crash-only family: L must beat U decisively, which is exactly the asymmetry the
+    winning t family is structurally unable to report."""
+    import copula_garch as cg
+    th, q, n = 2.0, 0.95, 20000
+    rng = np.random.default_rng(202)
+    U = cg.pseudo_obs(cg.simulate_copula("clayton", n, {"theta": th}, rng))
+    e = cg.empirical_tail_dependence(U[:, 0], U[:, 1], q)
+    p = 1.0 - q
+    lo_true = _clayton_diag(p, th) / p                     # 0.7075 (limit lambda_L 0.7071)
+    up_true = (1.0 - 2.0 * q + _clayton_diag(q, th)) / p   # 0.1368 (limit lambda_U 0)
+    ok1 = abs(e["lambda_L"] - lo_true) < 0.08
+    ok2 = abs(e["lambda_U"] - up_true) < 0.08 and e["lambda_U"] < 0.30
+    ok3 = e["lambda_L"] > e["lambda_U"] + 0.30
+    # tail_concentration must agree with the point estimator on its grid
+    tc = cg.tail_concentration(U[:, 0], U[:, 1], qs=(0.90, 0.95, 0.99))
+    row = tc[np.isclose(tc["q"], q)].iloc[0]
+    ok4 = (abs(float(row["lower"]) - e["lambda_L"]) < 1e-12
+           and abs(float(row["upper"]) - e["lambda_U"]) < 1e-12
+           and list(tc.columns) == ["q", "lower", "upper"])
+    print(f"  clayton(th={th}): lL_np={e['lambda_L']:.3f} (closed-form {lo_true:.3f}), "
+          f"lU_np={e['lambda_U']:.3f} (closed-form {up_true:.3f}); grid consistent: {ok4}")
+    return ok1 and ok2 and ok3 and ok4
+
+
+def check_np_gumbel():
+    """WHY: the mirror image of the Clayton check -- a rally-tail family must produce
+    U > L in the empirical estimates, with both landing on Gumbel's closed-form diagonal
+    concentration. Also pins the documented finite-q bias in the honest direction: at
+    q=0.95 Gumbel's LOWER concentration is ~0.29 even though its limit lambda_L is 0 --
+    body dependence leaks into any fixed-level count, which is why the columns are
+    reported at fixed q and never extrapolated."""
+    import copula_garch as cg
+    th, q, n = 2.0, 0.95, 20000
+    rng = np.random.default_rng(203)
+    U = cg.pseudo_obs(cg.simulate_copula("gumbel", n, {"theta": th}, rng))
+    e = cg.empirical_tail_dependence(U[:, 0], U[:, 1], q)
+    p = 1.0 - q
+    lo_true = _gumbel_diag(p, th) / p                      # 0.289 (limit lambda_L 0)
+    up_true = (1.0 - 2.0 * q + _gumbel_diag(q, th)) / p    # 0.601 (limit lambda_U 0.586)
+    ok = (abs(e["lambda_U"] - up_true) < 0.08 and abs(e["lambda_L"] - lo_true) < 0.08
+          and e["lambda_U"] > e["lambda_L"] + 0.20)
+    print(f"  gumbel(th={th}): lU_np={e['lambda_U']:.3f} (closed-form {up_true:.3f}), "
+          f"lL_np={e['lambda_L']:.3f} (closed-form {lo_true:.3f}); U>L: "
+          f"{e['lambda_U'] > e['lambda_L'] + 0.20}")
+    return ok
+
+
+def check_np_symmetric_t():
+    """WHY: the np estimator exists because the t family FORCES lambda_L == lambda_U; it
+    is only a fair referee if it reports ~zero asymmetry when the truth IS symmetric.
+    On planted t data (radially symmetric by construction) the empirical L-minus-U must
+    stay inside sampling noise -- the estimator must not manufacture the asymmetry it was
+    brought in to adjudicate."""
+    import copula_garch as cg
+    rng = np.random.default_rng(204)
+    U = cg.pseudo_obs(cg.simulate_copula("t", 20000, {"rho": 0.5, "nu": 4.0}, rng))
+    e = cg.empirical_tail_dependence(U[:, 0], U[:, 1], 0.95)
+    asym = e["lambda_L"] - e["lambda_U"]
+    ok = abs(asym) < 0.05 and e["lambda_L"] > 0.1 and e["lambda_U"] > 0.1
+    print(f"  t(rho=0.5, nu=4): lL_np={e['lambda_L']:.3f} lU_np={e['lambda_U']:.3f} "
+          f"asym={asym:+.4f} (|asym| < 0.05: {abs(asym) < 0.05})")
+    return ok
+
+
+def check_np_columns_and_backcompat():
+    """WHY: the np columns are only credible BESIDE the parametric menu if adding them
+    changed nothing else -- so (a) the rendered regime table carries the five np columns
+    after the parametric block, (b) stripping the np fields from the per-day records
+    reproduces the previous table byte-identically (same columns, same values, same
+    order), and (c) the liquidity table carries its np thin/deep twin."""
+    import copula_garch as cg
+    import paper_tables as pt
+    fams = ("gaussian", "frank", "clayton", "gumbel", "joe")
+    days = [(f"2024-08-{d + 1:02d}", "volatile" if d % 2 else "benchmark",
+             _ret_frame(3000, 70 + d, down_mult=2.0)) for d in range(4)]
+    recs = cg.day_copula_records(days, fams, min_obs=500, trim_min=2.0)
+    t_new = cg._group_copula_rows(recs, n_flip=2000)
+    np_cols = ["median lambda_L_np", "median lambda_U_np", "mean np tail asym (L-U)",
+               "se(np asym)", "sign-flip p (np)"]
+    ok1 = all(c in t_new.columns for c in np_cols)
+    stripped = [{k: v for k, v in r.items() if k not in ("lL_np", "lU_np", "dlam_np")}
+                for r in recs]
+    t_old = cg._group_copula_rows(stripped, n_flip=2000)
+    old_cols = [c for c in t_new.columns if c not in np_cols]
+    ok2 = (list(t_old.columns) == old_cols
+           and list(t_new.columns)[:len(old_cols)] == old_cols
+           and t_new[old_cols].equals(t_old[old_cols]))
+    md = pt.Table("np check", t_new, "n").to_markdown()
+    ok3 = "lambda_L_np" in md and "sign-flip p (np)" in md
+    tl, _ = cg.table_copula_liquidity(days, min_obs=500, trim_min=2.0, n_flip=2000)
+    liq_np = ["median lambda_L_np thin", "median lambda_L_np deep",
+              "mean np delta (thin-deep)", "se(np delta)", "sign-flip p (np)"]
+    liq_old = ["median lambda_L thin", "median lambda_L deep", "mean delta (thin-deep)",
+               "se(delta)", "sign-flip p", "days"]
+    ok4 = (all(c in tl.columns for c in liq_np)
+           and list(tl.columns)[:len(liq_old)] == liq_old
+           and np.isfinite(float(tl.loc["all days", "mean np delta (thin-deep)"])))
+    print(f"  regime np cols present: {ok1}; parametric block byte-identical without np "
+          f"fields: {ok2}; markdown renders np: {ok3}; liquidity np twin: {ok4}")
+    return ok1 and ok2 and ok3 and ok4
+
+
 def main():
     warnings.simplefilter("ignore")
     checks = [("joe/frank densities integrate to 1", check_density_normalization),
@@ -197,7 +322,12 @@ def main():
               ("return-copula asymmetry: planted found, symmetric clean", check_return_asymmetry),
               ("liquidity table: end-to-end, no invented effect", check_liquidity_table),
               ("flow-copula asymmetry: planted tandem selling found", check_flow_asymmetry),
-              ("driver/runner/self-test wiring", check_wiring)]
+              ("driver/runner/self-test wiring", check_wiring),
+              ("np tail dependence: Clayton closed-form recovered", check_np_clayton),
+              ("np tail dependence: Gumbel mirror image", check_np_gumbel),
+              ("np tail dependence: symmetric t stays symmetric", check_np_symmetric_t),
+              ("np columns rendered; parametric block untouched",
+               check_np_columns_and_backcompat)]
     rc = 0
     for i, (name, fn) in enumerate(checks, 1):
         try:

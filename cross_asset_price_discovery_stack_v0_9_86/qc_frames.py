@@ -93,6 +93,12 @@ def qc_sessions(sessions, assets=("SPY", "ES"), crossed_tol: float = 0.005) -> p
                 row[f"{a}_luld_known"] = sm.get("luld_known", 0.0)
         except Exception:
             row["ssr_frac"] = float("nan"); row["luld_known"] = 0.0
+        # Which ES contract the frame was actually built on (stamped at extraction). The roll
+        # columns say whether the calendar pick LED the market; this says what the pick WAS --
+        # without it a roll-window session cannot be re-extracted pinned to the rival contract,
+        # and two frames of the same date built on different contracts are indistinguishable.
+        # Blank = extracted before the stamp existed, never "unknown is fine".
+        row["es_contract"] = str(df.attrs.get("es_contract") or "") if hasattr(df, "attrs") else ""
         # Roll split measured at extraction (measure_roll_at_extraction): which fraction of
         # two-contract futures volume / open interest the calendar pick actually carried, on
         # sessions near a roll boundary. n/m (NaN) = not in a roll window, or extracted before the

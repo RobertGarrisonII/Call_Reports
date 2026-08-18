@@ -15,6 +15,14 @@ and writes three tables:
   copula_flows_*       the copula on OFI INNOVATIONS: tandem-selling tail dependence, the
                        parametric twin of the semicorrelation exhibit
 
+Beside each parametric fit, every table carries model-free Schmidt-Stadtmueller-type
+EMPIRICAL tail-dependence columns (*_np) at --np-q (default 0.95): joint exceedance
+counts on the pseudo-observations, so they inherit no family constraint. This matters
+because the t family wins most benchmark days and t FORCES lambda_L == lambda_U -- with
+only the parametric columns, the tail-asymmetry test hinges on family selection. The np
+numbers are tail CONCENTRATION at the fixed level q, not the q->1 limit; compare them
+across days/regimes at the same q, never as asymptotic coefficients.
+
 Fit at the 1-second grid ONLY. At 10 ms, 80-89% of snapshots are stale tick repeats: the
 rank PIT degenerates into ties and the copula measures staleness, not dependence. (The
 driver runs this stage on the 1s frames and deliberately skips the fine grid.)
@@ -107,6 +115,10 @@ def build_parser():
                          "grid (inert at 1s)")
     ap.add_argument("--n-flip", type=int, default=20000,
                     help="day-level sign-flip draws for the asymmetry tests")
+    ap.add_argument("--np-q", type=float, default=0.95,
+                    help="exceedance level for the model-free empirical (*_np) "
+                         "tail-dependence columns; estimates tail concentration AT this "
+                         "level, not the q->1 limit")
     ap.add_argument("--no-halt-mask", dest="halt_mask", action="store_false", default=True)
     ap.add_argument("--out-dir", default="", help="write csv/md/tex per table here")
     ap.add_argument("--tag", default="", help="output-stem tag (the driver passes the grid)")
@@ -141,22 +153,23 @@ def main(argv=None):
         a.min_rest_steps = ca.frequency_defaults(sessions[0][2])["min_rest_steps"]
 
     print("[copula] return copulas by day ...", flush=True)
-    recs = cg.day_copula_records(sessions, fams, a.min_obs, a.trim_min, verbose=True)
+    recs = cg.day_copula_records(sessions, fams, a.min_obs, a.trim_min, verbose=True,
+                                 np_q=a.np_q)
     df1, n1 = cg.table_copula_regimes(sessions, fams, a.min_obs, a.trim_min,
-                                      n_flip=a.n_flip, recs=recs)
+                                      n_flip=a.n_flip, recs=recs, np_q=a.np_q)
     _emit(pt.Table("Return-tail dependence by regime (copula menu)", df1, n1),
           f"copula_regimes_{tag}t{int(a.trim_min)}m", a.out_dir)
 
     print("[copula] thin-vs-deep book split ...", flush=True)
     df2, n2 = cg.table_copula_liquidity(sessions, a.min_obs, a.trim_min, a.n_levels,
-                                        n_flip=a.n_flip, verbose=True)
+                                        n_flip=a.n_flip, verbose=True, np_q=a.np_q)
     _emit(pt.Table("Crash-tail dependence vs book depth (within-day)", df2, n2),
           f"copula_liquidity_{tag}t{int(a.trim_min)}m", a.out_dir)
 
     print("[copula] flow-innovation copulas ...", flush=True)
     df3, n3 = cg.table_copula_flows(sessions, fams, a.min_obs, a.trim_min, a.n_levels,
                                     a.min_rest_steps, a.ar_order, n_flip=a.n_flip,
-                                    verbose=True)
+                                    verbose=True, np_q=a.np_q)
     _emit(pt.Table("Tandem-flow tail dependence (OFI-innovation copula)", df3, n3),
           f"copula_flows_{tag}t{int(a.trim_min)}m", a.out_dir)
     return 0

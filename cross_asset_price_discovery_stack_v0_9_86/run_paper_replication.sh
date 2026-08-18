@@ -93,6 +93,8 @@
 #   MST_LAKEQUERY_RETRIES=3   vendor-query attempts before a fetch is believed to have failed
 #   FINE_N_BOOT=199           bootstrap draws for the FINE-grid Table 9 (1s keeps N_BOOT)
 #   FINE_T9_DCC=1             re-enable the DCC column at the fine grid (hours/session; see STAGE 5)
+#   T9_LP=1                   add the local-projection (lag-order-free) Table 9 counterpart
+#   FLOW_CTRL_STD=day         mediation control scaling: pooled (legacy) | day (tick-regime robust)
 #   FLOW_MS_BOOT=99           bootstrap LR draws per day for the STAGE 5b flow-regime test
 #   T9_LAG_BAND=lo:hi         STAGE 5 (1s): also refit Table 9 at EVERY lag order in the band and
 #                             write per-cell sign/star stability (table9_lag_band_*.csv). Off by
@@ -461,6 +463,9 @@ if have_stage 1; then
            test_design_sample.py \
            test_run_bundle.py \
            test_staleness_arms.py \
+           test_staleness_bias.py \
+           test_table5_inference.py \
+           test_lp_table9.py \
            test_era_controls.py \
            test_market_state.py ; do
     if [ "$DRY" -eq 1 ]; then info "(dry-run) would run $t"; continue; fi
@@ -917,6 +922,36 @@ print("\n  The published comparison uses the per-second null (0.4%) for all thre
 t7.to_csv(f"{out}/table7_frequency_matched_null.csv")
 EOF
   info "wrote ${OUT}/table5_corrected_null.csv, ${OUT}/table7_frequency_matched_null.csv"
+  # Day-clustered inference for the Table 5 corner log OR: re-scores the pooled
+  # panels with DAYS as the inference unit (the Woolf z=159-214 is a bar-count
+  # artifact) + the era-robust within-pair volatile-benchmark contrast.
+  if [ "$DRY" -eq 1 ]; then
+    info "(dry-run) would run run_table5_inference.py --out ${OUT}/nulls"
+  else
+    run_show $PY run_table5_inference.py --pickle "$FRAMES" --mwcb "$MWCB" \
+          --volatile "$VOLATILE" --benchmark "$BASELINE" \
+          --out "$OUT/nulls" --n-boot 2000 \
+      || info "Table 5 day-clustered inference FAILED -- see $LOG; continuing to STAGE 5"
+    info "wrote ${OUT}/nulls/table5_per_day.csv, ${OUT}/nulls/table5_inference.csv"
+  fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 4d — measured staleness bias curve for the Tier-1 flow correlation
+#
+# 25 of 66 sessions carry a stale ES ladder. Whether carry-forward staleness
+# biases the OFI-innovation flow correlation UP (refresh clustering) or DOWN
+# (attenuation) is measured, not assumed: a planted DGP with known rho_true
+# through the REAL flow_correlation.flow_corr_bars pipeline. Reads no frames.
+# ══════════════════════════════════════════════════════════════════════════════
+if have_stage 4; then
+  say "STAGE 4d  staleness bias curve for the Tier-1 flow correlation (planted DGP)"
+  if [ "$DRY" -eq 1 ]; then
+    info "(dry-run) would run run_staleness_bias.py --out ${OUT}/nulls"
+  else
+    run_show $PY run_staleness_bias.py --out "${OUT}/nulls" --n-days 24 --seed 0 --rho 0.75 \
+      || info "STAGE 4d FAILED -- see $LOG; continuing"
+  fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1111,6 +1146,32 @@ if have_stage 5; then
       info "the fine-grid pair, which is where the Epps gap should be largest"
     fi
   fi
+  # Local-projection counterpart to Table 9 (lag-order free; T9_LP=1 opts in).
+  # Per-horizon panel regressions with day FE and day-cluster bootstrap SEs --
+  # no lag truncation to fight about, so the AIC-at-bound / MA(W) window
+  # arguments cannot touch it; agreement with the SVAR IRF is the robustness
+  # statement (Plagborg-Moller/Wolf: same population IRFs).
+  if [ "${T9_LP:-0}" = "1" ]; then
+    LP_ARGS="--spec informational --n-lags ${N_LAGS} --pmax ${PMAX} --horizon 10 --n-boot ${N_BOOT}"
+    if [ "$SOURCE" = "demo" ]; then
+      # shellcheck disable=SC2086
+      run_show $PY lp_table9.py --source demo $LP_ARGS --out-dir "${OUT}/${INTERVAL}/table9" \
+        || info "STAGE 5 (LP Table 9, demo) FAILED -- see $LOG; continuing"
+    else
+      # shellcheck disable=SC2086
+      run_show $PY lp_table9.py --source load --pickle "$FRAMES" \
+          --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $LP_ARGS \
+          --out-dir "${OUT}/${INTERVAL}/table9" \
+        || info "STAGE 5 (LP Table 9, ${INTERVAL}) FAILED -- see $LOG; continuing"
+      if [ -n "${FINE_T9:-}" ] && [ "$FINE_T9" != "$FRAMES" ] && { [ "$DRY" -eq 1 ] || [ -f "$FINE_T9" ]; }; then
+        # shellcheck disable=SC2086
+        run_show $PY lp_table9.py --source load --pickle "$FINE_T9" \
+            --volatile "${VOLATILE},${MWCB}" --corr-window "$CORR_WINDOW" $LP_ARGS \
+            --n-boot "${FINE_N_BOOT:-199}" --out-dir "${OUT}/${FINE_INTERVAL}/table9" \
+          || info "STAGE 5 (LP Table 9, ${FINE_INTERVAL}) FAILED -- see $LOG; continuing"
+      fi
+    fi
+  fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1129,7 +1190,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 if have_stage 5; then
   say "STAGE 5b Tandem flow: Tier 1 regimes, Tier 2 mediation, data-driven MS regimes"
-  FLOWARGS="--n-boot ${N_BOOT} --ms-boot ${FLOW_MS_BOOT:-99} --out-dir ${OUT}/${INTERVAL}/flow"
+  FLOWARGS="--n-boot ${N_BOOT} --ms-boot ${FLOW_MS_BOOT:-99} --controls-standardize ${FLOW_CTRL_STD:-pooled} --out-dir ${OUT}/${INTERVAL}/flow"
   if [ "$SOURCE" = "demo" ]; then
     # shellcheck disable=SC2086
     run_show $PY run_flow_correlation.py --source demo --tag demo $FLOWARGS \

@@ -380,6 +380,43 @@ def run_liquidity_curves(sessions, args):
                      "total_depth": float(np.nanmean(m[f"{a}_bid_total_depth"]))})
     return {"sample_session": str(date), "bid_curve_means": pd.DataFrame(rows)}
 
+def _within_pair_tests(per_day, vol_l, ben_l, metric="CS_ES"):
+    """The v0.9.82 era-robust within-pair sign-flip on the positional (volatile,
+    benchmark) pairs, PLUS its ex-straddle variant: a pair whose two legs sit on opposite
+    sides of a SHARP market-structure break (market_eras.pair_straddle -- the 2025-11-03
+    tick regime is the one break so classified) mechanically contrasts two price-grid
+    regimes on top of two volatility regimes, so the same test is re-run with those pairs
+    dropped. Within-pair-significant but ex-straddle-not is the tick-break-confounding
+    signature; the exclusion is derived from the SAME volatile/benchmark lists, no extra
+    configuration. Returns the result dict(s) keyed for the results/summary plumbing."""
+    out = {}
+    prs = list(zip([str(d).strip() for d in vol_l], [str(d).strip() for d in ben_l]))
+    try:
+        out["regime_test_within_pair"] = pds.compare_regimes(per_day, metric=metric,
+                                                             pairs=prs)
+    except Exception as e:
+        out["regime_test_within_pair_error"] = str(e)
+    try:
+        import market_eras as me
+
+        def _d10(s):
+            try:
+                return str(pd.Timestamp(s).date())
+            except Exception:
+                return str(s)[:10]
+        strad = me.pair_straddle([v for v, _ in prs], [b for _, b in prs])
+        bad = (set() if strad.empty
+               else {(r["volatile"], r["baseline"]) for _i, r in strad.iterrows()})
+        keep = [p for p in prs if (_d10(p[0]), _d10(p[1])) not in bad]
+        r = pds.compare_regimes(per_day, metric=metric, pairs=keep)
+        r["n_pairs_excluded"] = len(prs) - len(keep)
+        r["excluded_pairs"] = sorted("%s/%s" % vb for vb in bad)
+        out["regime_test_within_pair_ex_straddle"] = r
+    except Exception as e:
+        out["regime_test_within_pair_ex_straddle_error"] = str(e)
+    return out
+
+
 def run_information_shares(sessions, args):
     mids = rb._mid_sessions(sessions)
     per_day = pds.estimate_sample(mids, n_lags=args.n_lags)
@@ -424,14 +461,11 @@ def run_information_shares(sessions, args):
         # pairs (positional zip of --volatile/--benchmark, the driver's convention),
         # so every comparison is two days ~a year apart. Free-significant but
         # within-pair-not is the era-confounding signature.
+        # (v0.9.87 adds the ex-straddle row beside it: pairs straddling the 2025-11-03
+        # tick-regime break dropped, derived from the same lists.)
         vol_l, ben_l = getattr(args, "volatile", None), getattr(args, "benchmark", None)
         if vol_l and ben_l:
-            try:
-                prs = list(zip([d.strip() for d in vol_l], [d.strip() for d in ben_l]))
-                res["regime_test_within_pair"] = pds.compare_regimes(
-                    per_day, metric="CS_ES", pairs=prs)
-            except Exception as e:
-                res["regime_test_within_pair_error"] = str(e)
+            res.update(_within_pair_tests(per_day, vol_l, ben_l, metric="CS_ES"))
     try: res["panel_vecm"] = pds.panel_vecm(mids, n_lags=args.n_lags)
     except Exception as e: res["panel_vecm_error"] = str(e)
     return res
@@ -812,7 +846,9 @@ def _scalar_summary(results):
         s["cojump_lead_p_flip"] = lt.get("p_flip")
     for key, name in (("regime_test", "regime_p_CS"), ("regime_test_IS", "regime_p_IS"),
                       ("regime_test_kappa_weighted", "regime_p_CS_kappa_w"),
-                      ("regime_test_within_pair", "regime_p_CS_within_pair")):
+                      ("regime_test_within_pair", "regime_p_CS_within_pair"),
+                      ("regime_test_within_pair_ex_straddle",
+                       "regime_p_CS_within_pair_ex_straddle")):
         rt = g(["information_shares", key])
         if isinstance(rt, dict):
             s[name] = rt.get("p_perm")

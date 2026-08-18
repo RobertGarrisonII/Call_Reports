@@ -321,6 +321,69 @@ def select_copula(U_or_Z, families=_FAMILIES, is_uniform=False) -> dict:
     return out
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Nonparametric (empirical) tail dependence — a model-free check on the menu
+# ════════════════════════════════════════════════════════════════════════════
+_NP_TAIL_Q = 0.95                                         # per-day reporting level
+
+
+def _emp_copula_diag(u, v, a):
+    """Empirical copula on the diagonal: C_n(a,a) = (1/n) * #{i : u_i <= a and v_i <= a}."""
+    return float(np.mean((u <= a) & (v <= a)))
+
+
+def empirical_tail_dependence(u, v, q: float = _NP_TAIL_Q) -> dict:
+    """Schmidt-Stadtmueller-type EMPIRICAL tail-dependence estimates at level q, no family
+    assumed:  lambda_L_hat = C_n(1-q, 1-q) / (1-q)  (joint lower-exceedance probability
+    over the marginal one) and  lambda_U_hat = (1 - 2q + C_n(q,q)) / (1-q)  (the survival
+    form: joint upper exceedance over marginal).
+
+    WHY. The lambda_L/lambda_U in the copula tables are read off the FITTED family, and
+    several families CONSTRAIN them: t forces lambda_L == lambda_U, Clayton forces
+    lambda_U = 0, Gumbel/Joe force lambda_L = 0. On day groups where such a family wins
+    the BIC (t wins most benchmark days), the tail-asymmetry evidence hinges on family
+    selection, not on the data's corners. These estimators are joint exceedance COUNTS on
+    the pseudo-observations — they cannot inherit a parametric constraint, so they sit
+    beside the parametric columns as the model-free cross-check.
+
+    FINITE-q BIAS. At fixed q these estimate tail CONCENTRATION at level q, not the limit
+    lambda = lim_{q->1}; they converge to the true lambda only as q -> 1 with
+    n(1-q) -> inf. Any copula with dependence in the body shows positive concentration at
+    q = 0.95 even when its limit lambda is 0 (Gaussian, or the crash-free tail of Gumbel).
+    Report at a fixed q and compare like with like across days/regimes — never read the
+    level-q number as the asymptotic coefficient, and never extrapolate. Feed rank-PIT
+    pseudo-observations so the marginals are exactly uniform and the only sampling noise
+    is in the joint counts. The survival form can dip an O(1/n) hair below 0 through
+    empirical-copula discreteness (Frechet bound C >= u+v-1 holds up to ties); it is
+    reported raw, not clipped."""
+    u = np.asarray(u, float); v = np.asarray(v, float)
+    m = np.isfinite(u) & np.isfinite(v)
+    u, v = u[m], v[m]
+    n = int(len(u))
+    if n == 0 or not (0.5 < q < 1.0):
+        return {"lambda_L": np.nan, "lambda_U": np.nan, "q": float(q), "n": n}
+    p = 1.0 - q
+    lam_L = _emp_copula_diag(u, v, p) / p
+    lam_U = (1.0 - 2.0 * q + _emp_copula_diag(u, v, q)) / p
+    return {"lambda_L": float(lam_L), "lambda_U": float(lam_U), "q": float(q), "n": n}
+
+
+def tail_concentration(u, v, qs=(0.80, 0.85, 0.90, 0.925, 0.95, 0.975, 0.99)) -> pd.DataFrame:
+    """Lower/upper tail-concentration functions on a q grid -> DataFrame(q, lower, upper),
+    with lower(q) = C_n(1-q,1-q)/(1-q) and upper(q) = (1-2q+C_n(q,q))/(1-q) — the same
+    estimators as ``empirical_tail_dependence``, traced toward the corner. The SHAPE is
+    the diagnostic: a curve flattening toward a positive level as q rises is the
+    model-free signature of genuine tail dependence, while a tail-free copula's curve
+    decays toward 0; a fitted family whose implied concentration path leaves this curve
+    is misallocating tail mass. The largest usable q is sample-size-limited (n(1-q) joint
+    exceedances at best) — the grid should stop well short of 1."""
+    rows = []
+    for q in qs:
+        e = empirical_tail_dependence(u, v, float(q))
+        rows.append({"q": float(q), "lower": e["lambda_L"], "upper": e["lambda_U"]})
+    return pd.DataFrame(rows)
+
+
 # ---- simulators (for the self-test / scenario work) ----
 def simulate_copula(name, n, params, rng=None):
     rng = rng or np.random.default_rng(0)
@@ -804,11 +867,13 @@ def _bb1_asym(u, v):
 
 
 def day_copula_records(sessions, families=_FAMILIES, min_obs=1000, trim_min=15.0,
-                       verbose=False):
+                       verbose=False, np_q=_NP_TAIL_Q):
     """Per-day copula fits on GARCH-margin pseudo-observations of the two legs' returns.
     Every record carries the BIC-selected family's tails AND the reflection-debiased BB1
     lower-minus-upper contrast (comparable across days regardless of which family wins,
-    with an exact symmetric null -- see _bb1_asym)."""
+    with an exact symmetric null -- see _bb1_asym), plus the model-free empirical tail
+    concentrations at level ``np_q`` (see empirical_tail_dependence: immune to the
+    family-constraint channel, e.g. t forcing lambda_L == lambda_U)."""
     fams = tuple(families) if "bb1" in families else tuple(families) + ("bb1",)
     recs = []
     for date, regime, df in sessions:
@@ -824,12 +889,15 @@ def day_copula_records(sessions, families=_FAMILIES, min_obs=1000, trim_min=15.0
             sel = select_copula(U, families=fams, is_uniform=True)
             best = sel["fits"][sel["best"]]
             asym, bb1, _bb1r = _bb1_asym(U[:, 0], U[:, 1])
+            emp = empirical_tail_dependence(U[:, 0], U[:, 1], np_q)
             nl = sel.get("nested_lr", {})
             recs.append({"date": str(date), "regime": str(regime), "best": best["name"],
                          "lambda_L": best["lambda_L"], "lambda_U": best["lambda_U"],
                          "bb1_lL": bb1["lambda_L"], "bb1_lU": bb1["lambda_U"],
                          "dlam_bb1": float(asym),
-                         "p_upper_lr": nl.get("p_boundary", np.nan), "n": int(len(R))})
+                         "p_upper_lr": nl.get("p_boundary", np.nan), "n": int(len(R)),
+                         "lL_np": emp["lambda_L"], "lU_np": emp["lambda_U"],
+                         "dlam_np": emp["lambda_L"] - emp["lambda_U"]})
             if verbose:
                 print(f"  [copula] {date}: best={best['name']} lL={best['lambda_L']:.3f} "
                       f"lU={best['lambda_U']:.3f} asym={asym:+.3f} (n={len(R)})", flush=True)
@@ -859,15 +927,27 @@ def _group_copula_rows(recs, n_flip=20000):
             "sign-flip p": sign_flip_p(d, n_flip=n_flip, seed=3) if len(d) else np.nan,
             "median p(upper tail LR)": float(g.p_upper_lr.median()),
             "days": int(len(g))}
+        # model-free empirical tail columns (appended AFTER the parametric block so the
+        # existing table layout is unchanged); the np asymmetry gets the same day-level
+        # sign-flip test (same seed => same flip matrix => paired comparability)
+        if "dlam_np" in per.columns:
+            dn = g.dlam_np.to_numpy(float)
+            dn = dn[np.isfinite(dn)]
+            out[gname].update({
+                "median lambda_L_np": float(g.lL_np.median()),
+                "median lambda_U_np": float(g.lU_np.median()),
+                "mean np tail asym (L-U)": float(dn.mean()) if len(dn) else np.nan,
+                "se(np asym)": float(dn.std(ddof=1) / np.sqrt(len(dn))) if len(dn) > 1 else np.nan,
+                "sign-flip p (np)": sign_flip_p(dn, n_flip=n_flip, seed=3) if len(dn) else np.nan})
     df = pd.DataFrame(out).T
     df.index.name = "day group"
     return df
 
 
 def table_copula_regimes(sessions, families=_FAMILIES, min_obs=1000, trim_min=15.0,
-                         n_flip=20000, verbose=False, recs=None):
+                         n_flip=20000, verbose=False, recs=None, np_q=_NP_TAIL_Q):
     """Return-copula tail dependence by a-priori regime -> (DataFrame, notes)."""
-    recs = day_copula_records(sessions, families, min_obs, trim_min, verbose) \
+    recs = day_copula_records(sessions, families, min_obs, trim_min, verbose, np_q=np_q) \
         if recs is None else recs
     if not recs:
         return pd.DataFrame(), "no usable sessions"
@@ -880,15 +960,23 @@ def table_copula_regimes(sessions, families=_FAMILIES, min_obs=1000, trim_min=15
              "'p(upper tail LR)' is the boundary-corrected BB1-vs-Clayton nested LR: small "
              "= upper-tail dependence beyond the crash tail. A Gaussian DCC asserts "
              "lambda = 0 at any rho < 1; a positive dlam says joint crashes are tighter "
-             "than joint rallies." % (trim_min, ", ".join(families)))
+             "than joint rallies. The *_np columns are the model-free Schmidt-Stadtmueller "
+             "empirical estimates at q=%.2f (joint exceedance count over marginal): tail "
+             "CONCENTRATION at that level, not the q->1 limit. They inherit no family "
+             "constraint (the t family FORCES lambda_L = lambda_U; Clayton forces "
+             "lambda_U = 0), so the np asymmetry -- same day-level sign-flip test -- is "
+             "the check that the parametric asymmetry is not an artifact of which family "
+             "wins the BIC." % (trim_min, ", ".join(families), np_q))
     return df, notes
 
 
 def table_copula_liquidity(sessions, min_obs=1000, trim_min=15.0, n_levels=10,
-                           n_flip=20000, verbose=False):
+                           n_flip=20000, verbose=False, np_q=_NP_TAIL_Q):
     """Within-day thin-vs-deep book split of the crash-tail dependence -> (DataFrame,
     notes). Thinness = TOTAL resting depth (both legs, all levels) below the day median;
-    BB1 fit per half on the full-day pseudo-observations."""
+    BB1 fit per half on the full-day pseudo-observations, beside the model-free empirical
+    lower-tail concentration at ``np_q`` on the same halves (the BB1 delta with a
+    parametric-family escape hatch removed)."""
     from flow_correlation import sign_flip_p
     import cross_asset_pd_liquidity as ca
     recs = []
@@ -913,10 +1001,14 @@ def table_copula_liquidity(sessions, min_obs=1000, trim_min=15.0, n_levels=10,
                 continue
             f_thin = _fit_copula("bb1", U[thin, 0], U[thin, 1])
             f_deep = _fit_copula("bb1", U[~thin, 0], U[~thin, 1])
+            e_thin = empirical_tail_dependence(U[thin, 0], U[thin, 1], np_q)
+            e_deep = empirical_tail_dependence(U[~thin, 0], U[~thin, 1], np_q)
             recs.append({"date": str(date), "regime": str(regime),
                          "lL_thin": f_thin["lambda_L"], "lL_deep": f_deep["lambda_L"],
                          "d_lL": f_thin["lambda_L"] - f_deep["lambda_L"],
-                         "n_thin": int(thin.sum()), "n_deep": int((~thin).sum())})
+                         "n_thin": int(thin.sum()), "n_deep": int((~thin).sum()),
+                         "lL_np_thin": e_thin["lambda_L"], "lL_np_deep": e_deep["lambda_L"],
+                         "d_lL_np": e_thin["lambda_L"] - e_deep["lambda_L"]})
             if verbose:
                 print(f"  [copula-liq] {date}: lL thin {f_thin['lambda_L']:.3f} vs deep "
                       f"{f_deep['lambda_L']:.3f}", flush=True)
@@ -939,6 +1031,16 @@ def table_copula_liquidity(sessions, min_obs=1000, trim_min=15.0, n_levels=10,
                       "se(delta)": float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1 else np.nan,
                       "sign-flip p": sign_flip_p(d, n_flip=n_flip, seed=4) if len(d) else np.nan,
                       "days": int(len(g))}
+        # model-free twin of the thin-minus-deep delta (appended after the BB1 block)
+        if "d_lL_np" in per.columns:
+            dn = g.d_lL_np.to_numpy(float)
+            dn = dn[np.isfinite(dn)]
+            out[gname].update({
+                "median lambda_L_np thin": float(g.lL_np_thin.median()),
+                "median lambda_L_np deep": float(g.lL_np_deep.median()),
+                "mean np delta (thin-deep)": float(dn.mean()) if len(dn) else np.nan,
+                "se(np delta)": float(dn.std(ddof=1) / np.sqrt(len(dn))) if len(dn) > 1 else np.nan,
+                "sign-flip p (np)": sign_flip_p(dn, n_flip=n_flip, seed=4) if len(dn) else np.nan})
     dfo = pd.DataFrame(out).T
     dfo.index.name = "day group"
     notes = ("Crash-tail (lambda_L, BB1) dependence of the two legs' returns in thin- vs "
@@ -946,13 +1048,16 @@ def table_copula_liquidity(sessions, min_obs=1000, trim_min=15.0, n_levels=10,
              "levels, both sides) below the day median; pseudo-observations from full-day "
              "GARCH margins; first/last %.0f min trimmed. A positive delta = joint-crash "
              "dependence rises as the books empty -- the liquidity-contagion direction. "
-             "Day-level sign-flip p." % (n_levels, trim_min))
+             "Day-level sign-flip p. The *_np columns repeat the split with the model-free "
+             "empirical lower-tail concentration at q=%.2f (joint exceedance over "
+             "marginal; level-q concentration, not the q->1 limit) -- no copula family "
+             "assumed in either half." % (n_levels, trim_min, np_q))
     return dfo, notes
 
 
 def table_copula_flows(sessions, families=_FAMILIES, min_obs=1000, trim_min=15.0,
                        n_levels=10, min_rest_steps=0, ar_order=5, n_flip=20000,
-                       verbose=False):
+                       verbose=False, np_q=_NP_TAIL_Q):
     """Copula on the two legs' OFI INNOVATIONS -> (DataFrame, notes): the parametric twin
     of the semicorrelation exhibit, with likelihood-based tail asymmetry."""
     import flow_correlation as fcm
@@ -973,12 +1078,15 @@ def table_copula_flows(sessions, families=_FAMILIES, min_obs=1000, trim_min=15.0
             sel = select_copula(U, families=fams, is_uniform=True)
             best = sel["fits"][sel["best"]]
             asym, bb1, _bb1r = _bb1_asym(U[:, 0], U[:, 1])
+            emp = empirical_tail_dependence(U[:, 0], U[:, 1], np_q)
             nl = sel.get("nested_lr", {})
             recs.append({"date": str(date), "regime": str(regime), "best": best["name"],
                          "lambda_L": best["lambda_L"], "lambda_U": best["lambda_U"],
                          "bb1_lL": bb1["lambda_L"], "bb1_lU": bb1["lambda_U"],
                          "dlam_bb1": float(asym),
-                         "p_upper_lr": nl.get("p_boundary", np.nan), "n": int(m.sum())})
+                         "p_upper_lr": nl.get("p_boundary", np.nan), "n": int(m.sum()),
+                         "lL_np": emp["lambda_L"], "lU_np": emp["lambda_U"],
+                         "dlam_np": emp["lambda_L"] - emp["lambda_U"]})
             if verbose:
                 print(f"  [copula-flow] {date}: best={best['name']} "
                       f"lL={best['lambda_L']:.3f} lU={best['lambda_U']:.3f}", flush=True)
@@ -994,7 +1102,11 @@ def table_copula_flows(sessions, families=_FAMILIES, min_obs=1000, trim_min=15.0
              "probability one leg's flow surprise is extremely negative given the other's "
              "is. The parametric, likelihood-based twin of the semicorrelation exhibit -- "
              "a positive BB1 L-minus-U contrast (day-level sign-flip p) says tandem "
-             "selling is tighter than tandem buying." % (ar_order, min_rest_steps, trim_min))
+             "selling is tighter than tandem buying. The *_np columns are the model-free "
+             "Schmidt-Stadtmueller empirical estimates at q=%.2f (level-q tail "
+             "concentration, no family assumed) with the same day-level sign-flip test "
+             "on their L-minus-U asymmetry."
+             % (ar_order, min_rest_steps, trim_min, np_q))
     return df, notes
 
 

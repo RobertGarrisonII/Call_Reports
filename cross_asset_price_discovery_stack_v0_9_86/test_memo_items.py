@@ -116,9 +116,76 @@ def check_wiring():
     return bool(ok_flag and ok_sum)
 
 
+def _mediation_bars(scale_break=False, n_days=8, n_bars=90, seed=7):
+    """Synthetic per-day bar frames for mediation_from_bars: dz_ret loads on the
+    UNIT-SCALE lagged spread innovation with coefficient 0.5. The broken variant applies
+    a per-day AFFINE transform (x -> 0.7 + 10x) to the spread control on the second half
+    of the days -- a level+scale break, which is exactly what the 2025-11-03 tick regime
+    does to spread-denominated controls. The rng sequence is identical in both variants,
+    so the two datasets differ ONLY by that deterministic transform."""
+    rng = np.random.default_rng(seed)
+    beta = 0.5
+    bars = []
+    for d in range(n_days):
+        u = rng.standard_normal(n_bars)                   # unit-scale spread innovation
+        dz = np.zeros(n_bars)
+        dz[1:] = beta * u[:-1] + 0.05 * rng.standard_normal(n_bars - 1)
+        b = pd.DataFrame({
+            "z_flow": np.cumsum(0.1 * rng.standard_normal(n_bars)),
+            "z_ret": np.cumsum(dz),
+            "rv_spy": np.abs(rng.standard_normal(n_bars)),
+            "rv_es": np.abs(rng.standard_normal(n_bars)),
+            "state": rng.standard_normal(n_bars),
+            "d_wspr_spy": rng.standard_normal(n_bars),
+            "d_wspr_es": u.copy(),
+        })
+        if scale_break and d >= n_days // 2:
+            b["d_wspr_es"] = 0.7 + 10.0 * b["d_wspr_es"]
+        bars.append((f"d{d}", "benchmark", b))
+    return bars
+
+
+def check_mediation_controls_standardize():
+    """(v0.9.87) Pooled control standardization lets a mid-sample level+scale break in
+    the spread control leak into the per-SD coefficient (post-break days contribute
+    spread variation on a different ruler); within-day standardization exactly undoes
+    any per-day affine transform, so the panel -- and every coefficient -- is invariant
+    to the break by construction. Also pins that the legacy default output is
+    bit-identical to controls_standardize='pooled'."""
+    import flow_correlation as fc
+    j = len([f"dz_ret_l{i}" for i in range(1, 4)]) + fc._CONTROLS.index("d_wspr_es_l1")
+    bars_u = _mediation_bars(scale_break=False)
+    bars_b = _mediation_bars(scale_break=True)
+    r_leg = fc.mediation_from_bars(bars_u, n_boot=0)
+    r_poo = fc.mediation_from_bars(bars_u, n_boot=0, controls_standardize="pooled")
+    ok_legacy = (np.array_equal(r_leg["eqA"][0], r_poo["eqA"][0])
+                 and np.array_equal(r_leg["eqB_total"][0], r_poo["eqB_total"][0])
+                 and np.array_equal(r_leg["eqB_direct"][0], r_poo["eqB_direct"][0])
+                 and r_leg["rv_es_total"] == r_poo["rv_es_total"])
+    r_pb = fc.mediation_from_bars(bars_b, n_boot=0, controls_standardize="pooled")
+    r_du = fc.mediation_from_bars(bars_u, n_boot=0, controls_standardize="day")
+    r_db = fc.mediation_from_bars(bars_b, n_boot=0, controls_standardize="day")
+    c_pu = float(r_poo["eqB_total"][0][j])
+    c_pb = float(r_pb["eqB_total"][0][j])
+    c_du = float(r_du["eqB_total"][0][j])
+    c_db = float(r_db["eqB_total"][0][j])
+    shift = abs(c_pb - c_pu) / abs(c_pu)
+    ok_shift = shift > 0.15                               # pooled: the break moves the coef
+    ok_inv = (abs(c_db - c_du) < 1e-8                     # day: bit-near invariant, and not
+              and float(np.max(np.abs(r_db["eqB_total"][0] - r_du["eqB_total"][0]))) < 1e-8)
+    ok_val = abs(c_du - 0.5) < 0.05                       # ... by being degenerate: recovers beta
+    print("(5) mediation spread coef (Eq B total): pooled %.4f -> %.4f under a planted "
+          "level+scale break (shift %.1f%%, fires: %s);" % (c_pu, c_pb, 100 * shift, ok_shift))
+    print("    day-standardized %.6f -> %.6f (invariant to 1e-8: %s, recovers beta 0.5: %s); "
+          "legacy default bit-identical to explicit 'pooled' (%s)"
+          % (c_du, c_db, ok_inv, ok_val, ok_legacy))
+    return bool(ok_legacy and ok_shift and ok_inv and ok_val)
+
+
 def main():
     checks = [check_cojump_by_day_recovers_leader, check_cojump_null_is_flat,
-              check_weighted_compare_regimes, check_wiring]
+              check_weighted_compare_regimes, check_wiring,
+              check_mediation_controls_standardize]
     res = []
     for fn in checks:
         try:

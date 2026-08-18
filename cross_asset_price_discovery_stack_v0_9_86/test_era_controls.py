@@ -129,8 +129,124 @@ def check_wiring():
     return bool(ok_pick and ok_deg and ok_excl)
 
 
+def _baked_pairs():
+    import re
+    src = open("run_paper_replication.sh").read()
+    vol = re.search(r'^VOLATILE="([^"]+)"', src, re.M).group(1).split(",")
+    base = re.search(r'^BASELINE="([^"]+)"', src, re.M).group(1).split(",")
+    return vol, base
+
+
+def check_ex_straddle_row():
+    """(v0.9.87) The ex-straddle within-pair row: the two baked 2026 pairs straddle the
+    2025-11-03 tick break, so run_analysis must emit a second within-pair test with them
+    dropped. Planted DGP: ONLY the straddling pairs carry a (spurious) +0.40 pair
+    difference; the clean pairs carry an exactly sign-balanced +-0.05 (23 pairs, odd
+    count, so the ex-straddle sign-flip null is EXACT: every flip's |mean| >= the
+    observed |mean|, p = 1). The all-pairs p must be pulled down by the straddle pairs
+    (~0.25 analytically) and the ex-straddle p must be materially larger -- the row
+    removes exactly the spurious contribution and nothing else."""
+    import run_analysis as ra
+    vol, base = _baked_pairs()
+    prs = list(zip(vol, base))                             # positional, driver convention
+    strad = me.pair_straddle([v for v, _ in prs], [b for _, b in prs])
+    bad = {(r["volatile"], r["baseline"]) for _i, r in strad.iterrows()}
+    rows, j = [], 0
+    for v, b in prs:
+        if (v, b) in bad:
+            diff = 0.40                                    # spurious, straddle pairs only
+        else:
+            diff = 0.05 if j % 2 == 0 else -0.05
+            j += 1
+        rows.append({"date": b, "regime": "benchmark", "CS_ES": 0.50})
+        rows.append({"date": v, "regime": "volatile", "CS_ES": 0.50 + diff})
+    per_day = pd.DataFrame(rows).set_index("date")
+    out = ra._within_pair_tests(per_day, vol, base)
+    wp = out.get("regime_test_within_pair")
+    ex = out.get("regime_test_within_pair_ex_straddle")
+    ok_row = isinstance(ex, dict) and ex.get("mode") == "within_pair"
+    ok_n = ok_row and ex["n_pairs"] == wp["n_pairs"] - 2 and ex["n_pairs_excluded"] == 2
+    ok_which = ok_row and ex["excluded_pairs"] == ["2026-01-20/2025-01-21",
+                                                   "2026-06-05/2025-06-06"]
+    ok_p = ok_row and ex["p_perm"] > 2.5 * wp["p_perm"] and ex["p_perm"] > 0.9 \
+        and wp["p_perm"] < 0.35
+    ok_mean = ok_row and abs(ex["mean_pair_diff"]) < 0.005 < wp["mean_pair_diff"]
+    print("(5) ex-straddle row: %d -> %d pairs, exclusions %s (right pairs: %s);"
+          % (wp["n_pairs"], ex["n_pairs"] if ok_row else -1,
+             ex.get("n_pairs_excluded") if ok_row else "?", ok_which))
+    print("    spurious-in-straddle-only DGP: p all=%.3f ex=%.3f (materially larger: %s), "
+          "mean diff %.4f -> %.4f (%s)"
+          % (wp["p_perm"], ex["p_perm"] if ok_row else float("nan"), ok_p,
+             wp["mean_pair_diff"], ex["mean_pair_diff"] if ok_row else float("nan"), ok_mean))
+    return bool(ok_row and ok_n and ok_which and ok_p and ok_mean)
+
+
+def check_es_stale_frac():
+    """(v0.9.87) The per-day ES staleness covariate: a planted frame with the ES top
+    frozen on a known block of open rows must yield exactly frozen/open to 1e-6, with
+    post-13:00 rows of a half day and MWCB-halt rows excluded from the DENOMINATOR --
+    otherwise a closed market reads as a stale data feed on exactly the stressed and
+    half-day sessions. Also checks the wiring: tier1_per_day carries the column and it
+    matches the direct computation."""
+    import flow_correlation as fc
+    import market_halts as mh
+
+    def _frozen_frame(idx, blocks):
+        n = len(idx)
+        bid = 5000.0 + 0.25 * np.arange(n)                # moves every row unless frozen
+        ask = bid + 0.25
+        frz = np.zeros(n, bool)
+        for a, b in blocks:
+            frz[a:b] = True
+        for t in range(1, n):
+            if frz[t]:
+                bid[t] = bid[t - 1]
+                ask[t] = ask[t - 1]
+        return pd.DataFrame({"ES_bidprice_1": bid, "ES_askprice_1": ask}, index=idx), frz
+
+    # half day (2024-11-29, day after Thanksgiving): 1000 frozen open rows + 600 frozen
+    # rows entirely after the 13:00 close that must count NOWHERE
+    idx = pd.date_range("2024-11-29 09:30", "2024-11-29 13:59:59", freq="s",
+                        tz="America/New_York")
+    n_open = int((pd.Timestamp("2024-11-29 13:00", tz="America/New_York")
+                  - idx[0]).total_seconds())              # rows strictly before the close
+    df, frz = _frozen_frame(idx, [(1000, 2000), (n_open + 100, n_open + 700)])
+    got = fc.es_stale_frac(df, date="2024-11-29")
+    exp = 1000.0 / n_open
+    ok_half = abs(got - exp) < 1e-6
+    ok_denom = abs(got - frz.sum() / len(idx)) > 1e-3     # naive all-rows frac differs
+    # MWCB halt day (2020-03-09, halt 09:34:13-09:49:13): freeze the whole halt window
+    # (a halted top IS frozen) + 500 open rows; only the open 500 may count
+    idx2 = pd.date_range("2020-03-09 09:30", "2020-03-09 11:29:59", freq="s",
+                         tz="America/New_York")
+    hm = mh.halt_mask(idx2)
+    h0, h1 = int(np.argmax(hm)), int(len(hm) - np.argmax(hm[::-1]))
+    df2, _ = _frozen_frame(idx2, [(h0, h1), (3000, 3500)])
+    got2 = fc.es_stale_frac(df2)
+    exp2 = 500.0 / float((~hm).sum())
+    ok_halt = abs(got2 - exp2) < 1e-6 and int(hm.sum()) == 901
+    # wiring: the column lands in tier1_per_day and matches the direct call
+    import test_hy_correlation as th
+    sess = []
+    for i in range(2):
+        d, _ = th._frame(n=4000, rho=0.6, refresh=0.7, seed=50 + i)
+        sess.append((f"2024-08-0{5 + i}", "benchmark", d))
+    per_day = fc.tier1_per_day(sess)
+    ok_wire = ("es_stale_frac" in per_day.columns and len(per_day) == 2
+               and all(abs(per_day.es_stale_frac.iloc[k]
+                           - fc.es_stale_frac(sess[k][2], date=sess[k][0])) < 1e-12
+                       for k in range(2)))
+    print("(6) es_stale_frac: half day %.6f vs planted %.6f (match %s; post-close out of "
+          "the denominator %s);" % (got, exp, ok_half, ok_denom))
+    print("    halt day %.6f vs planted %.6f over %d open rows (%s); tier1_per_day "
+          "carries the matching column (%s)"
+          % (got2, exp2, int((~hm).sum()), ok_halt, ok_wire))
+    return bool(ok_half and ok_denom and ok_halt and ok_wire)
+
+
 def main():
-    checks = [check_double_dissociation, check_era_flags, check_straddle, check_wiring]
+    checks = [check_double_dissociation, check_era_flags, check_straddle, check_wiring,
+              check_ex_straddle_row, check_es_stale_frac]
     res = []
     for fn in checks:
         try:
