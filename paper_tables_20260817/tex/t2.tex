@@ -1,0 +1,17 @@
+% T2 — generated from replication_20260817_015626, corrections per RUN_FINDINGS_20260817
+\begin{table}[htbp]\centering
+\caption{Table 5 — Crossed-book corner concentration: observed/null ratios and panel log odds ratio}
+\label{tab:t2}
+\small
+\begin{tabular}{llllll}
+\toprule
+Panel & PCMOF obs/null & NCMOF obs/null & log OR & (Woolf z — invalid) & Corner asymmetry \\
+\midrule
+A — Baseline (benchmark) & 1.243 & 0.763 & 0.977 & (159.8) & -0.016 \\
+B — Volatile & 1.280 & 0.730 & 1.124 & (214.3) & -0.019 \\
+C — MWCB & 1.372 & 0.659 & 1.470 & (77.7) & -0.019 \\
+C — MWCB, ex-SSR member & 1.359 & 0.672 & 1.413 & (64.2) & -0.021 \\
+\bottomrule
+\end{tabular}
+\begin{minipage}{\linewidth}\vspace{2pt}\footnotesize\emph{Notes:} PCMOF/NCMOF: positively/negatively co-moving order-flow corners; ratios are observed corner mass over the independence null. The Woolf z column is retained only for the record and must not be quoted: it is a pooled-bar statistic whose ordering tracks panel size, not effect size (the largest log OR, MWCB 1.470, has nearly the smallest z), and on a planted serially dependent DGP it overstates the day-clustered z by roughly 21x (RUN\_FINDINGS M-2); the run-level analogue of the same disease deflates a pooled t of 386.9 to a day-clustered 5.56 (M-1, T15). Day-clustered inference (per-day count matrices, day bootstrap, within-pair sign-flip, MWCB jackknife) ships in v0.9.87 and attaches to the next run. Corner asymmetry approximately -0.02 in every panel: no SSR fingerprint at the pooled level (D-6). MWCB is broken out here; T4-T8 fold or break it out as marked (M-8).\end{minipage}
+\end{table}

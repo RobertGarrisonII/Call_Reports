@@ -1,0 +1,23 @@
+% T9 — generated from replication_20260817_015626, corrections per RUN_FINDINGS_20260817
+\begin{table}[htbp]\centering
+\caption{Table 9 — IRF of return-correlation change on liquidity/flow shocks (1 s), Pearson vs HY vs DCC}
+\label{tab:t9}
+\small
+\begin{tabular}{lllllllll}
+\toprule
+Shock & Pearson bench & Pearson vol & HY bench & HY vol & DCC bench & DCC vol & $\Delta$(HY--P) bench & $\Delta$(HY--P) vol \\
+\midrule
+Spread\_ES & 0.003 (0.001) & 0.000 (0.001) & 0.006\sym{**} (0.001) & 0.001 (0.001) & 0.000 (0.001) & -0.000 (0.001) & 0.003 & 0.001 \\
+WtdSpread\_ES & 0.001 (0.005) & -0.000 (0.002) & -0.048\sym{**} (0.014) & -0.011\sym{**} (0.003) & 0.021\sym{\sym{**}*} (0.005) & 0.011\sym{\sym{**}*} (0.002) & -0.049 & -0.011 \\
+OFI\_ES & -0.015 (0.012) & -0.000 (0.003) & 0.018 (0.014) & -0.012 (0.005) & -0.005 (0.004) & -0.001 (0.002) & 0.033 & -0.012 \\
+RV\_ES & 0.178 (0.061) & 0.041* (0.012) & 0.137 (0.046) & 0.028 (0.010) & -0.004 (0.003) & 0.001 (0.002) & -0.041 & -0.013 \\
+MicroDev\_ES & 0.003 (0.005) & -0.003 (0.001) & -0.000 (0.007) & -0.004 (0.001) & 0.001 (0.002) & -0.001 (0.001) & -0.003 & -0.002 \\
+Spread\_SPY & 0.004 (0.002) & 0.000 (0.001) & 0.002 (0.002) & 0.000 (0.001) & 0.002 (0.002) & -0.000 (0.001) & -0.002 & -0.000 \\
+WtdSpread\_SPY & 0.023\sym{**} (0.005) & 0.014\sym{**} (0.003) & 0.039\sym{**} (0.010) & 0.013 (0.004) & -0.004 (0.003) & 0.001 (0.001) & 0.016 & -0.001 \\
+OFI\_SPY & 0.004 (0.004) & 0.004 (0.002) & 0.010 (0.007) & -0.000 (0.002) & -0.005 (0.002) & 0.002 (0.001) & 0.006 & -0.004 \\
+RV\_SPY & -0.085 (0.034) & -0.004 (0.015) & -0.152* (0.045) & 0.002 (0.016) & -0.005 (0.006) & 0.001 (0.001) & -0.068 & 0.005 \\
+MicroDev\_SPY & -0.004 (0.003) & 0.001 (0.001) & 0.002 (0.003) & 0.001 (0.001) & 0.000 (0.002) & -0.000 (0.001) & 0.007 & -0.000 \\
+\bottomrule
+\end{tabular}
+\begin{minipage}{\linewidth}\vspace{2pt}\footnotesize\emph{Notes:} Impact orthogonalized responses of $\Delta$correlation, x100; panel VAR(5) with day fixed effects, within-day lags; day-cluster bootstrap SEs, Romano-Wolf joint stars (\sym{\sym{**}*}/\sym{**}/* = 1/5/10\% FWER). The $\Delta$ column is the share of each published Pearson response attributable to Epps-type measurement artifact. Standing caveats (RUN\_FINDINGS): the 10 ms leg of this table died at ~292.6 GiB and does not exist (I.1); no lag-band certification ran, so no cell is certified lag-robust (I.3); DCC is a boundary estimate (a+b = 0.9999, M-6) — read its near-zero responses accordingly; the RealBar column is omitted here pending the lag diagnostic (available in the bundle). The v0.9.87 local-projection twin (T9\_LP=1) replaces lag-order-dependent IRFs next run (M-3).\end{minipage}
+\end{table}

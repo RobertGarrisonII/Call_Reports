@@ -1,0 +1,17 @@
+% T10 — generated from replication_20260817_015626, corrections per RUN_FINDINGS_20260817
+\begin{table}[htbp]\centering
+\caption{Forecast-error variance of SPY returns attributed to ES order flow — diagonal FEVD vs generalized (GFEVD), by regime (1 s)}
+\label{tab:t10}
+\small
+\begin{tabular}{llll}
+\toprule
+Decomposition & Regime & SPY ret $\leftarrow$ OFI\_SPY & SPY ret $\leftarrow$ OFI\_ES \\
+\midrule
+FEVD (diagonal — invalid here) & Benchmark & 0.721 & 0.279 \\
+ & Volatile & 0.495 & 0.505 \\
+GFEVD (Pesaran–Shin — quote this) & Benchmark & 0.543 & 0.457 \\
+ & Volatile & 0.500 & 0.500 \\
+\bottomrule
+\end{tabular}
+\begin{minipage}{\linewidth}\vspace{2pt}\footnotesize\emph{Notes:} LABELING CORRECTION applied: the shipped irf\_\_fevd.csv / irf\_\_gfevd.csv are the BENCHMARK-regime tables with no regime label; the volatile decompositions existed only inline in report.md (RUN\_FINDINGS M-5, E-9). Measured OFI-innovation correlation is 0.705 (benchmark) / 0.788 (volatile), so the diagonal FEVD's orthogonality assumption fails and the GFEVD is the quotable object — with the caveat that under tandem flow, common flow is counted toward both shocks. Roughly 46-50\% of SPY-return forecast-error variance attributes to ES flow.\end{minipage}
+\end{table}

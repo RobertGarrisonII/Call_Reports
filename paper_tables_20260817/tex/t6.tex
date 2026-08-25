@@ -1,0 +1,30 @@
+% T6 — generated from replication_20260817_015626, corrections per RUN_FINDINGS_20260817
+\begin{table}[htbp]\centering
+\caption{Tier 2 mediation — does tandem flow mediate the RV $\rightarrow$ return-correlation link?}
+\label{tab:t6}
+\small
+\begin{tabular}{lllll}
+\toprule
+Grid & Regressor & Eq A: $\Delta$z\_flow & Eq B: $\Delta$z\_ret (total) & Eq B: $\Delta$z\_ret (direct) \\
+\midrule
+1 s & rv\_es\_l1 & -5.517\sym{**} (2.674) & -1.131 (3.300) & 5.711\sym{**} (2.755) \\
+ & rv\_spy\_l1 & 4.823\sym{**} (1.943) & 0.190 (2.576) & -5.671\sym{**} (2.388) \\
+ & state\_l1 & -0.094 (0.216) & -0.048 (0.366) & -0.183 (0.296) \\
+ & d\_wspr\_es\_l1 & 0.041 (0.191) & -0.284 (0.269) & 0.235 (0.242) \\
+ & d\_wspr\_spy\_l1 & 0.168 (0.224) & 0.482 (0.333) & 0.416* (0.230) \\
+ & d z\_flow (mediator) & -- & -- & 67.009\sym{\sym{**}*} (3.766) \\
+ & indirect (RV\_ES via z\_flow) & -- & -- & -6.842 [-41.940, -3.144] \\
+ & indirect share of RV\_ES effect & -- & -- & 6.05 [-29.56, 27.36] \\
+\midrule
+10 ms & rv\_es\_l1 & -0.425\sym{**} (0.201) & -1.076\sym{\sym{**}*} (0.350) & -0.790* (0.446) \\
+ & rv\_spy\_l1 & 1.129\sym{\sym{**}*} (0.305) & 1.831\sym{\sym{**}*} (0.442) & 0.890* (0.466) \\
+ & state\_l1 & 0.052 (0.060) & 0.115 (0.087) & 0.014 (0.056) \\
+ & d\_wspr\_es\_l1 & 0.044 (0.060) & -0.024 (0.077) & 0.036 (0.064) \\
+ & d\_wspr\_spy\_l1 & 0.064 (0.081) & 0.206* (0.110) & 0.126\sym{**} (0.051) \\
+ & d z\_flow (mediator) & -- & -- & 75.270\sym{\sym{**}*} (1.183) \\
+ & indirect (RV\_ES via z\_flow) & -- & -- & -0.286 [-2.346, 0.163] \\
+ & indirect share of RV\_ES effect & -- & -- & 0.27 [-0.14, 1.21] \\
+\bottomrule
+\end{tabular}
+\begin{minipage}{\linewidth}\vspace{2pt}\footnotesize\emph{Notes:} Day-cluster bootstrap SEs in parentheses; */\sym{**}/\sym{\sym{**}*} = 10/5/1\%. The mediator link ($\Delta$z\_flow $\rightarrow$ $\Delta$z\_ret: 67.0 at 1 s, 75.3 at 10 ms) is the strongest coefficient in the run and holds on both grids. The suppression decomposition is a 1 s result: there the indirect level CI [--41.9, --3.14] excludes zero; the share row (6.05 = 605\%) is a ratio to a near-zero total and must not be quoted. At 10 ms the indirect CI includes zero. Bootstrap resolution is unequal across grids (499 vs 199 draws; RUN\_FINDINGS F-3, D-7); the next-run config re-runs both at n\_boot = 2000 with BCa intervals.\end{minipage}
+\end{table}

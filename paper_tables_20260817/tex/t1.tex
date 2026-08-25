@@ -1,0 +1,17 @@
+% T1 — generated from replication_20260817_015626, corrections per RUN_FINDINGS_20260817
+\begin{table}[htbp]\centering
+\caption{Sample composition and 10 ms estimability}
+\label{tab:t1}
+\small
+\begin{tabular}{llll}
+\toprule
+Regime & Sessions & 10 ms QC-fail (ES ladder stale) & Share of regime \\
+\midrule
+Benchmark & 25 & 16 & 64\% \\
+Volatile & 37 & 9 & 24\% \\
+MWCB & 4 & 0 & 0\% \\
+All & 66 & 25 & 38\% \\
+\bottomrule
+\end{tabular}
+\begin{minipage}{\linewidth}\vspace{2pt}\footnotesize\emph{Notes:} QC-fail = ES top of book unchanged on more than 99\% of 10 ms snapshots (qc\_frames\_10ms.txt ok=False); the run estimated on all 66 sessions against this gate (RUN\_FINDINGS D-2). The staleness loads on the benchmark side of every regime contrast; the v0.9.87 measured bias curve finds attenuation under the carry-forward mechanism, so 10 ms volatile-minus-benchmark gaps are conservative (D-1). The memo tallies (6/19 and 11/14) were wrong; the correct split is 16 benchmark / 9 volatile / 0 MWCB (I.2). Full per-session roster in Appendix A1.\end{minipage}
+\end{table}

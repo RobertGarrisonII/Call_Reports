@@ -1,0 +1,22 @@
+% T8 — generated from replication_20260817_015626, corrections per RUN_FINDINGS_20260817
+\begin{table}[htbp]\centering
+\caption{Information-share regime tests — volatile vs benchmark}
+\label{tab:t8}
+\small
+\begin{tabular}{llllll}
+\toprule
+Grid & Test & Volatile mean & Benchmark mean & Difference & p \\
+\midrule
+1 s & CS\_ES, free permutation & 0.336 & 0.302 & 0.034 & 0.5491 \\
+ & IS\_mid\_ES, free permutation & 0.469 & 0.437 & 0.032 & 0.0324 \\
+ & CS\_ES, within-pair (era-robust) & — & — & -0.002 & 0.9755 \\
+ & CS\_ES, $\kappa$-weighted & kappa & 0.292 & 0.263 & 0.0285 \\
+\midrule
+10 ms & CS\_ES, free permutation & 0.398 & 0.355 & 0.043 & 0.1169 \\
+ & IS\_mid\_ES, free permutation & 0.484 & 0.437 & 0.047 & 0.1253 \\
+ & CS\_ES, within-pair (era-robust) & — & — & 0.038 & 0.1324 \\
+ & CS\_ES, $\kappa$-weighted & kappa & 0.354 & 0.343 & 0.0109 \\
+\bottomrule
+\end{tabular}
+\begin{minipage}{\linewidth}\vspace{2pt}\footnotesize\emph{Notes:} Within-pair rows report the mean pair difference over 25 pairs. The only sub-0.05 cell is the 1 s free-permutation IS test (p = 0.032) — and its era-robust within-pair counterpart DOES NOT EXIST in this run (it was run only on CS, where it reverses sign at 1 s, p = 0.976). The claim "ES gains share in volatile regimes" is therefore unsupported by an era-robust test on this record (RUN\_FINDINGS F-5). v0.9.87 adds the within-pair and ex-straddle twins on IS\_mid\_ES; the next run carries the verdict. IS is the primary metric; CS is fragile to lags and beta (M-7). Volatile here folds MWCB in (M-8).\end{minipage}
+\end{table}

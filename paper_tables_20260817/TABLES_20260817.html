@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en-US">
+<head>
+<meta charset="utf-8">
+<title>Paper Tables — Run of August 17, 2026 (Corrected)</title>
+<style>
+html { -webkit-print-color-adjust: exact; }
+body { font-family: "XCharter","Charter","Liberation Serif","Times New Roman",serif;
+  font-size: 10pt; line-height: 1.4; color: #000; margin: 0; }
+.page { max-width: 7.3in; margin: 0 auto; padding: 0.6in 0.3in; }
+h1 { font-size: 15pt; line-height: 1.25; margin: 0 0 6pt 0; }
+h2 { font-size: 11pt; margin: 18pt 0 5pt 0; page-break-after: avoid; }
+p { margin: 0 0 6pt 0; text-align: justify; }
+table { border-collapse: collapse; width: 100%; margin: 4pt 0 6pt 0; font-size: 8.6pt; }
+th { border-top: 1.2pt solid #000; border-bottom: 0.6pt solid #000; padding: 2.5pt 4pt;
+     text-align: left; font-weight: 700; }
+td { padding: 2pt 4pt; text-align: left; }
+tr.last td { border-bottom: 1.2pt solid #000; }
+tr.pbreak td { border-top: 0.6pt solid #666; }
+p.note { font-size: 8.6pt; font-style: italic; margin: 0 0 4pt 0; }
+code { font-family: "Liberation Mono",monospace; font-size: 8.5pt; }
+@media print { .page { padding: 0.1in 0; } h2 { page-break-after: avoid; } table { page-break-inside: avoid; } }
+.a1 table { page-break-inside: auto; }
+
+</style>
+</head>
+<body>
+<div class="page">
+<h1>Paper Tables — Full-Sample Two-Grid Run of August 17, 2026<br><span style="font-size:11pt;font-weight:400">Corrected per the Findings of Record (RUN_FINDINGS_20260817)</span></h1>
+<p><strong>Run:</strong> <code>replication_20260817_015626</code> · <strong>Stack:</strong> v0.9.86 · <strong>Sample:</strong> 66 sessions (25 benchmark / 37 volatile / 4 MWCB), 2017-06-26 – 2026-06-05 · <strong>Grids:</strong> 1 s and 10 ms · <strong>Prepared:</strong> August 22, 2026, from the shipped analysis bundle, with the corrections of the Findings of Record applied in place.</p>
+<p><strong>Corrections applied</strong> (each table's notes give details): (1) Table 5 Woolf z struck as invalid (M-1/M-2); (2) FEVD/GFEVD tables regime-labeled (M-5/E-9); (3) half-life bar-unit fix, ×0.01 at 10 ms (E-3); (4) stale-session tally corrected to 16 benchmark / 9 volatile (I.2); (5) 1 s-only results flagged as such (F-2/F-3); (6) mediation share statistic suppressed (F-3); (7) MWCB taxonomy marked per table (M-8); (8) copula upper-tail LR column omitted pending E-13; (9) Rigobon column excluded, unidentified by its own diagnostic (M-4); (10) pre-averaged θ contradiction flagged unadjudicated (F-4/E-2).</p>
+<div>
+<h2>T1. Sample composition and 10 ms estimability</h2>
+<table>
+<tr><th>Regime</th><th>Sessions</th><th>10 ms QC-fail (ES ladder stale)</th><th>Share of regime</th></tr>
+<tr><td>Benchmark</td><td>25</td><td>16</td><td>64%</td></tr>
+<tr><td>Volatile</td><td>37</td><td>9</td><td>24%</td></tr>
+<tr><td>MWCB</td><td>4</td><td>0</td><td>0%</td></tr>
+<tr class="last"><td>All</td><td>66</td><td>25</td><td>38%</td></tr>
+</table>
+<p class="note">QC-fail = ES top of book unchanged on more than 99% of 10 ms snapshots (qc_frames_10ms.txt ok=False); the run estimated on all 66 sessions against this gate (RUN_FINDINGS D-2). The staleness loads on the benchmark side of every regime contrast; the v0.9.87 measured bias curve finds attenuation under the carry-forward mechanism, so 10 ms volatile-minus-benchmark gaps are conservative (D-1). The memo tallies (6/19 and 11/14) were wrong; the correct split is 16 benchmark / 9 volatile / 0 MWCB (I.2). Full per-session roster in Appendix A1.</p>
+</div>
+<div>
+<h2>T2. Table 5 — Crossed-book corner concentration: observed/null ratios and panel log odds ratio</h2>
+<table>
+<tr><th>Panel</th><th>PCMOF obs/null</th><th>NCMOF obs/null</th><th>log OR</th><th>(Woolf z — invalid)</th><th>Corner asymmetry</th></tr>
+<tr><td>A — Baseline (benchmark)</td><td>1.243</td><td>0.763</td><td>0.977</td><td>(159.8)</td><td>-0.016</td></tr>
+<tr><td>B — Volatile</td><td>1.280</td><td>0.730</td><td>1.124</td><td>(214.3)</td><td>-0.019</td></tr>
+<tr><td>C — MWCB</td><td>1.372</td><td>0.659</td><td>1.470</td><td>(77.7)</td><td>-0.019</td></tr>
+<tr class="last"><td>C — MWCB, ex-SSR member</td><td>1.359</td><td>0.672</td><td>1.413</td><td>(64.2)</td><td>-0.021</td></tr>
+</table>
+<p class="note">PCMOF/NCMOF: positively/negatively co-moving order-flow corners; ratios are observed corner mass over the independence null. The Woolf z column is retained only for the record and must not be quoted: it is a pooled-bar statistic whose ordering tracks panel size, not effect size (the largest log OR, MWCB 1.470, has nearly the smallest z), and on a planted serially dependent DGP it overstates the day-clustered z by roughly 21x (RUN_FINDINGS M-2); the run-level analogue of the same disease deflates a pooled t of 386.9 to a day-clustered 5.56 (M-1, T15). Day-clustered inference (per-day count matrices, day bootstrap, within-pair sign-flip, MWCB jackknife) ships in v0.9.87 and attaches to the next run. Corner asymmetry approximately -0.02 in every panel: no SSR fingerprint at the pooled level (D-6). MWCB is broken out here; T4-T8 fold or break it out as marked (M-8).</p>
+</div>
+<div>
+<h2>T3. Table 7 — NCMOF excess over the frequency-matched null, by aggregation</h2>
+<table>
+<tr><th>Aggregation</th><th>Orders per bar (ETF)</th><th>Orders per bar (FUT)</th><th>NCMOF null %</th><th>NCMOF observed %</th><th>Observed / null</th></tr>
+<tr><td>1 second</td><td>505.00</td><td>112.00</td><td>0.35</td><td>11.88</td><td>33.54</td></tr>
+<tr><td>10 millisecond</td><td>5.05</td><td>1.12</td><td>22.88</td><td>30.14</td><td>1.32</td></tr>
+<tr class="last"><td>action time</td><td>1.00</td><td>1.00</td><td>50.08</td><td>48.40</td><td>0.97</td></tr>
+</table>
+<p class="note">The published aggregation story reproduces on this sample: the negative-corner excess collapses from 33.5x at 1 s bars to 1.32x at 10 ms to 0.97x in action time. No uncertainty ships with this exhibit in this run (RUN_FINDINGS F-6); day-clustered inference attaches with the v0.9.87 machinery on the next run.</p>
+</div>
+<div>
+<h2>T4. Tandem flow coupling (Tier 1) — OFI-innovation correlation by regime and grid</h2>
+<table>
+<tr><th>Grid</th><th>Regime</th><th>Mean corr</th><th>Mean z</th><th>SE(z)</th><th>Days</th><th>Permutation p</th></tr>
+<tr><td>1 s</td><td>Benchmark</td><td>0.729</td><td>0.926</td><td>0.049</td><td>25</td><td>—</td></tr>
+<tr><td></td><td>Volatile</td><td>0.818</td><td>1.152</td><td>0.041</td><td>37</td><td>—</td></tr>
+<tr><td></td><td>MWCB</td><td>0.870</td><td>1.334</td><td>0.039</td><td>4</td><td>—</td></tr>
+<tr><td></td><td>Volatile − benchmark</td><td>0.089</td><td>0.226</td><td>—</td><td>62</td><td>0.0008</td></tr>
+<tr class="pbreak"><td>10 ms</td><td>Benchmark</td><td>0.266</td><td>0.273</td><td>0.009</td><td>25</td><td>—</td></tr>
+<tr><td></td><td>Volatile</td><td>0.292</td><td>0.301</td><td>0.008</td><td>37</td><td>—</td></tr>
+<tr><td></td><td>MWCB</td><td>0.355</td><td>0.371</td><td>0.008</td><td>4</td><td>—</td></tr>
+<tr class="last"><td></td><td>Volatile − benchmark</td><td>0.026</td><td>0.028</td><td>—</td><td>62</td><td>0.0327</td></tr>
+</table>
+<p class="note">The run&#x27;s most robust substantive result: coupling orders monotonically with stress on both grids (benchmark &lt; volatile &lt; MWCB), and the volatile-benchmark difference is significant at both (p = 0.0008 at 1 s, p = 0.0327 at 10 ms). MWCB broken out (4 days). Staleness biases the 10 ms benchmark cell downward (attenuation), making the reported gap conservative (T1 note; RUN_FINDINGS F-1, D-1).</p>
+</div>
+<div>
+<h2>T5. Directional asymmetry of flow coupling — down-move vs up-move bars</h2>
+<table>
+<tr><th>Grid</th><th>Regime</th><th>Down corr (med)</th><th>Up corr (med)</th><th>Mean dz (down−up)</th><th>SE</th><th>Sign-flip p</th><th>Days</th></tr>
+<tr><td>1 s</td><td>Benchmark</td><td>0.559</td><td>0.526</td><td>0.0468</td><td>0.0154</td><td>0.0045</td><td>25</td></tr>
+<tr><td></td><td>Volatile</td><td>0.485</td><td>0.563</td><td>-0.0901</td><td>0.0120</td><td>0.0000</td><td>37</td></tr>
+<tr><td></td><td>MWCB</td><td>0.330</td><td>0.307</td><td>0.0057</td><td>0.0154</td><td>0.6249</td><td>4</td></tr>
+<tr><td></td><td>All days</td><td>0.514</td><td>0.549</td><td>-0.0324</td><td>0.0121</td><td>0.0096</td><td>66</td></tr>
+<tr class="pbreak"><td>10 ms</td><td>Benchmark</td><td>0.327</td><td>0.311</td><td>0.0037</td><td>0.0033</td><td>0.2672</td><td>25</td></tr>
+<tr><td></td><td>Volatile</td><td>0.336</td><td>0.335</td><td>-0.0023</td><td>0.0032</td><td>0.4724</td><td>37</td></tr>
+<tr><td></td><td>MWCB</td><td>0.406</td><td>0.409</td><td>-0.0101</td><td>0.0098</td><td>0.3727</td><td>4</td></tr>
+<tr class="last"><td></td><td>All days</td><td>0.335</td><td>0.334</td><td>-0.0005</td><td>0.0023</td><td>0.8224</td><td>66</td></tr>
+</table>
+<p class="note">A 1 s result only. At 1 s the benchmark regime couples tighter on down-moves (+0.047, p = 0.0045) and the volatile regime reverses to tighter on up-moves (−0.090, p &lt; 5e-5). At 10 ms every gap is an order of magnitude smaller and non-significant. The gap-of-gaps is untested in the shipped tables, and the SSR / direction-conditioning checks remain outstanding (RUN_FINDINGS F-2). Quote the reversal as an aggregation-dependent finding or not at all.</p>
+</div>
+<div>
+<h2>T6. Tier 2 mediation — does tandem flow mediate the RV → return-correlation link?</h2>
+<table>
+<tr><th>Grid</th><th>Regressor</th><th>Eq A: Δz_flow</th><th>Eq B: Δz_ret (total)</th><th>Eq B: Δz_ret (direct)</th></tr>
+<tr><td>1 s</td><td>rv_es_l1</td><td>-5.517** (2.674)</td><td>-1.131 (3.300)</td><td>5.711** (2.755)</td></tr>
+<tr><td></td><td>rv_spy_l1</td><td>4.823** (1.943)</td><td>0.190 (2.576)</td><td>-5.671** (2.388)</td></tr>
+<tr><td></td><td>state_l1</td><td>-0.094 (0.216)</td><td>-0.048 (0.366)</td><td>-0.183 (0.296)</td></tr>
+<tr><td></td><td>d_wspr_es_l1</td><td>0.041 (0.191)</td><td>-0.284 (0.269)</td><td>0.235 (0.242)</td></tr>
+<tr><td></td><td>d_wspr_spy_l1</td><td>0.168 (0.224)</td><td>0.482 (0.333)</td><td>0.416* (0.230)</td></tr>
+<tr><td></td><td>d z_flow (mediator)</td><td>--</td><td>--</td><td>67.009*** (3.766)</td></tr>
+<tr><td></td><td>indirect (RV_ES via z_flow)</td><td>--</td><td>--</td><td>-6.842 [-41.940, -3.144]</td></tr>
+<tr><td></td><td>indirect share of RV_ES effect</td><td>--</td><td>--</td><td>6.05 [-29.56, 27.36]</td></tr>
+<tr class="pbreak"><td>10 ms</td><td>rv_es_l1</td><td>-0.425** (0.201)</td><td>-1.076*** (0.350)</td><td>-0.790* (0.446)</td></tr>
+<tr><td></td><td>rv_spy_l1</td><td>1.129*** (0.305)</td><td>1.831*** (0.442)</td><td>0.890* (0.466)</td></tr>
+<tr><td></td><td>state_l1</td><td>0.052 (0.060)</td><td>0.115 (0.087)</td><td>0.014 (0.056)</td></tr>
+<tr><td></td><td>d_wspr_es_l1</td><td>0.044 (0.060)</td><td>-0.024 (0.077)</td><td>0.036 (0.064)</td></tr>
+<tr><td></td><td>d_wspr_spy_l1</td><td>0.064 (0.081)</td><td>0.206* (0.110)</td><td>0.126** (0.051)</td></tr>
+<tr><td></td><td>d z_flow (mediator)</td><td>--</td><td>--</td><td>75.270*** (1.183)</td></tr>
+<tr><td></td><td>indirect (RV_ES via z_flow)</td><td>--</td><td>--</td><td>-0.286 [-2.346, 0.163]</td></tr>
+<tr class="last"><td></td><td>indirect share of RV_ES effect</td><td>--</td><td>--</td><td>0.27 [-0.14, 1.21]</td></tr>
+</table>
+<p class="note">Day-cluster bootstrap SEs in parentheses; */**/*** = 10/5/1%. The mediator link (Δz_flow → Δz_ret: 67.0 at 1 s, 75.3 at 10 ms) is the strongest coefficient in the run and holds on both grids. The suppression decomposition is a 1 s result: there the indirect level CI [−41.9, −3.14] excludes zero; the share row (6.05 = 605%) is a ratio to a near-zero total and must not be quoted. At 10 ms the indirect CI includes zero. Bootstrap resolution is unequal across grids (499 vs 199 draws; RUN_FINDINGS F-3, D-7); the next-run config re-runs both at n_boot = 2000 with BCa intervals.</p>
+</div>
+<div>
+<h2>T7. Lead-lag at 10 ms — HRY timing estimate and co-jump ordering</h2>
+<table>
+<tr><th>Test</th><th>Point estimate</th><th>Days ES-leading</th><th>Day-level sign-flip p</th></tr>
+<tr><td>HRY cross-correlation θ (ES leads by)</td><td>21.5 ms (median 20.0 ms)</td><td>64 / 66</td><td>0.0005</td></tr>
+<tr class="last"><td>Co-jump lead share (ES first)</td><td>0.358</td><td>65 / 66</td><td>5.0e-05</td></tr>
+</table>
+<p class="note">Both tests are day-level (immune to the pooled-inference disease of M-1). ES leads SPY by about one 20 ms grid step. Integrity notes from RUN_FINDINGS F-4: (i) the co-jump ES-lead share correlates POSITIVELY with ES update counts (Spearman +0.57) — weakest on stale sessions, so not a staleness artifact; (ii) the two extreme raw-θ days (2017-06-26, 2017-10-05) are the two stalest sessions and should be excluded from θ magnitude claims; (iii) the pre-averaged θ column reverses sign on 62/66 days and ships untested — the raw-vs-pre-averaged contradiction is UNADJUDICATED on this record and the ES-lead claim should cite the co-jump test first. At 1 s neither test resolves (p = 0.52/0.96): a resolution artifact.</p>
+</div>
+<div>
+<h2>T8. Information-share regime tests — volatile vs benchmark</h2>
+<table>
+<tr><th>Grid</th><th>Test</th><th>Volatile mean</th><th>Benchmark mean</th><th>Difference</th><th>p</th></tr>
+<tr><td>1 s</td><td>CS_ES, free permutation</td><td>0.336</td><td>0.302</td><td>0.034</td><td>0.5491</td></tr>
+<tr><td></td><td>IS_mid_ES, free permutation</td><td>0.469</td><td>0.437</td><td>0.032</td><td>0.0324</td></tr>
+<tr><td></td><td>CS_ES, within-pair (era-robust)</td><td>—</td><td>—</td><td>-0.002</td><td>0.9755</td></tr>
+<tr><td></td><td>CS_ES, κ-weighted</td><td>kappa</td><td>0.292</td><td>0.263</td><td>0.0285</td></tr>
+<tr class="pbreak"><td>10 ms</td><td>CS_ES, free permutation</td><td>0.398</td><td>0.355</td><td>0.043</td><td>0.1169</td></tr>
+<tr><td></td><td>IS_mid_ES, free permutation</td><td>0.484</td><td>0.437</td><td>0.047</td><td>0.1253</td></tr>
+<tr><td></td><td>CS_ES, within-pair (era-robust)</td><td>—</td><td>—</td><td>0.038</td><td>0.1324</td></tr>
+<tr class="last"><td></td><td>CS_ES, κ-weighted</td><td>kappa</td><td>0.354</td><td>0.343</td><td>0.0109</td></tr>
+</table>
+<p class="note">Within-pair rows report the mean pair difference over 25 pairs. The only sub-0.05 cell is the 1 s free-permutation IS test (p = 0.032) — and its era-robust within-pair counterpart DOES NOT EXIST in this run (it was run only on CS, where it reverses sign at 1 s, p = 0.976). The claim &quot;ES gains share in volatile regimes&quot; is therefore unsupported by an era-robust test on this record (RUN_FINDINGS F-5). v0.9.87 adds the within-pair and ex-straddle twins on IS_mid_ES; the next run carries the verdict. IS is the primary metric; CS is fragile to lags and beta (M-7). Volatile here folds MWCB in (M-8).</p>
+</div>
+<div>
+<h2>T9. Table 9 — IRF of return-correlation change on liquidity/flow shocks (1 s), Pearson vs HY vs DCC</h2>
+<table>
+<tr><th>Shock</th><th>Pearson bench</th><th>Pearson vol</th><th>HY bench</th><th>HY vol</th><th>DCC bench</th><th>DCC vol</th><th>Δ(HY−P) bench</th><th>Δ(HY−P) vol</th></tr>
+<tr><td>Spread_ES</td><td>0.003 (0.001)</td><td>0.000 (0.001)</td><td>0.006** (0.001)</td><td>0.001 (0.001)</td><td>0.000 (0.001)</td><td>-0.000 (0.001)</td><td>0.003</td><td>0.001</td></tr>
+<tr><td>WtdSpread_ES</td><td>0.001 (0.005)</td><td>-0.000 (0.002)</td><td>-0.048** (0.014)</td><td>-0.011** (0.003)</td><td>0.021*** (0.005)</td><td>0.011*** (0.002)</td><td>-0.049</td><td>-0.011</td></tr>
+<tr><td>OFI_ES</td><td>-0.015 (0.012)</td><td>-0.000 (0.003)</td><td>0.018 (0.014)</td><td>-0.012 (0.005)</td><td>-0.005 (0.004)</td><td>-0.001 (0.002)</td><td>0.033</td><td>-0.012</td></tr>
+<tr><td>RV_ES</td><td>0.178 (0.061)</td><td>0.041* (0.012)</td><td>0.137 (0.046)</td><td>0.028 (0.010)</td><td>-0.004 (0.003)</td><td>0.001 (0.002)</td><td>-0.041</td><td>-0.013</td></tr>
+<tr><td>MicroDev_ES</td><td>0.003 (0.005)</td><td>-0.003 (0.001)</td><td>-0.000 (0.007)</td><td>-0.004 (0.001)</td><td>0.001 (0.002)</td><td>-0.001 (0.001)</td><td>-0.003</td><td>-0.002</td></tr>
+<tr><td>Spread_SPY</td><td>0.004 (0.002)</td><td>0.000 (0.001)</td><td>0.002 (0.002)</td><td>0.000 (0.001)</td><td>0.002 (0.002)</td><td>-0.000 (0.001)</td><td>-0.002</td><td>-0.000</td></tr>
+<tr><td>WtdSpread_SPY</td><td>0.023** (0.005)</td><td>0.014** (0.003)</td><td>0.039** (0.010)</td><td>0.013 (0.004)</td><td>-0.004 (0.003)</td><td>0.001 (0.001)</td><td>0.016</td><td>-0.001</td></tr>
+<tr><td>OFI_SPY</td><td>0.004 (0.004)</td><td>0.004 (0.002)</td><td>0.010 (0.007)</td><td>-0.000 (0.002)</td><td>-0.005 (0.002)</td><td>0.002 (0.001)</td><td>0.006</td><td>-0.004</td></tr>
+<tr><td>RV_SPY</td><td>-0.085 (0.034)</td><td>-0.004 (0.015)</td><td>-0.152* (0.045)</td><td>0.002 (0.016)</td><td>-0.005 (0.006)</td><td>0.001 (0.001)</td><td>-0.068</td><td>0.005</td></tr>
+<tr class="last"><td>MicroDev_SPY</td><td>-0.004 (0.003)</td><td>0.001 (0.001)</td><td>0.002 (0.003)</td><td>0.001 (0.001)</td><td>0.000 (0.002)</td><td>-0.000 (0.001)</td><td>0.007</td><td>-0.000</td></tr>
+</table>
+<p class="note">Impact orthogonalized responses of Δcorrelation, x100; panel VAR(5) with day fixed effects, within-day lags; day-cluster bootstrap SEs, Romano-Wolf joint stars (***/**/* = 1/5/10% FWER). The Δ column is the share of each published Pearson response attributable to Epps-type measurement artifact. Standing caveats (RUN_FINDINGS): the 10 ms leg of this table died at ~292.6 GiB and does not exist (I.1); no lag-band certification ran, so no cell is certified lag-robust (I.3); DCC is a boundary estimate (a+b = 0.9999, M-6) — read its near-zero responses accordingly; the RealBar column is omitted here pending the lag diagnostic (available in the bundle). The v0.9.87 local-projection twin (T9_LP=1) replaces lag-order-dependent IRFs next run (M-3).</p>
+</div>
+<div>
+<h2>T10. Forecast-error variance of SPY returns attributed to ES order flow — diagonal FEVD vs generalized (GFEVD), by regime (1 s)</h2>
+<table>
+<tr><th>Decomposition</th><th>Regime</th><th>SPY ret ← OFI_SPY</th><th>SPY ret ← OFI_ES</th></tr>
+<tr><td>FEVD (diagonal — invalid here)</td><td>Benchmark</td><td>0.721</td><td>0.279</td></tr>
+<tr><td></td><td>Volatile</td><td>0.495</td><td>0.505</td></tr>
+<tr><td>GFEVD (Pesaran–Shin — quote this)</td><td>Benchmark</td><td>0.543</td><td>0.457</td></tr>
+<tr class="last"><td></td><td>Volatile</td><td>0.500</td><td>0.500</td></tr>
+</table>
+<p class="note">LABELING CORRECTION applied: the shipped irf__fevd.csv / irf__gfevd.csv are the BENCHMARK-regime tables with no regime label; the volatile decompositions existed only inline in report.md (RUN_FINDINGS M-5, E-9). Measured OFI-innovation correlation is 0.705 (benchmark) / 0.788 (volatile), so the diagonal FEVD&#x27;s orthogonality assumption fails and the GFEVD is the quotable object — with the caveat that under tandem flow, common flow is counted toward both shocks. Roughly 46-50% of SPY-return forecast-error variance attributes to ES flow.</p>
+</div>
+<div>
+<h2>T11a. Copula tail dependence by regime (1 s, 15 m windows)</h2>
+<table>
+<tr><th>Regime</th><th>Best family (days)</th><th>Median λ_L</th><th>Median λ_U</th><th>Tail asym (L−U)</th><th>Sign-flip p</th><th>Days</th></tr>
+<tr><td>Benchmark</td><td>t:19 sjc:4 bb1:2</td><td>0.531</td><td>0.531</td><td>0.0197</td><td>0.2490</td><td>25</td></tr>
+<tr><td>Volatile</td><td>sjc:20 bb1:11 t:6</td><td>0.685</td><td>0.688</td><td>-0.0023</td><td>0.6866</td><td>37</td></tr>
+<tr><td>MWCB</td><td>t:2 frank:2</td><td>0.389</td><td>0.389</td><td>-0.0287</td><td>0.1253</td><td>4</td></tr>
+<tr class="last"><td>All days</td><td>t:27 sjc:24 bb1:13 frank:2</td><td>0.622</td><td>0.628</td><td>0.0044</td><td>0.5475</td><td>66</td></tr>
+</table>
+<p class="note">Parametric caveat (RUN_FINDINGS): the t family FORCES λ_L = λ_U, and t wins 19/25 benchmark days — the benchmark row&#x27;s symmetry is partly assumed, not measured. The v0.9.87 nonparametric Schmidt-Stadtmüller estimator (λ at q = 0.95, no family constraint) attaches next run and adjudicates. The upper-tail LR column (median p = 0.0 in all groups) is omitted pending the E-13 column-definition fix.</p>
+</div>
+<div>
+<h2>T11b. Lower-tail dependence conditional on book state — thin vs deep liquidity (1 s)</h2>
+<table>
+<tr><th>Regime</th><th>Median λ_L thin</th><th>Median λ_L deep</th><th>Δ (thin−deep)</th><th>SE</th><th>Sign-flip p</th><th>Days</th></tr>
+<tr><td>Benchmark</td><td>0.503</td><td>0.448</td><td>-0.0203</td><td>0.0402</td><td>0.6111</td><td>25</td></tr>
+<tr><td>Volatile</td><td>0.641</td><td>0.551</td><td>0.0762</td><td>0.0128</td><td>0.0000</td><td>37</td></tr>
+<tr><td>MWCB</td><td>0.813</td><td>0.812</td><td>0.0196</td><td>0.0240</td><td>0.7461</td><td>4</td></tr>
+<tr class="last"><td>All days</td><td>0.597</td><td>0.506</td><td>0.0362</td><td>0.0176</td><td>0.0443</td><td>66</td></tr>
+</table>
+<p class="note">In the volatile regime, tail dependence is significantly higher when the book is thin (+0.076, p = 5e-5) — the liquidity channel of tail coupling. Benchmark and MWCB do not resolve.</p>
+</div>
+<div>
+<h2>T12. Markov-switching flow-coupling regimes within the day (1 s)</h2>
+<table>
+<tr><th>Regime</th><th>Days by chosen K</th><th>Corr levels (modal K)</th><th>Top-regime share</th><th>Median duration lo/hi (bars)</th><th>Duration asym p</th><th>Entry ret (bps)</th><th>Entry-direction p</th><th>Multi-regime days</th></tr>
+<tr><td>Benchmark</td><td>K=1:1 K=2:10 K=3:13 K=4:1</td><td>0.64 / 0.76 / 0.89</td><td>0.23</td><td>156 / 36</td><td>0.0007</td><td>-0.31</td><td>0.587</td><td>24 of 25</td></tr>
+<tr><td>Volatile</td><td>K=1:1 K=2:22 K=3:14</td><td>0.80 / 0.87</td><td>0.39</td><td>81 / 61</td><td>0.4151</td><td>-1.60</td><td>0.221</td><td>36 of 37</td></tr>
+<tr><td>MWCB</td><td>K=2:3 K=4:1</td><td>0.67 / 0.89</td><td>0.73</td><td>9 / 197</td><td>0.1263</td><td>-22.08</td><td>0.125</td><td>4 of 4</td></tr>
+<tr class="last"><td>All days</td><td>K=1:2 K=2:35 K=3:27 K=4:2</td><td>0.75 / 0.87</td><td>0.35</td><td>89 / 54</td><td>0.0769</td><td>-2.76</td><td>0.020</td><td>64 of 66</td></tr>
+</table>
+<p class="note">64 of 66 days reject a single flow-coupling regime (median LR p = 0.01 — a 99-draw resolution FLOOR, not an estimate; RUN_FINDINGS D-7). Benchmark days spend long spells in the low-coupling state punctuated by short high-coupling bursts (156 vs 36 bars, asymmetry p = 0.0007); volatile days are more evenly split. Regime entries lean toward down-moves overall (entry-direction p = 0.020, all days).</p>
+</div>
+<div>
+<h2>T13. Horizon profile — cross-asset transmission across sampling rungs (66 days)</h2>
+<table>
+<tr><th>Interval</th><th>λ SPY←ES</th><th>λ ES←SPY</th><th>IS_mid_ES</th><th>CS_ES</th><th>Half-life (bars)</th><th>Half-life (s, corrected)</th><th>ES lead share</th></tr>
+<tr><td>10ms</td><td>0.038</td><td>0.015</td><td>0.466</td><td>0.381</td><td>5.4</td><td>0.05</td><td>0.358</td></tr>
+<tr><td>50ms</td><td>0.152</td><td>0.087</td><td>0.413</td><td>0.329</td><td>26.2</td><td>1.31</td><td>0.086</td></tr>
+<tr><td>100ms</td><td>0.180</td><td>0.007</td><td>0.413</td><td>0.311</td><td>67.9</td><td>6.79</td><td>0.041</td></tr>
+<tr><td>250ms</td><td>0.250</td><td>0.013</td><td>0.429</td><td>0.310</td><td>56.2</td><td>14.06</td><td>-0.039</td></tr>
+<tr><td>500ms</td><td>0.309</td><td>0.021</td><td>0.444</td><td>0.317</td><td>57.4</td><td>28.69</td><td>-0.069</td></tr>
+<tr class="last"><td>1s</td><td>0.370</td><td>0.033</td><td>0.457</td><td>0.323</td><td>63.9</td><td>63.92</td><td>0.006</td></tr>
+</table>
+<p class="note">UNIT CORRECTION applied: the shipped half_life_s column is in BAR units; true seconds = bars x bar length (RUN_FINDINGS E-3 — a x100 label error at 10 ms). Corrected, the error-correction half-life runs 0.05 s at 10 ms to 64 s at 1 s bars. The asymmetric cross-impact (λ SPY←ES an order of magnitude above λ ES←SPY at every rung) and the ES lead share visible only below 100 ms are the profile&#x27;s substantive content.</p>
+</div>
+<div>
+<h2>T14. ECM-SDE error-correction estimates (Kalman, curve-implied)</h2>
+<table>
+<tr><th>Grid</th><th>a1 SPY (t)</th><th>a1 ES (t)</th><th>Median IS_ES (mid)</th><th>Median IS_ES (microprice)</th><th>Median half-life (s, corrected)</th></tr>
+<tr><td>1 s</td><td>0.00067 (0.30)</td><td>-0.00972 (-3.33)</td><td>0.176</td><td>0.308</td><td>9.4</td></tr>
+<tr class="last"><td>10 ms</td><td>0.00022 (3.68)</td><td>-0.00024 (-6.07)</td><td>0.569</td><td>0.646</td><td>1.45</td></tr>
+</table>
+<p class="note">Signs are the textbook error-correction pattern (SPY adjusts up toward, ES down toward, the common curve). Half-life carries the same bar-unit correction as T13 (x0.01 at 10 ms; RUN_FINDINGS E-3). Microprice-based IS is above mid-based on both grids. t-statistics are as shipped (per-day Kalman aggregation).</p>
+</div>
+<div>
+<h2>T15. Inference exhibit — pooled-iid vs day-clustered t on the same regression (1 s)</h2>
+<table>
+<tr><th>Regression</th><th>Coefficient</th><th>Pooled-iid t</th><th>Day-clustered t</th><th>Wild-bootstrap p</th><th>N obs</th><th>N days</th></tr>
+<tr class="last"><td>SPY_ret ~ ES_OFI</td><td>1.05e-08</td><td>386.9</td><td>5.56</td><td>0.001</td><td>1529994</td><td>66</td></tr>
+</table>
+<p class="note">The 69.5x deflation that governs the reading of every pooled statistic in the run (RUN_FINDINGS M-1), and the reason T2&#x27;s Woolf z column is struck. All starred results quoted in this document use day-level or day-clustered inference.</p>
+</div>
+<div>
+<h2>T16. Cross-impact regime summary (10 ms)</h2>
+<table>
+<tr><th>Regime</th><th>Type</th><th>Mean</th><th>SD</th><th>Day-windows</th></tr>
+<tr><td>Benchmark</td><td>cross</td><td>0.0118</td><td>0.0215</td><td>50</td></tr>
+<tr><td>Benchmark</td><td>own</td><td>0.8417</td><td>0.0442</td><td>50</td></tr>
+<tr><td>Volatile (incl. MWCB)</td><td>cross</td><td>0.0352</td><td>0.0412</td><td>82</td></tr>
+<tr class="last"><td>Volatile (incl. MWCB)</td><td>own</td><td>0.7940</td><td>0.0996</td><td>82</td></tr>
+</table>
+<p class="note">Cross-impact triples from benchmark (0.012) to volatile (0.035) while own-impact barely moves. Taxonomy note: this family folds MWCB into volatile (41 days; M-8).</p>
+</div>
+<div class="a1">
+<h2>A1. Appendix — per-session 10 ms QC roster</h2>
+<table>
+<tr><th>Date</th><th>Regime</th><th>ES top-of-book stale fraction</th><th>10 ms QC</th><th>Notes</th></tr>
+<tr><td>2017-06-26</td><td>bench</td><td>0.9986</td><td>fail</td><td>ladder-monotonicity defect (8 snaps); session0 exemplar</td></tr>
+<tr><td>2017-08-10</td><td>vol</td><td>0.9970</td><td>fail</td><td></td></tr>
+<tr><td>2017-09-05</td><td>vol</td><td>0.9967</td><td>fail</td><td></td></tr>
+<tr><td>2017-10-05</td><td>bench</td><td>0.9994</td><td>fail</td><td></td></tr>
+<tr><td>2017-10-25</td><td>bench</td><td>0.9980</td><td>fail</td><td></td></tr>
+<tr><td>2017-11-28</td><td>bench</td><td>0.9985</td><td>fail</td><td></td></tr>
+<tr><td>2018-01-29</td><td>vol</td><td>0.9972</td><td>fail</td><td></td></tr>
+<tr><td>2018-02-02</td><td>vol</td><td>0.9924</td><td>fail</td><td></td></tr>
+<tr><td>2018-02-05</td><td>vol</td><td>0.9763</td><td>ok</td><td></td></tr>
+<tr><td>2018-03-19</td><td>vol</td><td>0.9910</td><td>fail</td><td></td></tr>
+<tr><td>2018-03-22</td><td>vol</td><td>0.9847</td><td>ok</td><td></td></tr>
+<tr><td>2018-03-23</td><td>bench</td><td>0.9810</td><td>ok</td><td></td></tr>
+<tr><td>2018-05-29</td><td>vol</td><td>0.9918</td><td>fail</td><td></td></tr>
+<tr><td>2018-06-25</td><td>vol</td><td>0.9924</td><td>fail</td><td></td></tr>
+<tr><td>2018-08-06</td><td>bench</td><td>0.9986</td><td>fail</td><td></td></tr>
+<tr><td>2018-10-04</td><td>vol</td><td>0.9942</td><td>fail</td><td></td></tr>
+<tr><td>2018-10-10</td><td>vol</td><td>0.9860</td><td>ok</td><td></td></tr>
+<tr><td>2018-12-04</td><td>vol</td><td>0.9799</td><td>ok</td><td></td></tr>
+<tr><td>2019-03-22</td><td>vol</td><td>0.9900</td><td>ok</td><td></td></tr>
+<tr><td>2019-05-14</td><td>bench</td><td>0.9940</td><td>fail</td><td></td></tr>
+<tr><td>2019-06-13</td><td>bench</td><td>0.9958</td><td>fail</td><td></td></tr>
+<tr><td>2019-08-05</td><td>vol</td><td>0.9866</td><td>ok</td><td></td></tr>
+<tr><td>2019-09-05</td><td>bench</td><td>0.9954</td><td>fail</td><td></td></tr>
+<tr><td>2019-10-28</td><td>bench</td><td>0.9977</td><td>fail</td><td></td></tr>
+<tr><td>2020-01-27</td><td>vol</td><td>0.9911</td><td>fail</td><td></td></tr>
+<tr><td>2020-01-29</td><td>bench</td><td>0.9938</td><td>fail</td><td></td></tr>
+<tr><td>2020-02-24</td><td>vol</td><td>0.9832</td><td>ok</td><td></td></tr>
+<tr><td>2020-02-27</td><td>bench</td><td>0.9531</td><td>ok</td><td></td></tr>
+<tr><td>2020-03-09</td><td>MWCB</td><td>0.9275</td><td>ok</td><td>MWCB halt rows masked</td></tr>
+<tr><td>2020-03-12</td><td>MWCB</td><td>0.8876</td><td>ok</td><td>MWCB halt rows masked</td></tr>
+<tr><td>2020-03-16</td><td>MWCB</td><td>0.9012</td><td>ok</td><td>MWCB halt rows masked; SSR 100%</td></tr>
+<tr><td>2020-03-18</td><td>MWCB</td><td>0.8852</td><td>ok</td><td>MWCB halt rows masked</td></tr>
+<tr><td>2020-05-12</td><td>vol</td><td>0.9862</td><td>ok</td><td></td></tr>
+<tr><td>2020-06-11</td><td>vol</td><td>0.9657</td><td>ok</td><td></td></tr>
+<tr><td>2020-09-03</td><td>vol</td><td>0.9442</td><td>ok</td><td></td></tr>
+<tr><td>2020-10-26</td><td>vol</td><td>0.9765</td><td>ok</td><td></td></tr>
+<tr><td>2020-12-11</td><td>bench</td><td>0.9853</td><td>ok</td><td>activity rule extracted ESZ0 (75.8%); QC cols score calendar front (D-5)</td></tr>
+<tr><td>2021-01-27</td><td>vol</td><td>0.9598</td><td>ok</td><td></td></tr>
+<tr><td>2021-02-04</td><td>bench</td><td>0.9916</td><td>fail</td><td></td></tr>
+<tr><td>2021-02-25</td><td>vol</td><td>0.9478</td><td>ok</td><td></td></tr>
+<tr><td>2021-11-26</td><td>vol</td><td>0.9510</td><td>ok</td><td>early close 13:00; post-close rows masked</td></tr>
+<tr><td>2022-02-10</td><td>vol</td><td>0.9426</td><td>ok</td><td>SSR 100%</td></tr>
+<tr><td>2022-06-13</td><td>vol</td><td>0.9418</td><td>ok</td><td></td></tr>
+<tr><td>2023-03-09</td><td>vol</td><td>0.9762</td><td>ok</td><td></td></tr>
+<tr><td>2023-07-26</td><td>bench</td><td>0.9850</td><td>ok</td><td></td></tr>
+<tr><td>2023-08-07</td><td>bench</td><td>0.9904</td><td>fail</td><td></td></tr>
+<tr><td>2023-09-05</td><td>bench</td><td>0.9915</td><td>fail</td><td></td></tr>
+<tr><td>2023-12-20</td><td>bench</td><td>0.9904</td><td>fail</td><td></td></tr>
+<tr><td>2024-01-29</td><td>bench</td><td>0.9939</td><td>fail</td><td></td></tr>
+<tr><td>2024-02-23</td><td>bench</td><td>0.9893</td><td>ok</td><td></td></tr>
+<tr><td>2024-04-04</td><td>bench</td><td>0.9854</td><td>ok</td><td></td></tr>
+<tr><td>2024-07-24</td><td>vol</td><td>0.9829</td><td>ok</td><td></td></tr>
+<tr><td>2024-08-02</td><td>bench</td><td>0.9287</td><td>ok</td><td></td></tr>
+<tr><td>2024-08-05</td><td>vol</td><td>0.8874</td><td>ok</td><td></td></tr>
+<tr><td>2024-09-03</td><td>vol</td><td>0.9726</td><td>ok</td><td></td></tr>
+<tr><td>2024-10-11</td><td>bench</td><td>0.9908</td><td>fail</td><td></td></tr>
+<tr><td>2024-12-18</td><td>vol</td><td>0.9651</td><td>ok</td><td></td></tr>
+<tr><td>2025-01-21</td><td>bench</td><td>0.9805</td><td>ok</td><td></td></tr>
+<tr><td>2025-01-27</td><td>vol</td><td>0.9613</td><td>ok</td><td></td></tr>
+<tr><td>2025-02-21</td><td>vol</td><td>0.9751</td><td>ok</td><td></td></tr>
+<tr><td>2025-04-03</td><td>vol</td><td>0.9091</td><td>ok</td><td></td></tr>
+<tr><td>2025-06-06</td><td>bench</td><td>0.9785</td><td>ok</td><td></td></tr>
+<tr><td>2025-08-01</td><td>vol</td><td>0.9573</td><td>ok</td><td></td></tr>
+<tr><td>2025-10-10</td><td>vol</td><td>0.9082</td><td>ok</td><td></td></tr>
+<tr><td>2026-01-20</td><td>vol</td><td>0.9547</td><td>ok</td><td></td></tr>
+<tr class="last"><td>2026-06-05</td><td>vol</td><td>0.9279</td><td>ok</td><td></td></tr>
+</table>
+<p class="note">QC fail threshold: ES top of book unchanged on &gt;99% of snapshots. The 1 s frames pass QC on all 66 sessions; every 10 ms exhibit in this document estimated on all 66 (D-2) — the clean-subsample and dose-response (es_stale_frac) checks attach next run.</p>
+</div>
+</div>
+</body>
+</html>

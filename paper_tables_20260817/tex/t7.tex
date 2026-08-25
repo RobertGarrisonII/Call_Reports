@@ -1,0 +1,15 @@
+% T7 — generated from replication_20260817_015626, corrections per RUN_FINDINGS_20260817
+\begin{table}[htbp]\centering
+\caption{Lead-lag at 10 ms — HRY timing estimate and co-jump ordering}
+\label{tab:t7}
+\small
+\begin{tabular}{llll}
+\toprule
+Test & Point estimate & Days ES-leading & Day-level sign-flip p \\
+\midrule
+HRY cross-correlation $\theta$ (ES leads by) & 21.5 ms (median 20.0 ms) & 64 / 66 & 0.0005 \\
+Co-jump lead share (ES first) & 0.358 & 65 / 66 & 5.0e-05 \\
+\bottomrule
+\end{tabular}
+\begin{minipage}{\linewidth}\vspace{2pt}\footnotesize\emph{Notes:} Both tests are day-level (immune to the pooled-inference disease of M-1). ES leads SPY by about one 20 ms grid step. Integrity notes from RUN\_FINDINGS F-4: (i) the co-jump ES-lead share correlates POSITIVELY with ES update counts (Spearman +0.57) — weakest on stale sessions, so not a staleness artifact; (ii) the two extreme raw-$\theta$ days (2017-06-26, 2017-10-05) are the two stalest sessions and should be excluded from $\theta$ magnitude claims; (iii) the pre-averaged $\theta$ column reverses sign on 62/66 days and ships untested — the raw-vs-pre-averaged contradiction is UNADJUDICATED on this record and the ES-lead claim should cite the co-jump test first. At 1 s neither test resolves (p = 0.52/0.96): a resolution artifact.\end{minipage}
+\end{table}

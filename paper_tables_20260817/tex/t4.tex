@@ -1,0 +1,22 @@
+% T4 — generated from replication_20260817_015626, corrections per RUN_FINDINGS_20260817
+\begin{table}[htbp]\centering
+\caption{Tandem flow coupling (Tier 1) — OFI-innovation correlation by regime and grid}
+\label{tab:t4}
+\small
+\begin{tabular}{lllllll}
+\toprule
+Grid & Regime & Mean corr & Mean z & SE(z) & Days & Permutation p \\
+\midrule
+1 s & Benchmark & 0.729 & 0.926 & 0.049 & 25 & — \\
+ & Volatile & 0.818 & 1.152 & 0.041 & 37 & — \\
+ & MWCB & 0.870 & 1.334 & 0.039 & 4 & — \\
+ & Volatile -- benchmark & 0.089 & 0.226 & — & 62 & 0.0008 \\
+\midrule
+10 ms & Benchmark & 0.266 & 0.273 & 0.009 & 25 & — \\
+ & Volatile & 0.292 & 0.301 & 0.008 & 37 & — \\
+ & MWCB & 0.355 & 0.371 & 0.008 & 4 & — \\
+ & Volatile -- benchmark & 0.026 & 0.028 & — & 62 & 0.0327 \\
+\bottomrule
+\end{tabular}
+\begin{minipage}{\linewidth}\vspace{2pt}\footnotesize\emph{Notes:} The run's most robust substantive result: coupling orders monotonically with stress on both grids (benchmark < volatile < MWCB), and the volatile-benchmark difference is significant at both (p = 0.0008 at 1 s, p = 0.0327 at 10 ms). MWCB broken out (4 days). Staleness biases the 10 ms benchmark cell downward (attenuation), making the reported gap conservative (T1 note; RUN\_FINDINGS F-1, D-1).\end{minipage}
+\end{table}

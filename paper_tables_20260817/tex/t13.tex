@@ -1,0 +1,19 @@
+% T13 — generated from replication_20260817_015626, corrections per RUN_FINDINGS_20260817
+\begin{table}[htbp]\centering
+\caption{Horizon profile — cross-asset transmission across sampling rungs (66 days)}
+\label{tab:t13}
+\small
+\begin{tabular}{llllllll}
+\toprule
+Interval & $\lambda$ SPY$\leftarrow$ES & $\lambda$ ES$\leftarrow$SPY & IS\_mid\_ES & CS\_ES & Half-life (bars) & Half-life (s, corrected) & ES lead share \\
+\midrule
+10ms & 0.038 & 0.015 & 0.466 & 0.381 & 5.4 & 0.05 & 0.358 \\
+50ms & 0.152 & 0.087 & 0.413 & 0.329 & 26.2 & 1.31 & 0.086 \\
+100ms & 0.180 & 0.007 & 0.413 & 0.311 & 67.9 & 6.79 & 0.041 \\
+250ms & 0.250 & 0.013 & 0.429 & 0.310 & 56.2 & 14.06 & -0.039 \\
+500ms & 0.309 & 0.021 & 0.444 & 0.317 & 57.4 & 28.69 & -0.069 \\
+1s & 0.370 & 0.033 & 0.457 & 0.323 & 63.9 & 63.92 & 0.006 \\
+\bottomrule
+\end{tabular}
+\begin{minipage}{\linewidth}\vspace{2pt}\footnotesize\emph{Notes:} UNIT CORRECTION applied: the shipped half\_life\_s column is in BAR units; true seconds = bars x bar length (RUN\_FINDINGS E-3 — a x100 label error at 10 ms). Corrected, the error-correction half-life runs 0.05 s at 10 ms to 64 s at 1 s bars. The asymmetric cross-impact ($\lambda$ SPY$\leftarrow$ES an order of magnitude above $\lambda$ ES$\leftarrow$SPY at every rung) and the ES lead share visible only below 100 ms are the profile's substantive content.\end{minipage}
+\end{table}
